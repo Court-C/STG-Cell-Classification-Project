@@ -56,27 +56,47 @@ Fixed constants (not parameters, hardcoded exactly as in the Java source):
 Currents returned (in this order): [Na, CaT, CaS, A, KCa, Kd, H, L, IMI]
 """
 import numpy as np
+from numba import njit
 
 
 # ---------------------------------------------------------------------------
 # Elementary functions (exact transcriptions from the Java source)
+#
+# @njit here does double duty: these get called both from the fast, fully
+# compiled integrator core below (scalar float64 args) and from get_currents
+# (whole-trajectory numpy arrays). Numba compiles a separate specialization
+# per argument-type signature the first time it sees it, so the same
+# functions serve both call patterns without any vectorization tricks.
+#
+# error_model='numpy' is required, not cosmetic: numba's default
+# ('python') makes scalar float division-by-zero raise ZeroDivisionError,
+# matching CPython -- but the original numpy-scalar code this replaced
+# returns inf/nan instead (numpy division semantics), which is what the
+# blow-up detection in generate_steady_state.py's np.isfinite() checks
+# expect. Without this, a cell that legitimately blows up raises an
+# uncaught ZeroDivisionError instead of producing a non-finite trajectory.
 # ---------------------------------------------------------------------------
+@njit(cache=True, error_model='numpy')
 def boltzSS(V, A, B):
     return 1. / (1. + np.exp((V + A) / B))
 
 
+@njit(cache=True, error_model='numpy')
 def tauX(V, CT, DT, AT, BT):
     return CT - DT / (1. + np.exp((V + AT) / BT))
 
 
+@njit(cache=True, error_model='numpy')
 def spectau(V, CT, DT, AT, BT, AT2, BT2):
     return CT + DT / (np.exp((V + AT) / BT) + np.exp((V + AT2) / BT2))
 
 
+@njit(cache=True, error_model='numpy')
 def iIonic(g, m, h, q, V, Erev):
     return g * (m ** q) * h * (V - Erev)
 
 
+@njit(cache=True, error_model='numpy')
 def CaNernst(CaIn, temp):
     R = 8.314e3
     T = 273.15 + temp
@@ -88,21 +108,22 @@ def CaNernst(CaIn, temp):
 
 # ---------------------------------------------------------------------------
 # Derivatives (right-hand side of the ODE system)
+#
+# The actual math lives in _derivatives_core, which is @njit-compiled and
+# therefore can't use Python conveniences like tuple/slice unpacking of a
+# runtime-sized array (numba's nopython mode requires the fixed-size
+# indexing below instead) or an Optional[float] default for Iapp. derivatives()
+# stays as the plain-Python, full-signature entry point so any existing
+# caller (including interactive use) keeps working unchanged; it just
+# resolves Iapp_override down to a single float and hands off to the
+# compiled core.
 # ---------------------------------------------------------------------------
-def derivatives(state, p, temp, reftemp=10.0, Iapp_override=None):
-    """
-    state: length-14 array, see module docstring for order.
-    p: length-40 parameter array, see module docstring for order.
-    temp: simulation temperature (deg C).
-    reftemp: reference temperature the q10 factors are defined relative to.
-        Single-cell default is 10 (see module docstring) -- pass 25 if you
-        specifically want to match the network model's convention instead.
-    Iapp_override: if not None, use this value (nA) instead of p[39] for the
-        applied current this step. Used for time-varying current injection.
-
-    Returns dstate/dt, same length-14 order as state.
-    """
-    V, NaM, NaH, CaTM, CaTH, CaSM, CaSH, HM, KdM, KCaM, AM, AH, IMIM, IntCa = state
+@njit(cache=True, error_model='numpy')
+def _derivatives_core(state, p, temp, reftemp, Iapp):
+    V = state[0]; NaM = state[1]; NaH = state[2]
+    CaTM = state[3]; CaTH = state[4]; CaSM = state[5]; CaSH = state[6]
+    HM = state[7]; KdM = state[8]; KCaM = state[9]
+    AM = state[10]; AH = state[11]; IMIM = state[12]; IntCa = state[13]
 
     CaRev = CaNernst(IntCa, temp)
     C = 1.0
@@ -111,27 +132,27 @@ def derivatives(state, p, temp, reftemp=10.0, Iapp_override=None):
     Ca0 = 0.05
     tauImi_base = 20.0
 
-    gNa, gCaT, gCaS, gA, gKCa, gKd, gH, gL, gImi = p[0:9]
-    EL, ENa, EKd, EH = p[9], p[10], p[11], p[12]
+    gNa = p[0]; gCaT = p[1]; gCaS = p[2]; gA = p[3]; gKCa = p[4]
+    gKd = p[5]; gH = p[6]; gL = p[7]; gImi = p[8]
+    EL = p[9]; ENa = p[10]; EKd = p[11]; EH = p[12]
     EKCa = EKd
     EA = EKd
     EIMI = -10.0
     ECaT = CaRev
     ECaS = CaRev
 
-    (q10_gNa, q10_gNa_m, q10_gNa_h,
-     q10_gCaT, q10_gCaT_m, q10_gCaT_h,
-     q10_gCaS, q10_gCaS_m, q10_gCaS_h,
-     q10_gA, q10_gA_m, q10_gA_h,
-     q10_gKCa, q10_gKCa_m, q10_gKCa_h,
-     q10_gKdr, q10_gKdr_m, q10_gKdr_h,
-     q10_gH, q10_gH_m, q10_gH_h,
-     q10_g_leak,
-     q10_g_imi, q10_g_imi_m,
-     q10_tau_Ca) = p[13:38]
+    q10_gNa = p[13]; q10_gNa_m = p[14]; q10_gNa_h = p[15]
+    q10_gCaT = p[16]; q10_gCaT_m = p[17]; q10_gCaT_h = p[18]
+    q10_gCaS = p[19]; q10_gCaS_m = p[20]; q10_gCaS_h = p[21]
+    q10_gA = p[22]; q10_gA_m = p[23]; q10_gA_h = p[24]
+    q10_gKCa = p[25]; q10_gKCa_m = p[26]; q10_gKCa_h = p[27]
+    q10_gKdr = p[28]; q10_gKdr_m = p[29]; q10_gKdr_h = p[30]
+    q10_gH = p[31]; q10_gH_m = p[32]; q10_gH_h = p[33]
+    q10_g_leak = p[34]
+    q10_g_imi = p[35]; q10_g_imi_m = p[36]
+    q10_tau_Ca = p[37]
 
     tauIntCa_base = p[38]
-    Iapp = p[39] if Iapp_override is None else Iapp_override
 
     # --- steady states ---
     NaMinf = boltzSS(V, 25.5, -5.29)
@@ -210,6 +231,25 @@ def derivatives(state, p, temp, reftemp=10.0, Iapp_override=None):
                       dKdM, dKCaM, dAM, dAH, dIMIM, dIntCa])
 
 
+def derivatives(state, p, temp, reftemp=10.0, Iapp_override=None):
+    """
+    state: length-14 array, see module docstring for order.
+    p: length-40 parameter array, see module docstring for order.
+    temp: simulation temperature (deg C).
+    reftemp: reference temperature the q10 factors are defined relative to.
+        Single-cell default is 10 (see module docstring) -- pass 25 if you
+        specifically want to match the network model's convention instead.
+    Iapp_override: if not None, use this value (nA) instead of p[39] for the
+        applied current this step. Used for time-varying current injection.
+
+    Returns dstate/dt, same length-14 order as state.
+    """
+    state = np.asarray(state, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    Iapp = p[39] if Iapp_override is None else Iapp_override
+    return _derivatives_core(state, p, float(temp), float(reftemp), float(Iapp))
+
+
 def get_currents(state, p, temp, reftemp=10.0):
     """Return the 9 currents [Na,CaT,CaS,A,KCa,Kd,H,L,IMI] for a given
     state/parameter vector, without advancing the ODE. state can be a
@@ -277,13 +317,42 @@ DEFAULT_CIS = np.array([-51.0, 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 5
 
 # ---------------------------------------------------------------------------
 # Classic RK4 integrator
+#
+# _rk4_step_core and _simulate_core are @njit-compiled. In particular,
+# _simulate_core runs the ENTIRE per-step loop as compiled machine code --
+# previously that loop was plain Python calling into numpy on 14-element
+# arrays hundreds of thousands of times per run, where per-call/per-op
+# overhead dominated over the actual floating-point work. simulate() still
+# accepts an arbitrary Python Iapp_func (needed for time-varying injection
+# protocols), so it resolves that callback to a plain float64 array up
+# front, outside the compiled loop, and hands the compiled core a fixed
+# per-step current to consume.
 # ---------------------------------------------------------------------------
-def rk4_step(state, dt, p, temp, reftemp=10.0, Iapp_override=None):
-    k1 = derivatives(state, p, temp, reftemp, Iapp_override)
-    k2 = derivatives(state + 0.5 * dt * k1, p, temp, reftemp, Iapp_override)
-    k3 = derivatives(state + 0.5 * dt * k2, p, temp, reftemp, Iapp_override)
-    k4 = derivatives(state + dt * k3, p, temp, reftemp, Iapp_override)
+@njit(cache=True, error_model='numpy')
+def _rk4_step_core(state, dt, p, temp, reftemp, Iapp):
+    k1 = _derivatives_core(state, p, temp, reftemp, Iapp)
+    k2 = _derivatives_core(state + 0.5 * dt * k1, p, temp, reftemp, Iapp)
+    k3 = _derivatives_core(state + 0.5 * dt * k2, p, temp, reftemp, Iapp)
+    k4 = _derivatives_core(state + dt * k3, p, temp, reftemp, Iapp)
     return state + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+
+def rk4_step(state, dt, p, temp, reftemp=10.0, Iapp_override=None):
+    state = np.asarray(state, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    Iapp = p[39] if Iapp_override is None else Iapp_override
+    return _rk4_step_core(state, float(dt), p, float(temp), float(reftemp), float(Iapp))
+
+
+@njit(cache=True, error_model='numpy')
+def _simulate_core(p, dt, temp, reftemp, state0, iapp_array):
+    nsteps = iapp_array.shape[0]
+    states = np.empty((nsteps, 14))
+    state = state0.copy()
+    for i in range(nsteps):
+        states[i] = state
+        state = _rk4_step_core(state, dt, p, temp, reftemp, iapp_array[i])
+    return states
 
 
 def simulate(p, nsecs, temp, dt=0.1, reftemp=10.0, cis=None, Iapp_func=None):
@@ -295,18 +364,22 @@ def simulate(p, nsecs, temp, dt=0.1, reftemp=10.0, cis=None, Iapp_func=None):
         p[39] at every step (time-varying injection). If None, uses the
         constant p[39] from the parameter file throughout.
     """
-    p = np.asarray(p, dtype=float)
-    state = np.array(cis, dtype=float) if cis is not None else DEFAULT_CIS.copy()
+    p = np.asarray(p, dtype=np.float64)
+    state0 = np.array(cis, dtype=np.float64) if cis is not None else DEFAULT_CIS.copy()
 
-    nsteps = int(round((1000.0 * nsecs) / dt))
-    states = np.empty((nsteps, 14))
+    total_ms = 1000.0 * nsecs
+    nsteps = int(np.ceil(total_ms / dt))
+    if nsteps < 1:
+        nsteps = 1
+    dt = total_ms / nsteps
     t_ms = np.arange(nsteps) * dt
 
-    for i in range(nsteps):
-        Iapp_override = Iapp_func(t_ms[i]) if Iapp_func is not None else None
-        states[i] = state
-        state = rk4_step(state, dt, p, temp, reftemp, Iapp_override)
+    if Iapp_func is None:
+        iapp_array = np.full(nsteps, p[39], dtype=np.float64)
+    else:
+        iapp_array = np.array([Iapp_func(t) for t in t_ms], dtype=np.float64)
 
+    states = _simulate_core(p, dt, float(temp), float(reftemp), state0, iapp_array)
     return t_ms, states
 
 
@@ -315,6 +388,7 @@ def simulate(p, nsecs, temp, dt=0.1, reftemp=10.0, cis=None, Iapp_func=None):
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
     import argparse
+    import sys
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -333,12 +407,15 @@ if __name__ == '__main__':
 
     p = np.genfromtxt(args.params)
     t_ms, states = simulate(p, args.nsecs, args.temp, dt=args.dt, reftemp=args.reftemp)
+    command = "python " + " ".join(sys.argv)
 
     fig, ax = plt.subplots(figsize=(10, 3))
     ax.plot(t_ms, states[:, 0], color='black', lw=0.8)
     ax.set_xlabel('time (ms)')
     ax.set_ylabel('V (mV)')
     ax.set_title(f'{args.params} -- control (Iapp={p[39]} nA)')
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.1, 1.0, 1.0))
+    fig.text(0.5, 0.01, command, ha='center', va='bottom',
+             fontsize=6, family='monospace', color='dimgray', wrap=True)
     fig.savefig(args.outfile, dpi=200)
     print(f'saved: {args.outfile}')
