@@ -71,7 +71,14 @@ from find_silencing_threshold import (constant_iapp_func, count_spikes_and_rate,
                                       PROMINENCE_FRACTION, FLATLINE_MV,
                                       DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_SILENCING_CACHE_PATH)
 
-SCHEMA_VERSION = 3  # bumped: coarse grid now uses a fixed step size instead of a fixed point count
+SCHEMA_VERSION = 5  # bumped: capture test_v_min_pre_spike_mV / test_first_spike_ms so sag can be
+                    # assessed from the pre-spike onset trough alone -- sag is a subthreshold Ih
+                    # relaxation that can precede the first spike/burst even in a cell that goes on
+                    # to fire, so it shouldn't be restricted to fully-silent test windows (previously
+                    # test_v_min_mV/test_v_end_mV were whole-window stats that conflate this with
+                    # arbitrary spike-phase/AHP values once the cell starts firing). Also fixed a
+                    # get_or_settle_hold crash and added adaptive test-window extension (carried over
+                    # from schema 4).
 
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_held_injected_grid.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "held_injected_grid"
@@ -121,13 +128,62 @@ def settle_hold_level(params, held_nA, warm_start_state, dt, temp, reftemp,
     return r
 
 
+def compute_pre_spike_sag_trough(v_test, t_test, sag_window_ms: float):
+    """Minimum voltage from test-window onset up to whichever comes first:
+    sag_window_ms elapsed, or the first spike. Isolates the passive,
+    Ih-relaxation-style sag trough from post-spike AHP troughs, so it stays
+    meaningful even for a test window that goes on to fire tonically or
+    burst -- sag is a subthreshold phenomenon that precedes the first spike,
+    not something restricted to windows that stay silent throughout.
+
+    Deliberately does NOT also try to report a "recovered/relaxed" reference
+    voltage at the window boundary (which would let a full trough-relative-
+    to-relaxation sag *ratio* be computed the same way for firing and silent
+    windows alike): confirmed directly that the sample(s) immediately before
+    a detected spike peak are already deep in the fast Na+ upstroke, not a
+    subthreshold "relaxed" value -- e.g. one VC08B6 point had samples at
+    -30mV eight timesteps (dt=0.05ms) before the peak and +19mV one timestep
+    before it, so "last sample before the peak" is not a well-defined
+    recovery reference without proper spike-onset-boundary detection
+    (derivative threshold-crossing or similar), which is out of scope for a
+    cache-only Phase-1 feature. The trough itself doesn't have this problem
+    since np.min over the pre-spike window is unaffected by how the window's
+    *end* happens to land relative to the upstroke.
+
+    Returns (trough_mV, first_spike_ms or None).
+    """
+    v_range = v_test.max() - v_test.min()
+    first_spike_ms = None
+    if v_range >= FLATLINE_MV:
+        peaks, _ = find_peaks(v_test, prominence=v_range * PROMINENCE_FRACTION)
+        if len(peaks) > 0:
+            first_spike_ms = float(t_test[peaks[0]])
+    window_end_ms = min(sag_window_ms, first_spike_ms) if first_spike_ms is not None else sag_window_ms
+    mask = t_test <= window_end_ms
+    if not np.any(mask):
+        mask = t_test <= t_test[0]  # degenerate (window_end_ms before first sample) -- fall back to first sample
+    return float(v_test[mask].min()), first_spike_ms
+
+
 def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz, dt, temp, reftemp,
                           test_window_s, recovery_window_s, rebound_latency_min_ms,
                           min_isis_for_burst_test, isi_mode_prominence_frac, min_isi_ratio,
+                          sag_window_ms: float = 500.0,
+                          max_test_window_s: float = None, test_window_extend_factor: float = 2.0,
                           return_traces: bool = False) -> dict:
     """Test window at the ABSOLUTE injected current level (held is not added
     on top -- see module docstring) followed by a recovery window (released
     back to held) watched for post-inhibitory rebound.
+
+    If the test window comes back "insufficient_data" (too few ISIs to run
+    the bimodality test at all), the window is doubled (re-simulated from
+    the same hold_state, not extended in place -- simpler, and the retry
+    only ever happens for the minority of points that actually need it) up
+    to max_test_window_s before giving up and reporting insufficient_data
+    for real. This directly targets the dominant cause of insufficient_data:
+    firing can be much slower near a boundary than the baseline-period-scaled
+    default window assumes, exactly the lesson find_silencing_threshold.py
+    already learned (its dedicated isi_window_s exists for the same reason).
 
     return_traces=True additionally returns the raw (t_ms, v_mV) arrays for
     both windows under "_trace_*" keys (underscore-prefixed since these are
@@ -135,32 +191,44 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
     uses this, for on-demand illustrative figures; the grid sweep itself
     always calls this with the default False to keep the cache small).
     """
+    if max_test_window_s is None:
+        max_test_window_s = test_window_s
     Iapp_test = constant_iapp_func(injected_nA)
-    try:
-        t_test, states_test = simulate(params, test_window_s, temp, dt=dt, reftemp=reftemp,
-                                       cis=hold_state, Iapp_func=Iapp_test)
-    except (FloatingPointError, OverflowError, ValueError) as exc:
-        return {"blew_up": True, "error": f"test window: {exc}"}
-    if not np.all(np.isfinite(states_test)):
-        return {"blew_up": True, "error": "test window: non-finite trajectory"}
 
-    v_test = states_test[:, V_INDEX]
-    test_freq_hz, _n_peaks, test_is_flatline = count_spikes_and_rate(
-        v_test, test_window_s * 1000.0, min_peaks_for_rate=2)
-    if test_is_flatline:
-        test_pattern = "silent"
-        test_isi_short_ms = test_isi_long_ms = None
-        test_n_isis = 0
-        test_bimodality_metric = None
-    else:
-        isis_test = compute_isis_ms(v_test, t_test, PROMINENCE_FRACTION)
-        burst_test = classify_burst_pattern(isis_test, min_isis_for_burst_test,
-                                            isi_mode_prominence_frac, min_isi_ratio)
-        test_pattern = burst_test["pattern"]
-        test_isi_short_ms = burst_test["isi_short_ms"]
-        test_isi_long_ms = burst_test["isi_long_ms"]
-        test_n_isis = burst_test["n_isis"]
-        test_bimodality_metric = burst_test["bimodality_metric"]
+    window_s = test_window_s
+    while True:
+        try:
+            t_test, states_test = simulate(params, window_s, temp, dt=dt, reftemp=reftemp,
+                                           cis=hold_state, Iapp_func=Iapp_test)
+        except (FloatingPointError, OverflowError, ValueError) as exc:
+            return {"blew_up": True, "error": f"test window: {exc}"}
+        if not np.all(np.isfinite(states_test)):
+            return {"blew_up": True, "error": "test window: non-finite trajectory"}
+
+        v_test = states_test[:, V_INDEX]
+        test_freq_hz, _n_peaks, test_is_flatline = count_spikes_and_rate(
+            v_test, window_s * 1000.0, min_peaks_for_rate=2)
+        if test_is_flatline:
+            test_pattern = "silent"
+            test_isi_short_ms = test_isi_long_ms = None
+            test_n_isis = 0
+            test_bimodality_metric = None
+        else:
+            isis_test = compute_isis_ms(v_test, t_test, PROMINENCE_FRACTION)
+            burst_test = classify_burst_pattern(isis_test, min_isis_for_burst_test,
+                                                isi_mode_prominence_frac, min_isi_ratio)
+            test_pattern = burst_test["pattern"]
+            test_isi_short_ms = burst_test["isi_short_ms"]
+            test_isi_long_ms = burst_test["isi_long_ms"]
+            test_n_isis = burst_test["n_isis"]
+            test_bimodality_metric = burst_test["bimodality_metric"]
+
+        if test_pattern != "insufficient_data" or window_s >= max_test_window_s:
+            break
+        window_s = min(window_s * test_window_extend_factor, max_test_window_s)
+
+    test_v_min_pre_spike_mV, test_first_spike_ms = compute_pre_spike_sag_trough(
+        v_test, t_test, sag_window_ms)
 
     test_result = {
         "test_pattern": test_pattern, "test_isi_short_ms": test_isi_short_ms,
@@ -174,6 +242,9 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
         # than a fabricated bool.
         "test_settled": None,
         "test_v_min_mV": float(v_test.min()), "test_v_end_mV": float(v_test[-1]),
+        "test_v_min_pre_spike_mV": test_v_min_pre_spike_mV,
+        "test_first_spike_ms": test_first_spike_ms,
+        "test_window_s_used": window_s,
     }
 
     # --- recovery window: release back to held, watch for rebound ---
@@ -268,6 +339,8 @@ _TEST_RECOVERY_DEFAULTS = {
     "test_pattern": None, "test_isi_short_ms": None, "test_isi_long_ms": None,
     "test_n_isis": 0, "test_bimodality_metric": None, "test_freq_hz": 0.0,
     "test_settled": None, "test_v_min_mV": float("nan"), "test_v_end_mV": float("nan"),
+    "test_v_min_pre_spike_mV": float("nan"), "test_first_spike_ms": None,
+    "test_window_s_used": float("nan"),
     "rebound_applicable": False,
     "rebound_occurred": False, "rebound_spike_count": 0, "rebound_latency_ms": None,
     "rebound_peak_mV": None, "rebound_peak_iH_nA": None, "rebound_peak_iCaT_nA": None,
@@ -323,7 +396,15 @@ def get_or_settle_hold(params, held_nA, hold_settle_cache, y_ss, baseline_freq_h
                   "hold_v_end_mV": float(y_ss[V_INDEX])}
         hold_settle_cache[key] = result
         return result
-    nearest_key = min(hold_settle_cache.keys(), key=lambda k: abs(k - key))
+    # Only warm-start from a PREVIOUSLY SUCCESSFUL settle -- a blown-up cache
+    # entry has no "final_state" to continue from (confirmed as a real crash:
+    # a later held level whose numerically-nearest neighbor happened to be a
+    # blown-up entry raised KeyError deep inside a parallel worker). held=0.0
+    # is always seeded first and can never itself blow up (it's the cell's
+    # own cached limit-cycle state, not simulated here), so there's always at
+    # least one valid entry to fall back to.
+    valid_keys = [k for k, r in hold_settle_cache.items() if not r["blew_up"]]
+    nearest_key = min(valid_keys, key=lambda k: abs(k - key))
     warm_state = hold_settle_cache[nearest_key]["final_state"]
     result = settle_hold_level(params, key, warm_state, dt, temp, reftemp, **settle_kwargs)
     hold_settle_cache[key] = result
@@ -366,7 +447,10 @@ def build_coarse_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, args):
                          settle_rtol=args.hold_settle_rtol, min_peaks_for_rate=args.min_peaks_for_rate)
     isi_kwargs = dict(min_isis_for_burst_test=args.min_isis_for_burst_test,
                       isi_mode_prominence_frac=args.isi_mode_prominence_frac,
-                      min_isi_ratio=args.min_isi_ratio)
+                      min_isi_ratio=args.min_isi_ratio,
+                      sag_window_ms=args.sag_window_ms,
+                      max_test_window_s=args.max_test_window_s,
+                      test_window_extend_factor=args.test_window_extend_factor)
 
     baseline_period_s = 1.0 / baseline_freq_hz if baseline_freq_hz else 1.0
     test_window_s = args.fixed_test_window_s or max(args.min_test_window_s,
@@ -441,7 +525,10 @@ def refine_grid(params, grid, hold_settle_cache, y_ss, baseline_freq_hz, held_le
                          settle_rtol=args.hold_settle_rtol, min_peaks_for_rate=args.min_peaks_for_rate)
     isi_kwargs = dict(min_isis_for_burst_test=args.min_isis_for_burst_test,
                       isi_mode_prominence_frac=args.isi_mode_prominence_frac,
-                      min_isi_ratio=args.min_isi_ratio)
+                      min_isi_ratio=args.min_isi_ratio,
+                      sag_window_ms=args.sag_window_ms,
+                      max_test_window_s=args.max_test_window_s,
+                      test_window_extend_factor=args.test_window_extend_factor)
 
     depth = 0
     edges = build_edge_list(held_levels, injected_levels)
@@ -689,6 +776,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-isis-for-burst-test", type=int, default=6)
     parser.add_argument("--isi-mode-prominence-frac", type=float, default=0.05)
     parser.add_argument("--min-isi-ratio", type=float, default=1.5)
+    parser.add_argument("--sag-window-ms", type=float, default=500.0,
+                        help="Window (from test-window onset) over which the pre-spike sag trough "
+                             "(test_v_min_pre_spike_mV) is measured, truncated early if a spike occurs "
+                             "first. Captures the passive Ih-relaxation sag independent of whether the "
+                             "cell goes on to fire tonically/burst -- sag precedes the first spike, so "
+                             "it isn't restricted to windows that stay silent throughout.")
+    parser.add_argument("--max-test-window-s", type=float, default=20.0,
+                        help="If a test window comes back 'insufficient_data' (too few ISIs to "
+                             "classify at all), it's re-simulated with a longer window (doubled by "
+                             "default, see --test-window-extend-factor) up to this cap before giving "
+                             "up -- firing can be much slower near a boundary than the baseline-period "
+                             "-scaled default window assumes.")
+    parser.add_argument("--test-window-extend-factor", type=float, default=2.0,
+                        help="Multiplier applied to the test window on each insufficient_data retry.")
     return parser.parse_args()
 
 
