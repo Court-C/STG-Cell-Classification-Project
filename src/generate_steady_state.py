@@ -23,7 +23,6 @@ target one or more specific cells instead (e.g. after fixing up a cell
 that failed, to regenerate just its cache entry).
 """
 
-import pickle
 import re
 import sys
 from pathlib import Path
@@ -42,6 +41,7 @@ ROOT_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from singlecell_model_v1 import DEFAULT_CIS, simulate
+from steady_state_cache import load_cache, save_cache
 
 # Bump this whenever the shape of the result dict changes (new/renamed
 # keys) so stale cache entries computed by an older version of this script
@@ -268,18 +268,6 @@ def compute_cell_steady_state(cell_id: str,
     # equation; a second check built on the same imprecise period doesn't
     # add signal, it adds phase-drift noise.
     return {**base, "status": "ok", "y_ss": y_ss}
-
-
-def load_cache(cache_path: Path = DEFAULT_CACHE_PATH) -> dict:
-    if cache_path.exists():
-        with open(cache_path, "rb") as handle:
-            return pickle.load(handle)
-    return {}
-
-
-def save_cache(cache: dict, cache_path: Path = DEFAULT_CACHE_PATH) -> None:
-    with open(cache_path, "wb") as handle:
-        pickle.dump(cache, handle)
 
 
 def is_cache_entry_valid(entry: dict,
