@@ -1,0 +1,235 @@
+"""Generate illustrative full-trace figures for representative (cell, held,
+injected) grid points from run_held_injected_grid.py's output.
+
+run_held_injected_grid.py deliberately never persists full voltage traces
+(only scalar/derived summaries per grid point) to keep its cache small
+across 69 cells x up to ~150 points each. This script re-simulates specific
+points on demand -- reusing the exact same settle/test/recovery machinery
+(settle_hold_level, run_test_and_recovery) so the reproduced trace matches
+what actually produced the classification stored in the grid cache -- and
+plots them.
+
+For each selected cell, one exemplar point is chosen per distinct
+(test_pattern, rebound_pattern) combination actually observed in that
+cell's grid (preferring coarse-grid points, which sit further from a
+bisected boundary and are more "typical" of their region). Output is
+organized as one subfolder per cell, one file per exemplar, with the
+current levels and classification baked into the filename so the figure
+set is self-documenting without needing an index:
+
+    figures/example_traces/{cell_id}/held{H:+.2f}_inj{I:+.2f}_test-{pattern}_rebound-{pattern}.svg
+"""
+
+import pickle
+import sys
+from pathlib import Path
+import argparse
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SCRIPT_DIR.parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from singlecell_model_v1 import simulate
+from steady_state_cache import CACHE_PATH as DEFAULT_STEADY_STATE_CACHE_PATH
+from steady_state_cache import PARAMS_DIR as DEFAULT_PARAMS_DIR
+from steady_state_cache import get_cached_state
+from run_held_injected_grid import (constant_iapp_func, settle_hold_level, run_test_and_recovery,
+                                    _round_level, V_INDEX,
+                                    DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_GRID_CACHE_PATH)
+
+DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "example_traces"
+DEFAULT_FIGURE_FORMAT = "svg"
+
+# Curated to span the range of behaviors seen in the real 69-cell grid
+# (see the session that built this: richest classification diversity,
+# deepest silencing threshold, bursting-at-rest, tonic-only, deep+diverse).
+DEFAULT_CURATED_CELLS = ["W0E22J", "WX7CJ9", "2EXYPV", "4QSWXH", "5A6WBD"]
+
+
+def select_exemplar_points(grid: dict) -> dict:
+    """One representative point per distinct (test_pattern, rebound_pattern)
+    combination actually present in this cell's grid. Prefers coarse-grid
+    points (sit further from a bisected boundary, more "typical" of their
+    region than a refinement point deliberately placed right at a
+    transition) with a deterministic tie-break for reproducibility.
+    """
+    candidates: dict = {}
+    for key, point in grid.items():
+        if point["blew_up"] or point["test_pattern"] is None:
+            continue
+        combo = (point["test_pattern"], point["rebound_pattern"])
+        candidates.setdefault(combo, []).append((key, point))
+
+    selected = {}
+    for combo, pts in candidates.items():
+        pts_sorted = sorted(pts, key=lambda kp: (kp[1]["source"] != "coarse", kp[0]))
+        selected[combo] = pts_sorted[0]
+    return selected
+
+
+def resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA, cell_result, hold_tail_s) -> dict:
+    """Re-run hold-settle -> (short plotting-context hold tail) -> test ->
+    recovery for one specific grid point, using the exact same run_args the
+    original grid sweep used for this cell, and capturing full traces.
+    """
+    run_args = cell_result["run_args"]
+    dt, temp, reftemp = run_args["dt"], run_args["temp"], run_args["reftemp"]
+    settle_kwargs = dict(chunk_s=run_args["hold_settle_chunk_s"], max_settle_s=run_args["max_hold_settle_s"],
+                         settle_rtol=run_args["hold_settle_rtol"], min_peaks_for_rate=run_args["min_peaks_for_rate"])
+    isi_kwargs = dict(min_isis_for_burst_test=run_args["min_isis_for_burst_test"],
+                      isi_mode_prominence_frac=run_args["isi_mode_prominence_frac"],
+                      min_isi_ratio=run_args["min_isi_ratio"])
+
+    if _round_level(held_nA) == 0.0:
+        hold_final_state = y_ss.copy()
+        hold_freq_hz = baseline_freq_hz
+    else:
+        hold_result = settle_hold_level(params, held_nA, y_ss.copy(), dt, temp, reftemp, **settle_kwargs)
+        if hold_result["blew_up"]:
+            return {"blew_up": True, "error": hold_result.get("error"), "stage": "hold"}
+        hold_final_state = hold_result["final_state"]
+        hold_freq_hz = hold_result["freq_hz"] or 0.0
+
+    # Short dedicated hold-only segment, purely for plotting context before
+    # the test window -- continues at the same held level from the settled
+    # state, so it's just a further stretch of the same trajectory.
+    Iapp_hold = constant_iapp_func(held_nA)
+    try:
+        t_hold, states_hold = simulate(params, hold_tail_s, temp, dt=dt, reftemp=reftemp,
+                                       cis=hold_final_state, Iapp_func=Iapp_hold)
+    except (FloatingPointError, OverflowError, ValueError) as exc:
+        return {"blew_up": True, "error": f"hold tail: {exc}", "stage": "hold_tail"}
+    if not np.all(np.isfinite(states_hold)):
+        return {"blew_up": True, "error": "hold tail: non-finite trajectory", "stage": "hold_tail"}
+
+    tr = run_test_and_recovery(params, states_hold[-1], held_nA, injected_nA, hold_freq_hz,
+                               dt, temp, reftemp, cell_result["test_window_s"], cell_result["recovery_window_s"],
+                               run_args["rebound_latency_min_ms"], return_traces=True, **isi_kwargs)
+    if tr["blew_up"]:
+        tr.setdefault("stage", "test_or_recovery")
+        return tr
+
+    tr["_trace_t_hold_ms"] = t_hold
+    tr["_trace_v_hold_mV"] = states_hold[:, V_INDEX]
+    return tr
+
+
+def plot_example_trace(cell_id: str, held_nA: float, injected_nA: float,
+                       test_pattern: str, rebound_pattern: str, tr: dict,
+                       outdir: Path, command: str, fig_format: str) -> Path:
+    t_hold, v_hold = tr["_trace_t_hold_ms"], tr["_trace_v_hold_mV"]
+    t_test, v_test = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
+    t_rec, v_rec = tr["_trace_t_rec_ms"], tr["_trace_v_rec_mV"]
+
+    dt_ms = t_hold[1] - t_hold[0] if len(t_hold) > 1 else 0.1
+    hold_end = t_hold[-1] + dt_ms if len(t_hold) else 0.0
+    t_test_off = t_test + hold_end
+    test_end = t_test_off[-1] + dt_ms if len(t_test_off) else hold_end
+    t_rec_off = t_rec + test_end
+
+    fig, (ax_v, ax_i) = plt.subplots(2, 1, figsize=(10, 5), sharex=True,
+                                     gridspec_kw={"height_ratios": [3, 1]})
+    ax_v.plot(t_hold, v_hold, color="gray", lw=0.8, label=f"hold ({held_nA:.2f} nA)")
+    ax_v.plot(t_test_off, v_test, color="firebrick", lw=0.8, label=f"test ({injected_nA:.2f} nA)")
+    ax_v.plot(t_rec_off, v_rec, color="steelblue", lw=0.8, label=f"recovery ({held_nA:.2f} nA)")
+    ax_v.axvline(hold_end, color="black", ls=":", lw=1)
+    ax_v.axvline(test_end, color="black", ls=":", lw=1)
+    ax_v.set_ylabel("V (mV)")
+    ax_v.legend(loc="upper right", fontsize=7)
+    ax_v.set_title(f"{cell_id} — held={held_nA:.2f} nA, injected={injected_nA:.2f} nA — "
+                   f"test: {test_pattern}, rebound: {rebound_pattern}", fontsize=9)
+
+    ax_i.plot(t_hold, np.full_like(t_hold, held_nA), color="gray", lw=1.2)
+    ax_i.plot(t_test_off, np.full_like(t_test_off, injected_nA), color="firebrick", lw=1.2)
+    ax_i.plot(t_rec_off, np.full_like(t_rec_off, held_nA), color="steelblue", lw=1.2)
+    ax_i.set_ylabel("Iapp (nA)")
+    ax_i.set_xlabel("time (ms)")
+
+    fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
+    fig.text(0.5, 0.01, command, ha="center", va="bottom",
+             fontsize=6, family="monospace", color="dimgray", wrap=True)
+
+    cell_dir = outdir / cell_id
+    cell_dir.mkdir(parents=True, exist_ok=True)
+    # Double-underscore section separators so e.g. test_pattern="bursting" +
+    # rebound_pattern="bursting_rebound" can't visually run together into an
+    # ambiguous single field (confirmed this was a real readability problem
+    # with single-underscore separators before this fix).
+    slug = f"held{held_nA:+.2f}__inj{injected_nA:+.2f}__test-{test_pattern}__rebound-{rebound_pattern}"
+    outpath = cell_dir / f"{slug}.{fig_format}"
+    fig.savefig(outpath, format=fig_format, dpi=150)
+    plt.close(fig)
+    return outpath
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate illustrative full-trace figures for representative (cell, held, "
+                    "injected) grid points, re-simulated on demand since run_held_injected_grid.py "
+                    "deliberately does not persist full traces in its cache.")
+    parser.add_argument("--cells", nargs="+", default=None,
+                        help="Cell ID(s) to generate example traces for. Default: a curated set of "
+                             f"{len(DEFAULT_CURATED_CELLS)} cells spanning the range of behaviors "
+                             "observed in the full grid sweep.")
+    parser.add_argument("--params-dir", default=DEFAULT_PARAMS_DIR)
+    parser.add_argument("--steady-state-cache", default=DEFAULT_STEADY_STATE_CACHE_PATH)
+    parser.add_argument("--grid-cache", default=DEFAULT_GRID_CACHE_PATH,
+                        help="Path to run_held_injected_grid.py's output cache (input, read-only).")
+    parser.add_argument("--figures-dir", default=DEFAULT_FIGURES_DIR)
+    parser.add_argument("--figure-format", default=DEFAULT_FIGURE_FORMAT, choices=["svg", "png", "pdf"])
+    parser.add_argument("--hold-tail-s", type=float, default=2.0,
+                        help="Duration of hold-only context shown before the test window (s).")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    command = "python " + " ".join(sys.argv)
+    cells_to_run = args.cells or DEFAULT_CURATED_CELLS
+
+    with open(args.grid_cache, "rb") as handle:
+        grid_cache = pickle.load(handle)
+
+    figures_dir = Path(args.figures_dir)
+    ss_cache_path = Path(args.steady_state_cache)
+
+    total_written, total_failed = 0, 0
+    for cell_id in cells_to_run:
+        cell_result = grid_cache.get(cell_id)
+        if cell_result is None or cell_result["status"] != "ok":
+            print(f"{cell_id}: skipped -- not present or not status 'ok' in {args.grid_cache}")
+            continue
+
+        params = cell_result["params"]
+        ss_entry = get_cached_state(cell_id, params, cache_path=ss_cache_path)
+        if ss_entry is None:
+            print(f"{cell_id}: skipped -- no valid steady-state cache entry")
+            continue
+        y_ss, baseline_freq_hz = ss_entry["y_ss"], ss_entry["freq_hz"]
+
+        exemplars = select_exemplar_points(cell_result["grid"])
+        print(f"{cell_id}: {len(exemplars)} exemplar point(s)")
+        for (test_pattern, rebound_pattern), (key, _point) in sorted(exemplars.items()):
+            held_nA, injected_nA = key
+            tr = resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA,
+                                  cell_result, args.hold_tail_s)
+            if tr["blew_up"]:
+                print(f"  ({held_nA:+.2f}, {injected_nA:+.2f}) [{test_pattern}/{rebound_pattern}]: "
+                     f"blew up re-simulating ({tr.get('stage')}: {tr.get('error')})")
+                total_failed += 1
+                continue
+            outpath = plot_example_trace(cell_id, held_nA, injected_nA, test_pattern, rebound_pattern,
+                                         tr, figures_dir, command, args.figure_format)
+            print(f"  ({held_nA:+.2f}, {injected_nA:+.2f}) [{test_pattern}/{rebound_pattern}] -> {outpath}")
+            total_written += 1
+
+    print(f"\n{total_written} trace figure(s) written to {figures_dir}/, {total_failed} failed to re-simulate.")
+
+
+if __name__ == "__main__":
+    main()

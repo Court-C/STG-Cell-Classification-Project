@@ -123,10 +123,17 @@ def settle_hold_level(params, held_nA, warm_start_state, dt, temp, reftemp,
 
 def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz, dt, temp, reftemp,
                           test_window_s, recovery_window_s, rebound_latency_min_ms,
-                          min_isis_for_burst_test, isi_mode_prominence_frac, min_isi_ratio) -> dict:
+                          min_isis_for_burst_test, isi_mode_prominence_frac, min_isi_ratio,
+                          return_traces: bool = False) -> dict:
     """Test window at the ABSOLUTE injected current level (held is not added
     on top -- see module docstring) followed by a recovery window (released
     back to held) watched for post-inhibitory rebound.
+
+    return_traces=True additionally returns the raw (t_ms, v_mV) arrays for
+    both windows under "_trace_*" keys (underscore-prefixed since these are
+    never meant to reach the persisted grid cache -- only plot_example_traces.py
+    uses this, for on-demand illustrative figures; the grid sweep itself
+    always calls this with the default False to keep the cache small).
     """
     Iapp_test = constant_iapp_func(injected_nA)
     try:
@@ -242,7 +249,13 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
         "recovery_v_min_mV": recovery_v_min_mV, "recovery_v_final_mV": recovery_v_final_mV,
     }
 
-    return {"blew_up": False, "error": None, **test_result, **recovery_result}
+    result = {"blew_up": False, "error": None, **test_result, **recovery_result}
+    if return_traces:
+        result["_trace_t_test_ms"] = t_test
+        result["_trace_v_test_mV"] = v_test
+        result["_trace_t_rec_ms"] = t_rec
+        result["_trace_v_rec_mV"] = v_rec
+    return result
 
 
 # Full set of test-/recovery-stage defaults, used both for a hold-stage
