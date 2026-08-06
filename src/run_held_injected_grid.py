@@ -71,7 +71,7 @@ from find_silencing_threshold import (constant_iapp_func, count_spikes_and_rate,
                                       PROMINENCE_FRACTION, FLATLINE_MV,
                                       DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_SILENCING_CACHE_PATH)
 
-SCHEMA_VERSION = 2  # bumped: injected is now an absolute test-window level, not added on top of held
+SCHEMA_VERSION = 3  # bumped: coarse grid now uses a fixed step size instead of a fixed point count
 
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_held_injected_grid.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "held_injected_grid"
@@ -334,9 +334,33 @@ def get_or_settle_hold(params, held_nA, hold_settle_cache, y_ss, baseline_freq_h
 # 2a: coarse grid
 # ---------------------------------------------------------------------------
 
+def _build_levels(step_nA: float, cell_floor_nA: float) -> list:
+    """Steps down from 0 by a FIXED step size (matching Step 1's own
+    coarse_step_nA convention) until reaching cell_floor_nA, rather than
+    dividing this cell's own (non-round, cell-specific) floor into a fixed
+    number of points. The latter was the original design and produced
+    non-round, cell-specific step sizes (e.g. 0.68 nA for one cell, 3.2 nA
+    for another) that made grid values look arbitrary and hard to compare
+    across cells -- fixed step size gives round, physically interpretable
+    values (0, -0.5, -1.0, ...) at the cost of point count varying by each
+    cell's own range instead of being forced to a constant count.
+    cell_floor_nA is always included as the final point even if it isn't an
+    exact multiple of step_nA, so the swept range still reaches exactly as
+    far as Step 1's threshold anchoring intended.
+    """
+    levels = [0.0]
+    level = _round_level(-step_nA)
+    while level > cell_floor_nA:
+        levels.append(level)
+        level = _round_level(level - step_nA)
+    if levels[-1] != _round_level(cell_floor_nA):
+        levels.append(_round_level(cell_floor_nA))
+    return levels
+
+
 def build_coarse_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, args):
-    held_levels = [_round_level(x) for x in np.linspace(0, cell_floor_nA, args.coarse_n_held)]
-    injected_levels = [_round_level(x) for x in np.linspace(0, cell_floor_nA, args.coarse_n_injected)]
+    held_levels = _build_levels(args.coarse_step_held_nA, cell_floor_nA)
+    injected_levels = _build_levels(args.coarse_step_injected_nA, cell_floor_nA)
 
     settle_kwargs = dict(chunk_s=args.hold_settle_chunk_s, max_settle_s=args.max_hold_settle_s,
                          settle_rtol=args.hold_settle_rtol, min_peaks_for_rate=args.min_peaks_for_rate)
@@ -618,10 +642,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dt", type=float, default=DEFAULT_DT_MS)
     parser.add_argument("--jobs", type=int, default=-1)
 
-    parser.add_argument("--coarse-n-held", type=int, default=7,
-                        help="Number of held-current levels in the coarse grid (0 to cell_floor_nA, inclusive).")
-    parser.add_argument("--coarse-n-injected", type=int, default=7,
-                        help="Number of injected-current levels in the coarse grid.")
+    parser.add_argument("--coarse-step-held-nA", type=float, default=0.5,
+                        help="Fixed held-current step size for the coarse grid (0 down to cell_floor_nA), "
+                             "matching Step 1's own coarse_step_nA convention -- gives round, "
+                             "cell-comparable values rather than dividing each cell's own floor into a "
+                             "fixed point count. Point count therefore varies per cell; a 2D grid at a "
+                             "fixed step is quadratically more expensive for deep-threshold cells.")
+    parser.add_argument("--coarse-step-injected-nA", type=float, default=0.5,
+                        help="Fixed injected-current step size for the coarse grid.")
     parser.add_argument("--cell-floor-margin-nA", type=float, default=1.0,
                         help="Both axes span [0, silencing_threshold - margin]. "
                              "Margin gives headroom past the cell's own confirmed quiescent level.")
