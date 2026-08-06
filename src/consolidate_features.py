@@ -260,6 +260,47 @@ def plot_pca(pca_result: dict, outdir: Path, command: str, fig_format: str) -> N
     plt.close(fig)
 
 
+def plot_feature_distributions(table: pd.DataFrame, outdir: Path, command: str, fig_format: str) -> None:
+    """One small figure per master_features.csv column, showing every
+    cell's value for that feature -- previously no raw column had any plot
+    at all (only the PCA-combined PC1-vs-PC2 figure existed). Numeric
+    columns get a per-cell bar sorted by value (NaN/missing cells excluded,
+    the count noted in the title); the two non-numeric columns
+    (silencing_status, any_bursting_before_silence) get a category-count
+    bar instead, since "sorted by value" isn't meaningful for those.
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+    categorical_cols = ["silencing_status", "any_bursting_before_silence"]
+
+    for col in table.columns:
+        series = table[col]
+        fig, ax = plt.subplots(figsize=(max(6, 0.12 * len(table)), 4))
+
+        if col in categorical_cols:
+            counts = series.astype("string").fillna("<missing>").value_counts()
+            ax.bar(counts.index.astype(str), counts.values, color="steelblue")
+            ax.set_ylabel("n cells")
+            ax.set_title(f"{col} (n={len(table)})", fontsize=10)
+        else:
+            valid = series.dropna().sort_values()
+            n_missing = series.isna().sum()
+            if len(valid) == 0:
+                plt.close(fig)
+                continue
+            ax.bar(range(len(valid)), valid.values, color="steelblue")
+            ax.set_xticks(range(len(valid)))
+            ax.set_xticklabels(valid.index, rotation=90, fontsize=5)
+            ax.set_ylabel(col)
+            title = f"{col} (n={len(valid)}"
+            title += f", {n_missing} missing)" if n_missing else ")"
+            ax.set_title(title, fontsize=10)
+
+        fig.tight_layout(rect=(0.0, 0.05, 1.0, 1.0))
+        fig.text(0.5, 0.01, command, ha="center", va="bottom", fontsize=5, color="gray")
+        fig.savefig(outdir / f"{col}.{fig_format}")
+        plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -277,7 +318,8 @@ def parse_args() -> argparse.Namespace:
                              "the console), for inspecting what drives PC2+ directly.")
     parser.add_argument("--figures-dir", default=DEFAULT_FIGURES_DIR)
     parser.add_argument("--figure-format", default=DEFAULT_FIGURE_FORMAT, choices=["svg", "png", "pdf"])
-    parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument("--no-plot", action="store_true",
+                        help="Skip both the per-feature distribution plots and the PCA figure.")
     parser.add_argument("--no-pca", action="store_true")
     parser.add_argument("--min-feature-coverage", type=float, default=0.85,
                         help="Features present for fewer than this fraction of cells are dropped "
@@ -303,6 +345,11 @@ def main() -> None:
         print("\nMissing-value counts per numeric column (of "
               f"{table.shape[0]} cells):")
         print(n_missing.to_string())
+
+    if not args.no_plot:
+        dist_dir = Path(args.figures_dir) / "feature_distributions"
+        plot_feature_distributions(table, dist_dir, command, args.figure_format)
+        print(f"\nPer-feature distribution plots ({table.shape[1]} features) written to {dist_dir}/")
 
     if args.no_pca:
         return

@@ -735,46 +735,75 @@ def _fine_grid_coords(cell_floor_nA: float, injected_floor_nA: float, resolution
     return np.meshgrid(held_coords, injected_coords)
 
 
-def _interpolate_continuous(held, injected, values, hh, ii):
-    """Cubic (piecewise Clough-Tocher) interpolation for a genuinely smooth
-    render -- linear interpolation is only C0 continuous, so its flat
-    triangular facets show up as visible sharp edges/faceting once you
-    render at a fine resolution, confirmed directly to look bad on the
-    rebound-latency/i_H panels here. Cubic is C1 continuous (smooth
-    gradients, not flat planes).
+def _merge_close_points(held, injected, values, tolerance_nA, is_categorical=False):
+    """Groups real points whose (held, injected) coordinates fall within
+    tolerance_nA of each other (snapped to a tolerance_nA grid) and averages
+    their values into one representative point per group -- mean for a
+    continuous quantity, mode (most common code) for a categorical one.
 
-    Falls back through linear, then nearest, for whatever cubic itself
-    leaves as NaN -- cubic can fail to produce a value both outside the
-    convex hull (same reason linear does) AND occasionally inside it for
-    ill-conditioned local point configurations, so a single fallback isn't
-    always enough. Nearest-neighbor is the final backstop (same pattern
-    already used in extract_grid_features.py's normalize_grid_to_common_coords)
-    since it always produces *something*, even if not smooth in that region.
+    This is where genuine "averaging between data points" happens, targeted
+    specifically at near-duplicate point clusters: confirmed directly on
+    real data (4QSWXH) that nearest-neighbor distances between real grid
+    points span from 4e-6 nA to 0.214 nA -- a >53,000x spread -- because
+    refine_grid's edge bisection keeps halving the gap between two points
+    right up to --min-edge-nA, while coarse regions stay at the full coarse
+    step. That extreme non-uniformity, not sparse resolution, is what made
+    cubic interpolation ring/overshoot (Clough-Tocher triangulation is
+    numerically ill-conditioned on near-zero-area triangles). tolerance_nA
+    defaults to --min-edge-nA itself: refinement never intentionally places
+    two distinct points closer than that, so anything closer than it is a
+    near-duplicate artifact of the bisection process, not independent
+    signal -- merging it isn't discarding real information.
+
+    Returns (merged_held, merged_injected, merged_values), each 1D arrays,
+    one entry per group.
     """
-    finite = np.isfinite(values)
-    if finite.sum() < 3:
+    finite = np.isfinite(values) if not is_categorical else np.ones(len(values), dtype=bool)
+    held, injected, values = held[finite], injected[finite], values[finite]
+    if len(held) == 0:
+        return held, injected, values
+
+    snapped_h = np.round(held / tolerance_nA).astype(np.int64)
+    snapped_i = np.round(injected / tolerance_nA).astype(np.int64)
+    groups: dict = {}
+    for h, i, v, sh, si in zip(held, injected, values, snapped_h, snapped_i):
+        groups.setdefault((sh, si), {"h": [], "i": [], "v": []})
+        g = groups[(sh, si)]
+        g["h"].append(h)
+        g["i"].append(i)
+        g["v"].append(v)
+
+    merged_h = np.empty(len(groups))
+    merged_i = np.empty(len(groups))
+    merged_v = np.empty(len(groups))
+    for idx, g in enumerate(groups.values()):
+        merged_h[idx] = np.mean(g["h"])
+        merged_i[idx] = np.mean(g["i"])
+        if is_categorical:
+            vals, counts = np.unique(g["v"], return_counts=True)
+            merged_v[idx] = vals[np.argmax(counts)]
+        else:
+            merged_v[idx] = np.mean(g["v"])
+    return merged_h, merged_i, merged_v
+
+
+def _render_heatmap(held, injected, values, hh, ii, tolerance_nA, is_categorical=False):
+    """Merge-then-nearest-neighbor render: _merge_close_points collapses
+    near-duplicate real points into local averages (see its docstring),
+    then a plain nearest-neighbor lookup places each render pixel at its
+    closest *merged* point's value. Nearest-neighbor is bounded by the real
+    (now-deduplicated) data's own value range -- unlike cubic/linear, it
+    cannot ring or overshoot beyond what real nearby measurements support,
+    which is exactly what produced the reported "distorted" panels (cubic
+    interpolation over the extremely non-uniform point cloud described in
+    _merge_close_points). Returns an all-NaN grid if fewer than 1 real
+    (merged) point survives.
+    """
+    m_held, m_injected, m_values = _merge_close_points(held, injected, values, tolerance_nA, is_categorical)
+    if len(m_held) == 0:
         return np.full(hh.shape, np.nan)
-    pts = np.column_stack([held[finite], injected[finite]])
-    vals = values[finite]
-    interpolated = griddata(pts, vals, (hh, ii), method="cubic")
-    nan_mask = np.isnan(interpolated)
-    if nan_mask.any() and not nan_mask.all():
-        linear = griddata(pts, vals, (hh, ii), method="linear")
-        interpolated[nan_mask] = linear[nan_mask]
-        nan_mask = np.isnan(interpolated)
-    if nan_mask.any() and not nan_mask.all():
-        nearest = griddata(pts, vals, (hh, ii), method="nearest")
-        interpolated[nan_mask] = nearest[nan_mask]
-    return interpolated
-
-
-def _interpolate_categorical(held, injected, codes, hh, ii):
-    """Nearest-neighbor only -- unlike a continuous quantity, blending two
-    category codes (e.g. "tonic"=1, "bursting"=2) via linear interpolation
-    would produce a meaningless intermediate value, not a real category.
-    """
-    pts = np.column_stack([held, injected])
-    return griddata(pts, codes, (hh, ii), method="nearest")
+    pts = np.column_stack([m_held, m_injected])
+    return griddata(pts, m_values, (hh, ii), method="nearest")
 
 
 def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: str = DEFAULT_FIGURE_FORMAT) -> None:
@@ -786,13 +815,18 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
     injected = np.array([p["injected_nA"] for p in grid.values()])
     hh, ii = _fine_grid_coords(cell_result["cell_floor_nA"], cell_result["injected_floor_nA"])
     extent = (cell_result["cell_floor_nA"], 0, cell_result["injected_floor_nA"], 0)
+    # Same tolerance this cell's own sweep used to decide "two points are
+    # meaningfully distinct" (see _merge_close_points) -- not a separate,
+    # possibly-mismatched constant.
+    merge_tolerance_nA = cell_result["run_args"]["min_edge_nA"]
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 9))
 
     pattern_names = list(PATTERN_COLORS.keys())
     pattern_codes = np.array([pattern_names.index(p["test_pattern"] or "insufficient_data")
-                              for p in grid.values()])
-    pattern_grid = _interpolate_categorical(held, injected, pattern_codes, hh, ii)
+                              for p in grid.values()], dtype=float)
+    pattern_grid = _render_heatmap(held, injected, pattern_codes, hh, ii, merge_tolerance_nA,
+                                   is_categorical=True)
     pattern_cmap = ListedColormap(list(PATTERN_COLORS.values()))
     pattern_norm = BoundaryNorm(np.arange(len(pattern_names) + 1) - 0.5, pattern_cmap.N)
     # Colormap the category codes to RGBA ourselves, THEN let imshow blend
@@ -820,14 +854,14 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
     # misleading claim from "checked and found none".
     rebound_counts = np.array([float(p["rebound_spike_count"]) if p["rebound_applicable"] else np.nan
                                for p in grid.values()])
-    rebound_grid = _interpolate_continuous(held, injected, rebound_counts, hh, ii)
+    rebound_grid = _render_heatmap(held, injected, rebound_counts, hh, ii, merge_tolerance_nA)
     im = axes[0, 1].imshow(rebound_grid, origin="lower", extent=extent, aspect="auto", cmap="Oranges",
                            interpolation="bilinear")
     fig.colorbar(im, ax=axes[0, 1], label="rebound spike count")
     axes[0, 1].set_title("rebound spike count (blank = not applicable)", fontsize=9)
 
     lat = np.array([p["rebound_latency_ms"] if p["rebound_occurred"] else np.nan for p in grid.values()])
-    lat_grid = _interpolate_continuous(held, injected, lat, hh, ii)
+    lat_grid = _render_heatmap(held, injected, lat, hh, ii, merge_tolerance_nA)
     im = axes[1, 0].imshow(lat_grid, origin="lower", extent=extent, aspect="auto", cmap="viridis",
                            interpolation="bilinear")
     fig.colorbar(im, ax=axes[1, 0], label="ms")
@@ -835,7 +869,7 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
 
     iH = np.array([p["rebound_peak_iH_nA"] if p["rebound_peak_iH_nA"] is not None else np.nan
                   for p in grid.values()])
-    iH_grid = _interpolate_continuous(held, injected, iH, hh, ii)
+    iH_grid = _render_heatmap(held, injected, iH, hh, ii, merge_tolerance_nA)
     im = axes[1, 1].imshow(iH_grid, origin="lower", extent=extent, aspect="auto", cmap="magma",
                            interpolation="bilinear")
     fig.colorbar(im, ax=axes[1, 1], label="nA")

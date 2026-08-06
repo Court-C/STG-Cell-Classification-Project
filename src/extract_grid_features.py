@@ -30,6 +30,7 @@ import argparse
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
 import numpy as np
 from joblib import Parallel, delayed
 from scipy.interpolate import griddata
@@ -39,6 +40,7 @@ ROOT_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from run_held_injected_grid import DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_GRID_CACHE_PATH
+from run_held_injected_grid import _fine_grid_coords, _render_heatmap
 
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_grid_features.pkl"
 DEFAULT_PCA_OUTPUT_PATH = ROOT_DIR / "cell_grid_features_pca.pkl"
@@ -305,7 +307,9 @@ def extract_cell_features(cell_id: str, cell_result: dict) -> dict:
     if not grid:
         return {**base, "status": "no_grid_data", "grid_status": "empty"}
 
-    features = {**base, "status": "ok", "cell_floor_nA": cell_result["cell_floor_nA"]}
+    features = {**base, "status": "ok", "cell_floor_nA": cell_result["cell_floor_nA"],
+               "injected_floor_nA": cell_result["injected_floor_nA"],
+               "min_edge_nA": cell_result["run_args"]["min_edge_nA"]}
     features.update(compute_fi_slope(grid))
     features.update(compute_burstiness(grid))
     features.update(compute_summary_stats(grid))
@@ -421,45 +425,116 @@ def run_pca(pca_input: dict) -> dict:
 # Figures
 # ---------------------------------------------------------------------------
 
+REBOUND_PATTERN_COLORS = {"none": "gray", "single_spike": "steelblue",
+                          "tonic_rebound": "seagreen", "bursting_rebound": "mediumpurple",
+                          "not_applicable": "lightgray"}
+
+# (map key, panel title, colormap) for every continuous map feature
+# extract_cell_features returns. rebound_occurred_map's booleans are cast to
+# 0.0/1.0 -- merging near-duplicate points (see _merge_close_points) then
+# naturally reports the local fraction that occurred, not just an on/off flag.
+CONTINUOUS_MAP_PANELS = [
+    ("sag_depth_map", "sag depth (mV)", "coolwarm"),
+    ("adaptation_ratio_map", "adaptation ratio (tonic)", "plasma"),
+    ("firing_rate_map", "firing rate (Hz)", "viridis"),
+    ("rebound_occurred_map", "rebound occurred (fraction)", "Oranges"),
+    ("rebound_count_map", "rebound spike count", "YlOrBr"),
+    ("rebound_latency_map", "rebound latency (ms)", "viridis"),
+    ("rebound_peak_mV_map", "rebound peak (mV)", "magma"),
+    ("intra_burst_rate_map", "intra-burst rate (Hz)", "cividis"),
+    ("burst_freq_approx_map", "burst freq, approx (Hz)", "cividis"),
+    ("n_bursts_map", "n bursts", "plasma"),
+    ("spikes_per_burst_map", "spikes per burst", "plasma"),
+]
+
+
+def _map_to_arrays(feature_map: dict):
+    keys = list(feature_map.keys())
+    held = np.array([k[0] for k in keys], dtype=float)
+    injected = np.array([k[1] for k in keys], dtype=float)
+    values = np.array([float(feature_map[k]) for k in keys], dtype=float)
+    return held, injected, values
+
+
 def plot_cell_features(cell_id: str, features: dict, outdir: Path, command: str, fig_format: str) -> None:
+    """One heat-map panel per map-valued feature extract_cell_features
+    returns (12 total: sag depth, adaptation ratio, firing rate, rebound
+    occurred/count/latency/peak/pattern, intra-burst rate, approx burst
+    freq, n bursts, spikes/burst) -- previously only 2 of these had any
+    panel at all. Reuses run_held_injected_grid.py's merge-then-nearest-
+    neighbor renderer (_fine_grid_coords/_render_heatmap) rather than a
+    second scatter/interpolation implementation, so these panels get the
+    same non-distorting rendering as the grid figures.
+    """
     if features["status"] != "ok":
         return
-    sag_map = features["sag_depth_map"]
-    rebound_map = features["rebound_occurred_map"]
-    if not sag_map and not rebound_map:
+
+    hh, ii = _fine_grid_coords(features["cell_floor_nA"], features["injected_floor_nA"])
+    extent = (features["cell_floor_nA"], 0, features["injected_floor_nA"], 0)
+    tolerance_nA = features["min_edge_nA"]
+
+    fig, axes = plt.subplots(3, 4, figsize=(19, 13))
+    axes_flat = axes.flat
+
+    any_data = False
+    for map_key, panel_title, cmap in CONTINUOUS_MAP_PANELS:
+        ax = next(axes_flat)
+        feature_map = features.get(map_key) or {}
+        if feature_map:
+            any_data = True
+            held, injected, values = _map_to_arrays(feature_map)
+            grid = _render_heatmap(held, injected, values, hh, ii, tolerance_nA)
+            im = ax.imshow(grid, origin="lower", extent=extent, aspect="auto", cmap=cmap,
+                           interpolation="bilinear")
+            fig.colorbar(im, ax=ax)
+        else:
+            # Blank panel (e.g. no bursting points at all for this cell) --
+            # still show the real axis extent rather than matplotlib's
+            # default [0,1] unit square, so it reads as "genuinely no data"
+            # rather than a mislabeled/confusing scale.
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
+        ax.set_title(panel_title, fontsize=9)
+        ax.set_xlabel("held (nA)")
+        ax.set_ylabel("injected (nA)")
+        ax.invert_xaxis()
+        ax.invert_yaxis()
+
+    # rebound_pattern_map is categorical -- mode-merge, same treatment as
+    # the grid figure's firing-pattern panel.
+    ax = next(axes_flat)
+    pattern_map = features.get("rebound_pattern_map") or {}
+    if pattern_map:
+        any_data = True
+        pattern_names = list(REBOUND_PATTERN_COLORS.keys())
+        held, injected, _ = _map_to_arrays({k: 0.0 for k in pattern_map})
+        codes = np.array([pattern_names.index(v) for v in pattern_map.values()], dtype=float)
+        pattern_grid = _render_heatmap(held, injected, codes, hh, ii, tolerance_nA, is_categorical=True)
+        pattern_cmap = ListedColormap(list(REBOUND_PATTERN_COLORS.values()))
+        pattern_norm = BoundaryNorm(np.arange(len(pattern_names) + 1) - 0.5, pattern_cmap.N)
+        pattern_rgba = pattern_cmap(pattern_norm(pattern_grid))
+        ax.imshow(pattern_rgba, origin="lower", extent=extent, aspect="auto", interpolation="bilinear")
+        handles = [plt.Line2D([0], [0], marker="s", color="w", markerfacecolor=c, markersize=8, label=lbl)
+                  for lbl, c in REBOUND_PATTERN_COLORS.items()]
+        ax.legend(handles=handles, loc="best", fontsize=5)
+    else:
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+    ax.set_title("rebound pattern", fontsize=9)
+    ax.set_xlabel("held (nA)")
+    ax.set_ylabel("injected (nA)")
+    ax.invert_xaxis()
+    ax.invert_yaxis()
+
+    if not any_data:
+        plt.close(fig)
         return
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
-
-    if sag_map:
-        keys = list(sag_map.keys())
-        held = [k[0] for k in keys]
-        injected = [k[1] for k in keys]
-        vals = [sag_map[k] for k in keys]
-        sc = axes[0].scatter(held, injected, c=vals, cmap="coolwarm", s=25)
-        fig.colorbar(sc, ax=axes[0], label="sag depth (mV)")
-    axes[0].set_title("sag depth map (mV)", fontsize=9)
-    axes[0].set_xlabel("held (nA)")
-    axes[0].set_ylabel("injected (nA)")
-    axes[0].invert_xaxis()
-    axes[0].invert_yaxis()
-
-    if rebound_map:
-        keys = list(rebound_map.keys())
-        held = [k[0] for k in keys]
-        injected = [k[1] for k in keys]
-        colors = ["darkorange" if rebound_map[k] else "lightgray" for k in keys]
-        axes[1].scatter(held, injected, c=colors, s=25)
-    axes[1].set_title("rebound occurred", fontsize=9)
-    axes[1].set_xlabel("held (nA)")
-    axes[1].set_ylabel("injected (nA)")
-    axes[1].invert_xaxis()
-    axes[1].invert_yaxis()
-
-    title = f"{cell_id} — burstiness={features.get('burstiness_index')}, F-I slope={features.get('fi_slope_hz_per_nA')}"
-    fig.suptitle(title, fontsize=9)
-    fig.tight_layout(rect=(0.0, 0.06, 1.0, 0.95))
-    fig.text(0.5, 0.01, command, ha="center", va="bottom",
+    title = (f"{cell_id} — burstiness={features.get('burstiness_index')}, "
+            f"F-I slope={features.get('fi_slope_hz_per_nA')}")
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout(rect=(0.0, 0.02, 1.0, 0.96))
+    fig.text(0.5, 0.005, command, ha="center", va="bottom",
              fontsize=6, family="monospace", color="dimgray", wrap=True)
     outpath = outdir / f"{cell_id}_features.{fig_format}"
     fig.savefig(outpath, format=fig_format, dpi=150)
