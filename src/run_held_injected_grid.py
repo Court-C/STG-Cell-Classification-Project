@@ -57,9 +57,11 @@ import argparse
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
 import numpy as np
 from joblib import Parallel, delayed
 from scipy.signal import find_peaks
+from scipy.interpolate import griddata
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
@@ -457,6 +459,28 @@ def get_or_settle_hold(params, held_nA, hold_settle_cache, y_ss, baseline_freq_h
 # 2a: coarse grid
 # ---------------------------------------------------------------------------
 
+def _adaptive_step(default_step_nA: float, floor_nA: float, min_points: int) -> float:
+    """Shrinks the coarse-grid step for a shallow-floor cell so it still
+    gets at least min_points levels on this axis, without ever coarsening a
+    cell that already clears that bar at the default step. Confirmed
+    directly this matters: at the 0.5nA default, a cell with floor=-3nA
+    (e.g. 4QSWXH) gets only 7 held levels, while a cell with floor=-17nA
+    (e.g. VC08B6) gets 36 -- a >5x density gap driven purely by how deep
+    each cell's own floor happens to be, not by anything about the sweep
+    itself.
+
+    _build_levels produces roughly |floor_nA| / step + 1 levels (0 plus
+    however many steps reach the floor, floor itself always included), so
+    solving for the step that yields exactly min_points gives
+    |floor_nA| / (min_points - 1); taking the min with default_step_nA means
+    this can only ever shrink the step, never grow it past the default.
+    """
+    if min_points < 2 or floor_nA == 0:
+        return default_step_nA
+    guaranteed_step = abs(floor_nA) / (min_points - 1)
+    return min(default_step_nA, guaranteed_step)
+
+
 def _build_levels(step_nA: float, cell_floor_nA: float) -> list:
     """Steps down from 0 by a FIXED step size (matching Step 1's own
     coarse_step_nA convention) until reaching cell_floor_nA, rather than
@@ -482,8 +506,10 @@ def _build_levels(step_nA: float, cell_floor_nA: float) -> list:
 
 
 def build_coarse_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_floor_nA, args):
-    held_levels = _build_levels(args.coarse_step_held_nA, cell_floor_nA)
-    injected_levels = _build_levels(args.coarse_step_injected_nA, injected_floor_nA)
+    held_step = _adaptive_step(args.coarse_step_held_nA, cell_floor_nA, args.min_coarse_points)
+    injected_step = _adaptive_step(args.coarse_step_injected_nA, injected_floor_nA, args.min_coarse_points)
+    held_levels = _build_levels(held_step, cell_floor_nA)
+    injected_levels = _build_levels(injected_step, injected_floor_nA)
 
     settle_kwargs = dict(chunk_s=args.hold_settle_chunk_s, max_settle_s=args.max_hold_settle_s,
                          settle_rtol=args.hold_settle_rtol, min_peaks_for_rate=args.min_peaks_for_rate)
@@ -686,6 +712,69 @@ def save_output_cache(cache: dict, cache_path: Path = DEFAULT_OUTPUT_CACHE_PATH)
 
 PATTERN_COLORS = {"silent": "gray", "tonic": "steelblue", "bursting": "mediumpurple",
                   "insufficient_data": "lightgray"}
+HEATMAP_RESOLUTION = 150
+
+
+def _fine_grid_coords(cell_floor_nA: float, injected_floor_nA: float, resolution: int = HEATMAP_RESOLUTION):
+    """Regular (held, injected) grid in nA, spanning [floor, 0] on each axis
+    at this cell's own resolution -- the render target every scattered
+    (adaptively-sampled) point below gets interpolated onto, so the figure
+    reads as a smooth heat map regardless of how sparse the underlying
+    simulated points actually are (a coarse 7x9 sweep still fills the whole
+    canvas; it just interpolates over more area per real data point).
+    """
+    # Ascending order (floor -> 0), matplotlib's natural default -- panels
+    # call ax.invert_xaxis()/invert_yaxis() afterward (same as the previous
+    # scatter-based version) to display 0 at the left/bottom edge. Building
+    # this descending instead and skipping the invert calls would look
+    # identical for a single panel, but would silently double-flip if
+    # anything ever draws overlay artists (e.g. a marker at a specific
+    # (held, injected)) using the un-inverted axes convention.
+    held_coords = np.linspace(cell_floor_nA, 0, resolution)
+    injected_coords = np.linspace(injected_floor_nA, 0, resolution)
+    return np.meshgrid(held_coords, injected_coords)
+
+
+def _interpolate_continuous(held, injected, values, hh, ii):
+    """Cubic (piecewise Clough-Tocher) interpolation for a genuinely smooth
+    render -- linear interpolation is only C0 continuous, so its flat
+    triangular facets show up as visible sharp edges/faceting once you
+    render at a fine resolution, confirmed directly to look bad on the
+    rebound-latency/i_H panels here. Cubic is C1 continuous (smooth
+    gradients, not flat planes).
+
+    Falls back through linear, then nearest, for whatever cubic itself
+    leaves as NaN -- cubic can fail to produce a value both outside the
+    convex hull (same reason linear does) AND occasionally inside it for
+    ill-conditioned local point configurations, so a single fallback isn't
+    always enough. Nearest-neighbor is the final backstop (same pattern
+    already used in extract_grid_features.py's normalize_grid_to_common_coords)
+    since it always produces *something*, even if not smooth in that region.
+    """
+    finite = np.isfinite(values)
+    if finite.sum() < 3:
+        return np.full(hh.shape, np.nan)
+    pts = np.column_stack([held[finite], injected[finite]])
+    vals = values[finite]
+    interpolated = griddata(pts, vals, (hh, ii), method="cubic")
+    nan_mask = np.isnan(interpolated)
+    if nan_mask.any() and not nan_mask.all():
+        linear = griddata(pts, vals, (hh, ii), method="linear")
+        interpolated[nan_mask] = linear[nan_mask]
+        nan_mask = np.isnan(interpolated)
+    if nan_mask.any() and not nan_mask.all():
+        nearest = griddata(pts, vals, (hh, ii), method="nearest")
+        interpolated[nan_mask] = nearest[nan_mask]
+    return interpolated
+
+
+def _interpolate_categorical(held, injected, codes, hh, ii):
+    """Nearest-neighbor only -- unlike a continuous quantity, blending two
+    category codes (e.g. "tonic"=1, "bursting"=2) via linear interpolation
+    would produce a meaningless intermediate value, not a real category.
+    """
+    pts = np.column_stack([held, injected])
+    return griddata(pts, codes, (hh, ii), method="nearest")
 
 
 def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: str = DEFAULT_FIGURE_FORMAT) -> None:
@@ -695,39 +784,61 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
     grid = cell_result["grid"]
     held = np.array([p["held_nA"] for p in grid.values()])
     injected = np.array([p["injected_nA"] for p in grid.values()])
-    is_coarse = np.array([p["source"] == "coarse" for p in grid.values()])
-    sizes = np.where(is_coarse, 40, 14)
+    hh, ii = _fine_grid_coords(cell_result["cell_floor_nA"], cell_result["injected_floor_nA"])
+    extent = (cell_result["cell_floor_nA"], 0, cell_result["injected_floor_nA"], 0)
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 9))
 
-    patterns = np.array([p["test_pattern"] or "insufficient_data" for p in grid.values()])
-    colors = [PATTERN_COLORS.get(pat, "black") for pat in patterns]
-    axes[0, 0].scatter(held, injected, c=colors, s=sizes, edgecolor="none")
+    pattern_names = list(PATTERN_COLORS.keys())
+    pattern_codes = np.array([pattern_names.index(p["test_pattern"] or "insufficient_data")
+                              for p in grid.values()])
+    pattern_grid = _interpolate_categorical(held, injected, pattern_codes, hh, ii)
+    pattern_cmap = ListedColormap(list(PATTERN_COLORS.values()))
+    pattern_norm = BoundaryNorm(np.arange(len(pattern_names) + 1) - 0.5, pattern_cmap.N)
+    # Colormap the category codes to RGBA ourselves, THEN let imshow blend
+    # that RGBA image with bilinear interpolation -- blending already-mapped
+    # colors pixel-to-pixel is a safe, purely visual antialiasing of the
+    # boundary (softens the jagged nearest-neighbor staircase). Letting
+    # imshow interpolate the raw integer CODES instead (interpolation=
+    # "bilinear" on pattern_grid directly) would average category indices
+    # (e.g. "silent"=0 blended with "tonic"=1 could land near 0.5) and get
+    # reassigned to whichever bucket BoundaryNorm puts that fractional value
+    # in -- a fabricated intermediate category, not a real one.
+    pattern_rgba = pattern_cmap(pattern_norm(pattern_grid))
+    axes[0, 0].imshow(pattern_rgba, origin="lower", extent=extent, aspect="auto",
+                      interpolation="bilinear")
     axes[0, 0].set_title("test-window firing pattern", fontsize=9)
-    handles = [plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=c, markersize=8, label=lbl)
+    handles = [plt.Line2D([0], [0], marker="s", color="w", markerfacecolor=c, markersize=10, label=lbl)
               for lbl, c in PATTERN_COLORS.items()]
     axes[0, 0].legend(handles=handles, loc="best", fontsize=6)
 
-    rebound = np.array([p["rebound_occurred"] for p in grid.values()])
-    rebound_counts = np.array([p["rebound_spike_count"] for p in grid.values()])
-    rcolors = np.where(rebound, "darkorange", "lightgray")
-    rsizes = 14 + 8 * rebound_counts
-    axes[0, 1].scatter(held, injected, c=rcolors, s=rsizes, edgecolor="none")
-    axes[0, 1].set_title("rebound occurred (size = spike count)", fontsize=9)
+    # rebound_spike_count where applicable+occurred (0 where applicable but
+    # didn't occur); NaN (excluded from interpolation) where rebound wasn't
+    # even applicable -- those points' recovery windows were never
+    # meaningfully evaluated for rebound onset (see run_test_and_recovery's
+    # test_suppressed gate), so a count of 0 there would be a different,
+    # misleading claim from "checked and found none".
+    rebound_counts = np.array([float(p["rebound_spike_count"]) if p["rebound_applicable"] else np.nan
+                               for p in grid.values()])
+    rebound_grid = _interpolate_continuous(held, injected, rebound_counts, hh, ii)
+    im = axes[0, 1].imshow(rebound_grid, origin="lower", extent=extent, aspect="auto", cmap="Oranges",
+                           interpolation="bilinear")
+    fig.colorbar(im, ax=axes[0, 1], label="rebound spike count")
+    axes[0, 1].set_title("rebound spike count (blank = not applicable)", fontsize=9)
 
     lat = np.array([p["rebound_latency_ms"] if p["rebound_occurred"] else np.nan for p in grid.values()])
-    if np.any(~np.isnan(lat)):
-        sc = axes[1, 0].scatter(held[~np.isnan(lat)], injected[~np.isnan(lat)],
-                                c=lat[~np.isnan(lat)], cmap="viridis", s=30)
-        fig.colorbar(sc, ax=axes[1, 0], label="ms")
+    lat_grid = _interpolate_continuous(held, injected, lat, hh, ii)
+    im = axes[1, 0].imshow(lat_grid, origin="lower", extent=extent, aspect="auto", cmap="viridis",
+                           interpolation="bilinear")
+    fig.colorbar(im, ax=axes[1, 0], label="ms")
     axes[1, 0].set_title("rebound latency", fontsize=9)
 
     iH = np.array([p["rebound_peak_iH_nA"] if p["rebound_peak_iH_nA"] is not None else np.nan
                   for p in grid.values()])
-    if np.any(~np.isnan(iH)):
-        sc = axes[1, 1].scatter(held[~np.isnan(iH)], injected[~np.isnan(iH)],
-                                c=iH[~np.isnan(iH)], cmap="magma", s=30)
-        fig.colorbar(sc, ax=axes[1, 1], label="nA")
+    iH_grid = _interpolate_continuous(held, injected, iH, hh, ii)
+    im = axes[1, 1].imshow(iH_grid, origin="lower", extent=extent, aspect="auto", cmap="magma",
+                           interpolation="bilinear")
+    fig.colorbar(im, ax=axes[1, 1], label="nA")
     axes[1, 1].set_title("i_H at recovery trough", fontsize=9)
 
     for ax in axes.flat:
@@ -742,7 +853,20 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
             f"refine_depth={cell_result['refine_max_depth_reached']}"
             + (" [TRUNCATED]" if cell_result["refinement_truncated"] else ""))
     fig.suptitle(title, fontsize=9)
-    fig.tight_layout(rect=(0.0, 0.04, 1.0, 0.96))
+    fig.tight_layout(rect=(0.0, 0.06, 1.0, 0.96))
+    # Sharp bands in rebound latency/spike-count are usually real, not an
+    # interpolation limit: confirmed directly (4QSWXH) that latency's
+    # nearest-neighbor point-to-point jump is 10x larger relative to its
+    # range at the 90th percentile than at the median -- a bimodal split
+    # between two rebound regimes a few tenths of a nA apart, consistent
+    # with this model's already-documented path-dependent (hysteretic)
+    # settling near dynamical transitions (see module docstring). i_H is
+    # smooth because it's a state-space value at a fixed instant, not a
+    # spike-timing quantity that can flip discretely between regimes.
+    fig.text(0.5, 0.025,
+             "Sharp bands in rebound latency/spike-count typically reflect real hysteretic "
+             "transitions between rebound regimes, not interpolation resolution.",
+             ha="center", va="bottom", fontsize=6.5, style="italic", color="dimgray")
     fig.text(0.5, 0.005, command, ha="center", va="bottom",
              fontsize=6, family="monospace", color="dimgray", wrap=True)
     outpath = outdir / f"{cell_id}_grid.{fig_format}"
@@ -782,9 +906,19 @@ def parse_args() -> argparse.Namespace:
                              "matching Step 1's own coarse_step_nA convention -- gives round, "
                              "cell-comparable values rather than dividing each cell's own floor into a "
                              "fixed point count. Point count therefore varies per cell; a 2D grid at a "
-                             "fixed step is quadratically more expensive for deep-threshold cells.")
+                             "fixed step is quadratically more expensive for deep-threshold cells. Only "
+                             "used as-is for cells deep enough to already clear --min-coarse-points at "
+                             "this step -- shallower cells get an automatically finer, cell-specific step.")
     parser.add_argument("--coarse-step-injected-nA", type=float, default=0.5,
                         help="Fixed injected-current step size for the coarse grid.")
+    parser.add_argument("--min-coarse-points", type=int, default=15,
+                        help="Minimum coarse-grid levels guaranteed per axis: the fixed step above "
+                             "is shrunk (never grown) for a cell whose own floor is shallow enough "
+                             "that it would otherwise fall below this count -- confirmed directly a "
+                             "0.5nA step gives a deep cell like ZE23IV (floor=-20.3) 42 held levels "
+                             "but a shallow cell like 4QSWXH (floor=-3.0) only 7, a >5x density gap "
+                             "driven purely by floor depth. Set to 0 or 1 to disable (always use the "
+                             "fixed step).")
     parser.add_argument("--cell-floor-margin-nA", type=float, default=1.0,
                         help="Held spans [0, silencing_threshold - margin] (cell_floor_nA). "
                              "Margin gives headroom past the cell's own confirmed quiescent level. "

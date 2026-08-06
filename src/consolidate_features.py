@@ -37,6 +37,7 @@ DEFAULT_SILENCING_CACHE_PATH = ROOT_DIR / "cell_silencing_thresholds.pkl"
 DEFAULT_GRID_FEATURES_CACHE_PATH = ROOT_DIR / "cell_grid_features.pkl"
 DEFAULT_OUTPUT_CSV_PATH = ROOT_DIR / "master_features.csv"
 DEFAULT_PCA_OUTPUT_PATH = ROOT_DIR / "master_features_pca.pkl"
+DEFAULT_PCA_LOADINGS_CSV_PATH = ROOT_DIR / "master_features_pca_loadings.csv"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "master_features"
 DEFAULT_FIGURE_FORMAT = "svg"
 
@@ -271,6 +272,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid-features-cache", default=DEFAULT_GRID_FEATURES_CACHE_PATH)
     parser.add_argument("--output-csv", default=DEFAULT_OUTPUT_CSV_PATH)
     parser.add_argument("--pca-output", default=DEFAULT_PCA_OUTPUT_PATH)
+    parser.add_argument("--pca-loadings-csv", default=DEFAULT_PCA_LOADINGS_CSV_PATH,
+                        help="Full feature x PC loadings table (not just the top few printed to "
+                             "the console), for inspecting what drives PC2+ directly.")
     parser.add_argument("--figures-dir", default=DEFAULT_FIGURES_DIR)
     parser.add_argument("--figure-format", default=DEFAULT_FIGURE_FORMAT, choices=["svg", "png", "pdf"])
     parser.add_argument("--no-plot", action="store_true")
@@ -320,13 +324,24 @@ def main() -> None:
     for i, (v, c) in enumerate(zip(var, cum)):
         print(f"  PC{i + 1}: {v:.1%} (cumulative {c:.1%})")
 
+    # PC1 and PC2 are each ranked by their OWN |loading|, not just PC2's value
+    # for PC1's top features -- PC2 can (and often does) be driven by a mostly
+    # different set of features than PC1, which the previous PC1-only ranking
+    # would have hidden.
     top_pc1 = pca_result["loadings"]["PC1"].abs().sort_values(ascending=False)
     print("\nTop PC1 loadings:")
     print(pca_result["loadings"].loc[top_pc1.index[:8], ["PC1", "PC2"]].to_string())
 
+    top_pc2 = pca_result["loadings"]["PC2"].abs().sort_values(ascending=False)
+    print("\nTop PC2 loadings:")
+    print(pca_result["loadings"].loc[top_pc2.index[:8], ["PC1", "PC2"]].to_string())
+
+    pca_result["loadings"].to_csv(args.pca_loadings_csv)
+    print(f"\nFull PC loadings table (all features x all PCs) written to {args.pca_loadings_csv}")
+
     with open(args.pca_output, "wb") as f:
         pickle.dump(pca_result, f)
-    print(f"\nPCA result written to {args.pca_output}")
+    print(f"PCA result written to {args.pca_output}")
 
     if not args.no_plot:
         plot_pca(pca_result, Path(args.figures_dir), command, args.figure_format)
