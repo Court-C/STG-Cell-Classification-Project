@@ -32,7 +32,6 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from steady_state_cache import load_cache as load_steady_state_cache
 from steady_state_cache import CACHE_PATH as DEFAULT_STEADY_STATE_CACHE_PATH
 
-SCHEMA_VERSION = 1
 DEFAULT_TRACK_A_PATH = ROOT_DIR / "track_a_features.csv"
 DEFAULT_SILENCING_CACHE_PATH = ROOT_DIR / "cell_silencing_thresholds.pkl"
 DEFAULT_GRID_FEATURES_CACHE_PATH = ROOT_DIR / "cell_grid_features.pkl"
@@ -151,6 +150,9 @@ def extract_grid_scalar_features(cache_path: Path) -> pd.DataFrame:
             "max_sag_depth_mV": _map_summary(entry["sag_depth_map"], "max"),
             "mean_rebound_latency_ms": _map_summary(entry["rebound_latency_map"], "mean"),
             "max_rebound_peak_mV": _map_summary(entry["rebound_peak_mV_map"], "max"),
+            "max_adaptation_ratio": _map_summary(entry["adaptation_ratio_map"], "max"),
+            "max_n_bursts": _map_summary(entry["n_bursts_map"], "max"),
+            "mean_spikes_per_burst": _map_summary(entry["spikes_per_burst_map"], "mean"),
         }
     return pd.DataFrame.from_dict(rows, orient="index")
 

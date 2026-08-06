@@ -26,10 +26,14 @@ Per-trial protocol at each (held, injected) grid point:
   3. release back to the HELD level (not to 0) for a recovery window and
      watch for post-inhibitory rebound spiking
 
-Range anchoring: both axes span [0, cell_floor_nA], where
+Range anchoring: held spans [0, cell_floor_nA], where
 cell_floor_nA = silencing_threshold_bracket_nA[0] - cell_floor_margin_nA
 (1.0 nA past the cell's own confirmed quiescent level by default), read
 from cell_silencing_thresholds.pkl (see find_silencing_threshold.py).
+injected spans [0, cell_floor_nA - injected_floor_margin_nA] -- one nA
+further than held by default -- so the test window can probe past the
+deepest level held itself ever reaches; held stays the "lowest hold
+current" reference point unchanged.
 
 Sweep strategy is coarse-to-fine: a coarse NxM grid is swept first, then
 edges where classification changes between neighbors (rebound-onset or
@@ -71,15 +75,6 @@ from find_silencing_threshold import (constant_iapp_func, count_spikes_and_rate,
                                       PROMINENCE_FRACTION, FLATLINE_MV,
                                       DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_SILENCING_CACHE_PATH)
 
-SCHEMA_VERSION = 5  # bumped: capture test_v_min_pre_spike_mV / test_first_spike_ms so sag can be
-                    # assessed from the pre-spike onset trough alone -- sag is a subthreshold Ih
-                    # relaxation that can precede the first spike/burst even in a cell that goes on
-                    # to fire, so it shouldn't be restricted to fully-silent test windows (previously
-                    # test_v_min_mV/test_v_end_mV were whole-window stats that conflate this with
-                    # arbitrary spike-phase/AHP values once the cell starts firing). Also fixed a
-                    # get_or_settle_hold crash and added adaptive test-window extension (carried over
-                    # from schema 4).
-
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_held_injected_grid.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "held_injected_grid"
 DEFAULT_FIGURE_FORMAT = "svg"
@@ -117,8 +112,8 @@ def get_cell_floor_nA(silencing_entry: dict, margin_nA: float):
 def settle_hold_level(params, held_nA, warm_start_state, dt, temp, reftemp,
                       chunk_s, max_settle_s, settle_rtol, min_peaks_for_rate) -> dict:
     """Settle at a constant held current, reusing Step 1's settle_at_level
-    engine unchanged, plus the end-of-settle voltage (needed by a future
-    sag-ratio feature; captured now so it isn't lost).
+    engine unchanged, plus the end-of-settle voltage (the pre-test baseline
+    compute_pre_spike_sag_trough's sag depth is measured against).
     """
     r = settle_at_level(params, warm_start_state, held_nA, dt, temp, reftemp,
                         chunk_s, max_settle_s, settle_rtol, min_peaks_for_rate)
@@ -165,10 +160,36 @@ def compute_pre_spike_sag_trough(v_test, t_test, sag_window_ms: float):
     return float(v_test[mask].min()), first_spike_ms
 
 
+def compute_adaptation_ratio(isis_ms: np.ndarray, edge_n: int):
+    """Spike-rate adaptation within a single tonic firing episode: mean of
+    the last edge_n ISIs over mean of the first edge_n ISIs (isis_ms is
+    chronologically ordered -- see compute_isis_ms). >1 means firing slows
+    over the course of the test window (e.g. 4QSWXH held=-3/inj=-2: ISIs go
+    from ~22-27ms at onset to ~250-350ms by test end, ~8.3x).
+
+    Requires n_isis >= 2*edge_n so the first-k/last-k windows never overlap;
+    below that, returns None rather than a degenerate/fabricated ratio. Only
+    ever called for test_pattern == "tonic" (see run_test_and_recovery) --
+    a bursting train's ISIs mix intra-burst and inter-burst intervals, so a
+    first-k-vs-last-k ratio there would measure burst structure, not smooth
+    rate adaptation.
+
+    An adaptation TIME CONSTANT (exponential fit of ISI vs spike index) was
+    considered and deliberately not attempted: the 4QSWXH ISI sequence
+    itself (22, 27, 47, 50, 49, ..., 156, 177, 206, 249, 348 ms) isn't
+    obviously mono-exponential, and fitting one without validating the
+    functional form against real traces first would repeat exactly what
+    compute_pre_spike_sag_trough's own docstring above warns against.
+    """
+    if len(isis_ms) < 2 * edge_n:
+        return None
+    return float(np.mean(isis_ms[-edge_n:])) / float(np.mean(isis_ms[:edge_n]))
+
+
 def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz, dt, temp, reftemp,
                           test_window_s, recovery_window_s, rebound_latency_min_ms,
                           min_isis_for_burst_test, isi_mode_prominence_frac, min_isi_ratio,
-                          sag_window_ms: float = 500.0,
+                          sag_window_ms: float = 500.0, adaptation_edge_n: int = 3,
                           max_test_window_s: float = None, test_window_extend_factor: float = 2.0,
                           return_traces: bool = False) -> dict:
     """Test window at the ABSOLUTE injected current level (held is not added
@@ -196,6 +217,11 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
     Iapp_test = constant_iapp_func(injected_nA)
 
     window_s = test_window_s
+    # Only ever assigned in the non-flatline branch below -- a window that's
+    # flatline on every retry attempt would otherwise leave these undefined
+    # for the post-loop adaptation/burst-structure computation.
+    isis_test = None
+    burst_test = None
     while True:
         try:
             t_test, states_test = simulate(params, window_s, temp, dt=dt, reftemp=reftemp,
@@ -230,6 +256,19 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
     test_v_min_pre_spike_mV, test_first_spike_ms = compute_pre_spike_sag_trough(
         v_test, t_test, sag_window_ms)
 
+    # Restricted to "tonic": a bursting train's first-k/last-k ISIs would mix
+    # intra-/inter-burst intervals (see compute_adaptation_ratio docstring).
+    test_adaptation_ratio = (compute_adaptation_ratio(isis_test, adaptation_edge_n)
+                             if test_pattern == "tonic" else None)
+    # n_bursts = n_long_isis + 1 (a "burst" is a maximal run of consecutive
+    # short ISIs, so each inter-burst gap marks one more burst boundary);
+    # spikes_per_burst is the average over the whole test window, not a
+    # per-burst array -- see classify_burst_pattern's n_long_isis docstring.
+    test_n_bursts = (burst_test["n_long_isis"] + 1
+                     if test_pattern == "bursting" and burst_test is not None else None)
+    test_spikes_per_burst = ((test_n_isis + 1) / test_n_bursts
+                             if test_n_bursts else None)
+
     test_result = {
         "test_pattern": test_pattern, "test_isi_short_ms": test_isi_short_ms,
         "test_isi_long_ms": test_isi_long_ms, "test_n_isis": test_n_isis,
@@ -244,6 +283,8 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
         "test_v_min_mV": float(v_test.min()), "test_v_end_mV": float(v_test[-1]),
         "test_v_min_pre_spike_mV": test_v_min_pre_spike_mV,
         "test_first_spike_ms": test_first_spike_ms,
+        "test_adaptation_ratio": test_adaptation_ratio,
+        "test_n_bursts": test_n_bursts, "test_spikes_per_burst": test_spikes_per_burst,
         "test_window_s_used": window_s,
     }
 
@@ -340,6 +381,7 @@ _TEST_RECOVERY_DEFAULTS = {
     "test_n_isis": 0, "test_bimodality_metric": None, "test_freq_hz": 0.0,
     "test_settled": None, "test_v_min_mV": float("nan"), "test_v_end_mV": float("nan"),
     "test_v_min_pre_spike_mV": float("nan"), "test_first_spike_ms": None,
+    "test_adaptation_ratio": None, "test_n_bursts": None, "test_spikes_per_burst": None,
     "test_window_s_used": float("nan"),
     "rebound_applicable": False,
     "rebound_occurred": False, "rebound_spike_count": 0, "rebound_latency_ms": None,
@@ -439,9 +481,9 @@ def _build_levels(step_nA: float, cell_floor_nA: float) -> list:
     return levels
 
 
-def build_coarse_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, args):
+def build_coarse_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_floor_nA, args):
     held_levels = _build_levels(args.coarse_step_held_nA, cell_floor_nA)
-    injected_levels = _build_levels(args.coarse_step_injected_nA, cell_floor_nA)
+    injected_levels = _build_levels(args.coarse_step_injected_nA, injected_floor_nA)
 
     settle_kwargs = dict(chunk_s=args.hold_settle_chunk_s, max_settle_s=args.max_hold_settle_s,
                          settle_rtol=args.hold_settle_rtol, min_peaks_for_rate=args.min_peaks_for_rate)
@@ -449,6 +491,7 @@ def build_coarse_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, args):
                       isi_mode_prominence_frac=args.isi_mode_prominence_frac,
                       min_isi_ratio=args.min_isi_ratio,
                       sag_window_ms=args.sag_window_ms,
+                      adaptation_edge_n=args.adaptation_edge_n,
                       max_test_window_s=args.max_test_window_s,
                       test_window_extend_factor=args.test_window_extend_factor)
 
@@ -527,6 +570,7 @@ def refine_grid(params, grid, hold_settle_cache, y_ss, baseline_freq_hz, held_le
                       isi_mode_prominence_frac=args.isi_mode_prominence_frac,
                       min_isi_ratio=args.min_isi_ratio,
                       sag_window_ms=args.sag_window_ms,
+                      adaptation_edge_n=args.adaptation_edge_n,
                       max_test_window_s=args.max_test_window_s,
                       test_window_extend_factor=args.test_window_extend_factor)
 
@@ -573,8 +617,7 @@ def refine_grid(params, grid, hold_settle_cache, y_ss, baseline_freq_hz, held_le
 # ---------------------------------------------------------------------------
 
 def run_cell_grid(cell_id: str, params: np.ndarray, ss_entry, silencing_entry, args) -> dict:
-    base = {"cell_id": cell_id, "params": params, "schema_version": SCHEMA_VERSION,
-            "run_args": vars(args)}
+    base = {"cell_id": cell_id, "params": params, "run_args": vars(args)}
 
     if ss_entry is None:
         return {**base, "status": "no_cached_steady_state"}
@@ -585,13 +628,17 @@ def run_cell_grid(cell_id: str, params: np.ndarray, ss_entry, silencing_entry, a
     if floor_result is None:
         return {**base, "status": "silencing_not_ok"}
     cell_floor_nA, floor_anchor_source = floor_result
+    # Injected probes deeper than held: held stays the "lowest hold current"
+    # reference (cell_floor_nA, unchanged), injected extends one more margin
+    # step past it.
+    injected_floor_nA = cell_floor_nA - args.injected_floor_margin_nA
 
     y_ss = ss_entry["y_ss"]
     baseline_freq_hz = ss_entry["freq_hz"]
 
     try:
         grid, hold_settle_cache, held_levels, injected_levels, test_window_s, recovery_window_s = \
-            build_coarse_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, args)
+            build_coarse_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_floor_nA, args)
         grid, max_depth_reached, refinement_truncated = refine_grid(
             params, grid, hold_settle_cache, y_ss, baseline_freq_hz, held_levels, injected_levels,
             test_window_s, recovery_window_s, args)
@@ -606,7 +653,8 @@ def run_cell_grid(cell_id: str, params: np.ndarray, ss_entry, silencing_entry, a
 
     return {
         **base, "status": "ok",
-        "cell_floor_nA": cell_floor_nA, "floor_anchor_source": floor_anchor_source,
+        "cell_floor_nA": cell_floor_nA, "injected_floor_nA": injected_floor_nA,
+        "floor_anchor_source": floor_anchor_source,
         "coarse_held_levels_nA": np.array(held_levels), "coarse_injected_levels_nA": np.array(injected_levels),
         "test_window_s": test_window_s, "recovery_window_s": recovery_window_s,
         "grid": grid, "hold_states": hold_states,
@@ -738,8 +786,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coarse-step-injected-nA", type=float, default=0.5,
                         help="Fixed injected-current step size for the coarse grid.")
     parser.add_argument("--cell-floor-margin-nA", type=float, default=1.0,
-                        help="Both axes span [0, silencing_threshold - margin]. "
-                             "Margin gives headroom past the cell's own confirmed quiescent level.")
+                        help="Held spans [0, silencing_threshold - margin] (cell_floor_nA). "
+                             "Margin gives headroom past the cell's own confirmed quiescent level. "
+                             "Injected spans further still -- see --injected-floor-margin-nA.")
+    parser.add_argument("--injected-floor-margin-nA", type=float, default=1.0,
+                        help="Injected spans [0, cell_floor_nA - this], i.e. this much further past "
+                             "the cell's confirmed quiescent level than held's own floor (cell_floor_nA) "
+                             "-- held stays anchored at cell_floor_nA.")
 
     parser.add_argument("--max-refine-depth", type=int, default=5,
                         help="Max edge-bisection depth. 2D refinement cost grows with the number "
@@ -782,6 +835,15 @@ def parse_args() -> argparse.Namespace:
                              "first. Captures the passive Ih-relaxation sag independent of whether the "
                              "cell goes on to fire tonically/burst -- sag precedes the first spike, so "
                              "it isn't restricted to windows that stay silent throughout.")
+    parser.add_argument("--adaptation-edge-n", type=int, default=3,
+                        help="Number of ISIs averaged at each end of a tonic test window to compute "
+                             "test_adaptation_ratio (mean of the last N ISIs / mean of the first N "
+                             "ISIs). Requires test_n_isis >= 2x this value or the point reports None. "
+                             "Coupled to --min-isis-for-burst-test in practice: since test_pattern == "
+                             "'tonic' already requires >= --min-isis-for-burst-test ISIs (default 6), "
+                             "the default of 3 here guarantees every tonic point qualifies -- raising "
+                             "this without also raising --min-isis-for-burst-test will silently make "
+                             "many tonic points report None.")
     parser.add_argument("--max-test-window-s", type=float, default=20.0,
                         help="If a test window comes back 'insufficient_data' (too few ISIs to "
                              "classify at all), it's re-simulated with a longer window (doubled by "

@@ -43,11 +43,20 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from singlecell_model_v1 import DEFAULT_CIS, simulate
 from steady_state_cache import load_cache, save_cache
 
-# Bump this whenever the shape of the result dict changes (new/renamed
-# keys) so stale cache entries computed by an older version of this script
-# get recomputed instead of crashing downstream code that expects the
-# current schema (e.g. plot_cell_trace reading result["freq_hz"]).
-CACHE_SCHEMA_VERSION = 2
+# Canonical set of keys every valid, "ok" steady-state cache entry must
+# have -- the single source of truth for what "the current schema" means.
+# is_cache_entry_valid checks this directly against actual cache contents at
+# load time, instead of via a separately maintained version integer that has
+# to be remembered and manually bumped whenever compute_cell_steady_state's
+# result shape changes (a real cache entry crashing downstream code, e.g.
+# plot_cell_trace reading result["freq_hz"], is the failure this prevents).
+# burnin_t is included even though it's not itself persisted to disk --
+# steady_state_cache.load_cache reconstructs it on load (see that module),
+# so any entry reaching this check already has it back.
+RESULT_SCHEMA_KEYS = frozenset({
+    "cell_id", "params", "dt", "shoot_dt", "period_ms", "freq_hz", "y_ss",
+    "shoot_resid_norm", "v_min_mV", "burnin_t", "burnin_v", "status",
+})
 
 DEFAULT_PARAMS_DIR = ROOT_DIR / "src" / "models"
 DEFAULT_CACHE_PATH = ROOT_DIR / "cell_steady_states.pkl"
@@ -212,8 +221,7 @@ def compute_cell_steady_state(cell_id: str,
     base = {"cell_id": cell_id, "params": params, "dt": dt, "shoot_dt": shoot_dt,
             "period_ms": None, "freq_hz": None, "y_ss": None,
             "shoot_resid_norm": None, "v_min_mV": None,
-            "burnin_t": None, "burnin_v": None,
-            "schema_version": CACHE_SCHEMA_VERSION}
+            "burnin_t": None, "burnin_v": None}
 
     try:
         t_ms, states = integrate_ms(params, DEFAULT_CIS.copy(),
@@ -274,7 +282,7 @@ def is_cache_entry_valid(entry: dict,
                          params: np.ndarray) -> bool:
     cached_params = entry.get("params")
     return (entry.get("status") == "ok"
-            and entry.get("schema_version") == CACHE_SCHEMA_VERSION
+            and RESULT_SCHEMA_KEYS.issubset(entry.keys())
             and cached_params is not None
             and np.array_equal(cached_params, params))
 

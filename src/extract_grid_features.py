@@ -4,18 +4,22 @@
 Phase 1 (implemented here): features computable purely from the grid cache
 that Step 2 already produced -- no re-simulation. This covers most of the
 2c spec: burst/tonic classification aggregation, burstiness index, sag
-ratio map, rebound maps (binary/count/latency/peak), F-I slope (held=0
-column), rebound/burst-onset boundary slope, summary stats, and cross-cell
-PCA over a common normalized (held_frac, injected_frac) grid.
+depth map, rebound maps (binary/count/latency/peak), firing-rate map, F-I
+slope (held=0 column), rebound/burst-onset boundary slope, summary stats,
+spike-rate adaptation map (tonic points), burst-structure maps (bursting
+points: burst count, average spikes/burst), and cross-cell PCA over a
+common normalized (held_frac, injected_frac) grid.
 
-Deliberately NOT attempted here (would need re-simulation, and were
-flagged during planning as needing validation against real data before
-committing to a formula): input resistance/tau, spike waveform features
-(threshold/amplitude/half-width/AHP), exact ISI CV/LV, and adaptation
-ratio. Per the user: adaptation ratio in particular should be reported as
-0/N/A rather than a misleading computed number for cells where the concept
-doesn't cleanly apply (e.g. tonic spikers with no onset transient) --
-tracked as a follow-up, not implemented in this pass.
+Adaptation ratio and burst structure were originally deferred here (would
+have needed re-simulation to see the raw per-spike ISI sequence) but are now
+computed inline in run_held_injected_grid.py's run_test_and_recovery, where
+that sequence is already in scope before being reduced to summary stats --
+see test_adaptation_ratio/test_n_bursts/test_spikes_per_burst there.
+
+Still deliberately NOT attempted here (genuinely need re-simulation -- no
+raw voltage trace is persisted per grid point, only derived scalars):
+input resistance/tau, spike waveform features (threshold/amplitude/
+half-width/AHP), and exact ISI CV/LV.
 """
 
 import pickle
@@ -36,7 +40,6 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from run_held_injected_grid import DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_GRID_CACHE_PATH
 
-SCHEMA_VERSION = 1
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_grid_features.pkl"
 DEFAULT_PCA_OUTPUT_PATH = ROOT_DIR / "cell_grid_features_pca.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "grid_features"
@@ -141,10 +144,12 @@ def compute_rebound_maps(grid: dict) -> dict:
 
 
 def compute_burst_rate_maps(grid: dict) -> dict:
-    """Cache-only approximations (no re-simulation): intra-burst rate from
-    the short-ISI mode, burst frequency approximated as 1/long-ISI (treating
-    the long ISI as roughly the inter-burst-onset interval). Exact
-    duty-cycle/spikes-per-burst need the raw trace and are not attempted here.
+    """Cache-only approximations: intra-burst rate from the short-ISI mode,
+    burst frequency approximated as 1/long-ISI (treating the long ISI as
+    roughly the inter-burst-onset interval). Exact burst count and
+    spikes-per-burst are NOT approximations -- see compute_burst_structure_maps,
+    computed inline in run_held_injected_grid.py from the actual per-spike
+    ISI sequence (test_n_bursts/test_spikes_per_burst), not derived here.
     """
     intra_burst_rate, burst_freq_approx = {}, {}
     for key, p in grid.items():
@@ -155,6 +160,58 @@ def compute_burst_rate_maps(grid: dict) -> dict:
         if p["test_isi_long_ms"]:
             burst_freq_approx[key] = 1000.0 / p["test_isi_long_ms"]
     return {"intra_burst_rate_map": intra_burst_rate, "burst_freq_approx_map": burst_freq_approx}
+
+
+def compute_burst_structure_maps(grid: dict) -> dict:
+    """Burst count and average spikes/burst per point (test_n_bursts,
+    test_spikes_per_burst, from run_held_injected_grid.py -- computed there
+    from n_long_isis + 1, i.e. the actual count of inter-burst gaps in the
+    test window's ISI sequence, not an approximation). Answers "does this
+    cell burst continuously through the injected window, or fire a handful
+    of discrete bursts before falling silent" per grid point. Restricted to
+    test_pattern == "bursting" upstream, same as compute_burst_rate_maps.
+    """
+    n_bursts, spikes_per_burst = {}, {}
+    for key, p in grid.items():
+        if p["blew_up"] or p["test_n_bursts"] is None:
+            continue
+        n_bursts[key] = p["test_n_bursts"]
+        if p["test_spikes_per_burst"] is not None:
+            spikes_per_burst[key] = p["test_spikes_per_burst"]
+    return {"n_bursts_map": n_bursts, "spikes_per_burst_map": spikes_per_burst}
+
+
+def compute_adaptation_map(grid: dict) -> dict:
+    """Spike-rate adaptation ratio per point (test_adaptation_ratio, from
+    run_held_injected_grid.py): mean of the last adaptation_edge_n ISIs over
+    the first adaptation_edge_n ISIs of the test window. Restricted to
+    test_pattern == "tonic" upstream (a bursting train's first-k/last-k ISIs
+    would mix intra-/inter-burst intervals -- see that function's
+    docstring), so this map is sparser than sag_depth_map by design.
+    """
+    adaptation_map = {}
+    for key, p in grid.items():
+        if p["blew_up"] or p["test_adaptation_ratio"] is None:
+            continue
+        adaptation_map[key] = float(p["test_adaptation_ratio"])
+    return adaptation_map
+
+
+def compute_firing_rate_map(grid: dict) -> dict:
+    """test_freq_hz per point -- the grid's core response surface (spike
+    rate as a function of held x injected current). Previously computed for
+    every point but only ever consumed piecemeal (the held=0 column for
+    compute_fi_slope, a grid-wide max for peak_test_freq_hz in
+    compute_summary_stats) and never exposed as its own spatial feature or
+    included in the cross-cell PCA -- despite being the single most direct
+    measurement the whole grid sweep produces.
+    """
+    rate_map = {}
+    for key, p in grid.items():
+        if p["blew_up"] or p["test_freq_hz"] is None:
+            continue
+        rate_map[key] = float(p["test_freq_hz"])
+    return rate_map
 
 
 def _boundary_crossings(grid: dict, predicate) -> list:
@@ -240,7 +297,7 @@ def compute_summary_stats(grid: dict) -> dict:
 
 
 def extract_cell_features(cell_id: str, cell_result: dict) -> dict:
-    base = {"cell_id": cell_id, "schema_version": SCHEMA_VERSION}
+    base = {"cell_id": cell_id}
     if cell_result["status"] != "ok":
         return {**base, "status": "no_grid_data", "grid_status": cell_result["status"]}
 
@@ -254,8 +311,11 @@ def extract_cell_features(cell_id: str, cell_result: dict) -> dict:
     features.update(compute_summary_stats(grid))
     features.update(compute_boundary_slopes(grid))
     features["sag_depth_map"] = compute_sag_depth_map(grid)
+    features["adaptation_ratio_map"] = compute_adaptation_map(grid)
+    features["firing_rate_map"] = compute_firing_rate_map(grid)
     features.update(compute_rebound_maps(grid))
     features.update(compute_burst_rate_maps(grid))
+    features.update(compute_burst_structure_maps(grid))
     return features
 
 
@@ -278,6 +338,22 @@ def normalize_grid_to_common_coords(cell_floor_nA: float, feature_map: dict,
     grid_coords = np.linspace(0, 1, pca_grid_n)
     gh, gi = np.meshgrid(grid_coords, grid_coords)
 
+    # Linear interpolation needs a genuine 2D point cloud. A sparse feature
+    # (adaptation_ratio_map is tonic-only, so far sparser than sag/rebound)
+    # can easily end up with every surviving point sharing one axis's
+    # coordinate -- confirmed directly: 4 real cells have adaptation_ratio_map
+    # entries only at held=0 (the only column where they fire tonic rather
+    # than bursting/silent elsewhere), which Qhull's triangulation rejects
+    # outright ("input is less than 3-dimensional"). Nearest-neighbor doesn't
+    # need a triangulation (it's a KDTree lookup), so it still works fine on
+    # a collinear point cloud -- skip straight to it rather than crashing.
+    collinear = np.ptp(points[:, 0]) < 1e-9 or np.ptp(points[:, 1]) < 1e-9
+    if collinear:
+        interpolated = (griddata(points, values, (gh, gi), method="nearest")
+                        if nan_policy == "impute_nearest"
+                        else np.full((pca_grid_n, pca_grid_n), np.nan))
+        return interpolated
+
     interpolated = griddata(points, values, (gh, gi), method="linear")
     if nan_policy == "impute_nearest":
         nan_mask = np.isnan(interpolated)
@@ -287,7 +363,8 @@ def normalize_grid_to_common_coords(cell_floor_nA: float, feature_map: dict,
     return interpolated
 
 
-PCA_MAP_FEATURES = ["sag_depth_map", "rebound_occurred_map", "rebound_count_map"]
+PCA_MAP_FEATURES = ["sag_depth_map", "rebound_occurred_map", "rebound_count_map",
+                    "firing_rate_map", "adaptation_ratio_map"]
 
 
 def build_pca_matrix(all_features: dict, pca_grid_n: int, nan_policy: str) -> dict:
@@ -441,8 +518,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract per-cell features from run_held_injected_grid.py's cache "
                     "(cache-only: no re-simulation) plus cross-cell PCA. Rin/tau, spike "
-                    "waveform, and exact ISI/adaptation stats need re-simulation and are "
-                    "not part of this pass -- see module docstring.")
+                    "waveform, and exact ISI CV/LV need re-simulation and are not part of "
+                    "this pass -- see module docstring.")
     parser.add_argument("--cells", nargs="+", default=None)
     parser.add_argument("--grid-cache", default=DEFAULT_GRID_CACHE_PATH)
     parser.add_argument("--output-cache", default=DEFAULT_OUTPUT_CACHE_PATH)
@@ -474,8 +551,7 @@ def main() -> None:
     def process(cell_id: str):
         cell_result = grid_cache.get(cell_id)
         if cell_result is None:
-            return cell_id, {"cell_id": cell_id, "schema_version": SCHEMA_VERSION,
-                            "status": "no_grid_data", "grid_status": "missing"}
+            return cell_id, {"cell_id": cell_id, "status": "no_grid_data", "grid_status": "missing"}
         return cell_id, extract_cell_features(cell_id, cell_result)
 
     if args.jobs == 1:

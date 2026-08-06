@@ -66,11 +66,6 @@ from steady_state_cache import PARAMS_DIR as DEFAULT_PARAMS_DIR
 from steady_state_cache import (CACHE_PATH as DEFAULT_STEADY_STATE_CACHE_PATH,
                                 load_all_cells, get_cached_state)
 
-# Bump whenever the shape of the result dict changes, so a stale entry
-# computed by an older version of this script gets recomputed instead of
-# crashing downstream code that expects the current schema.
-SCHEMA_VERSION = 3
-
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_silencing_thresholds.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "silencing"
 DEFAULT_FIGURE_FORMAT = "svg"  # matches generate_steady_state.py's figures/cache convention
@@ -150,13 +145,15 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     n = len(isis_ms)
     if n < min_isis_for_burst_test:
         return {"pattern": "insufficient_data", "isi_short_ms": None,
-                "isi_long_ms": None, "n_isis": n, "bimodality_metric": None}
+                "isi_long_ms": None, "n_isis": n, "bimodality_metric": None,
+                "n_long_isis": None}
 
     log_isi = np.log10(isis_ms)
     if np.ptp(log_isi) < 1e-6:
         # All ISIs effectively identical -- trivially unimodal/tonic.
         return {"pattern": "tonic", "isi_short_ms": float(np.mean(isis_ms)),
-                "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0}
+                "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0,
+                "n_long_isis": None}
 
     # Pad the evaluation grid past [min, max]: a mode sitting at or near a
     # data extreme (very common here -- the short-ISI cluster starts right
@@ -167,7 +164,8 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
         kde = gaussian_kde(log_isi)
     except np.linalg.LinAlgError:
         return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
-                "isi_long_ms": None, "n_isis": n, "bimodality_metric": None}
+                "isi_long_ms": None, "n_isis": n, "bimodality_metric": None,
+                "n_long_isis": None}
 
     pad = 0.15 * np.ptp(log_isi)
     grid = np.linspace(log_isi.min() - pad, log_isi.max() + pad, 200)
@@ -176,7 +174,8 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
 
     if len(peaks) < 2:
         return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
-                "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0}
+                "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0,
+                "n_long_isis": None}
 
     # Keep the two tallest candidate modes; split at the valley between them.
     top2 = peaks[np.argsort(density[peaks])[-2:]]
@@ -188,7 +187,8 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     long_mask = ~short_mask
     if not short_mask.any() or not long_mask.any():
         return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
-                "isi_long_ms": None, "n_isis": n, "bimodality_metric": None}
+                "isi_long_ms": None, "n_isis": n, "bimodality_metric": None,
+                "n_long_isis": None}
 
     isi_short_ms = float(np.mean(isis_ms[short_mask]))
     isi_long_ms = float(np.mean(isis_ms[long_mask]))
@@ -204,7 +204,8 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     # 10x or more, so this threshold has a lot of room below genuine cases.
     if isi_long_ms / isi_short_ms < min_isi_ratio:
         return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
-                "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0}
+                "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0,
+                "n_long_isis": None}
 
     # Ashman's D: separation of two Gaussians in units of pooled SD. D > 2 is
     # a common rule of thumb for "cleanly" bimodal -- stored for transparency,
@@ -213,8 +214,14 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     pooled = np.sqrt((s_short ** 2 + s_long ** 2) / 2.0)
     ashman_d = abs(isi_long_ms - isi_short_ms) / pooled if pooled > 0 else float("inf")
 
+    # n_long_isis (the count of inter-burst gaps) lets a caller segment the
+    # spike train into discrete bursts without redoing this KDE split: a
+    # "burst" is a maximal run of consecutive short ISIs, so there are
+    # exactly n_long_isis + 1 bursts, and (n_isis + 1) / (n_long_isis + 1)
+    # is the average spikes-per-burst (see run_held_injected_grid.py).
     return {"pattern": "bursting", "isi_short_ms": isi_short_ms,
-            "isi_long_ms": isi_long_ms, "n_isis": n, "bimodality_metric": float(ashman_d)}
+            "isi_long_ms": isi_long_ms, "n_isis": n, "bimodality_metric": float(ashman_d),
+            "n_long_isis": int(long_mask.sum())}
 
 
 def settle_at_level(params: np.ndarray, y0: np.ndarray, level_nA: float,
@@ -711,8 +718,7 @@ def find_cell_silencing_threshold(cell_id: str, params: np.ndarray,
             "isi_window_s": args.isi_window_s,
             "min_isis_for_burst_test": args.min_isis_for_burst_test,
             "isi_mode_prominence_frac": args.isi_mode_prominence_frac,
-            "min_isi_ratio": args.min_isi_ratio,
-            "schema_version": SCHEMA_VERSION}
+            "min_isi_ratio": args.min_isi_ratio}
 
     if ss_entry is None:
         return {**base, "status": "no_cached_steady_state"}, {}
