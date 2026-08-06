@@ -1,13 +1,28 @@
 """Held x injected current grid sweep (Step 2a/2b): for each cell, map how
 firing pattern during a current step and post-inhibitory rebound (PIR)
 behavior after it depend jointly on two current axes -- a sustained held
-current (the operating point) and an injected current delivered on top of
-it. Both axes are restricted to <=0 nA (inhibitory-only project phase).
+current (the operating point/context the cell is adapted to) and an
+injected current that is the ABSOLUTE test-window current level (not added
+on top of held). Both axes are restricted to <=0 nA (inhibitory-only
+project phase).
+
+held and injected are deliberately NOT combined additively: two
+independently-≤0 currents stacked (held+injected) would routinely drive the
+test window to roughly twice either axis's own meaningful range, which in
+practice meant most of the grid just probed "too hyperpolarized to do
+anything" territory (confirmed empirically -- this was the initial design
+and was corrected after review). Instead, held only does two things: (a)
+sets the pre-test adapted state the cell sits in before the test window
+(different held levels can leave the cell in different slow-adaptation
+states, e.g. IntCa, even for the same absolute test level), and (b) is the
+level released back to after the test window, which is what a PIR response
+must actually cross spike threshold from.
 
 Per-trial protocol at each (held, injected) grid point:
   1. settle at the held current alone (warm-started from the cell's cached
      Iapp=0 y_ss, or continuation from an already-settled held level)
-  2. apply held+injected together for a test window
+  2. apply injected (the absolute test-window current level, ignoring held)
+     for a test window
   3. release back to the HELD level (not to 0) for a recovery window and
      watch for post-inhibitory rebound spiking
 
@@ -56,7 +71,7 @@ from find_silencing_threshold import (constant_iapp_func, count_spikes_and_rate,
                                       PROMINENCE_FRACTION, FLATLINE_MV,
                                       DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_SILENCING_CACHE_PATH)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # bumped: injected is now an absolute test-window level, not added on top of held
 
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_held_injected_grid.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "held_injected_grid"
@@ -109,11 +124,11 @@ def settle_hold_level(params, held_nA, warm_start_state, dt, temp, reftemp,
 def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz, dt, temp, reftemp,
                           test_window_s, recovery_window_s, rebound_latency_min_ms,
                           min_isis_for_burst_test, isi_mode_prominence_frac, min_isi_ratio) -> dict:
-    """Test window (held+injected together) followed by recovery window
-    (released back to held) watched for post-inhibitory rebound.
+    """Test window at the ABSOLUTE injected current level (held is not added
+    on top -- see module docstring) followed by a recovery window (released
+    back to held) watched for post-inhibitory rebound.
     """
-    total_nA = held_nA + injected_nA
-    Iapp_test = constant_iapp_func(total_nA)
+    Iapp_test = constant_iapp_func(injected_nA)
     try:
         t_test, states_test = simulate(params, test_window_s, temp, dt=dt, reftemp=reftemp,
                                        cis=hold_state, Iapp_func=Iapp_test)
