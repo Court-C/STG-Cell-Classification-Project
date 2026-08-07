@@ -62,6 +62,7 @@ import numpy as np
 from joblib import Parallel, delayed
 from scipy.signal import find_peaks
 from scipy.interpolate import griddata
+from scipy.spatial import QhullError
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
@@ -787,23 +788,117 @@ def _merge_close_points(held, injected, values, tolerance_nA, is_categorical=Fal
     return merged_h, merged_i, merged_v
 
 
+def _mask_long_triangles(pts, hh, ii, max_edge_multiple: float = 4.0):
+    """Marks render pixels that fall inside a Delaunay triangle (over the
+    real, merged point cloud) whose longest edge exceeds max_edge_multiple
+    times the median real-point spacing.
+
+    Linear interpolation is bounded by its triangle's own corner values, so
+    it never fabricates a value outside what's real -- but stretched across
+    an unusually long/thin triangle (common where an adaptively-refined
+    point cloud goes from densely-sampled near a boundary to sparse
+    elsewhere), the result reads visually as a "ray" implying smooth local
+    structure over a distance where no nearby real data actually supports
+    that reading. This flags exactly those triangles so the caller can fall
+    back to honest nearest-neighbor there instead, keeping linear's smooth
+    blending only where real local point density actually earns it.
+    """
+    from scipy.spatial import Delaunay, cKDTree
+    if len(pts) < 4:
+        return np.zeros(hh.shape, dtype=bool)
+    tree = cKDTree(pts)
+    nn_dist, _ = tree.query(pts, k=2)
+    median_spacing = np.median(nn_dist[:, 1])
+    if not np.isfinite(median_spacing) or median_spacing <= 0:
+        return np.zeros(hh.shape, dtype=bool)
+    max_edge = max_edge_multiple * median_spacing
+
+    try:
+        tri = Delaunay(pts)
+    except QhullError:
+        # Same degenerate/near-collinear point configurations _render_heatmap's
+        # own linear-interpolation call can hit -- no masking is the safe
+        # default (falls through to whatever _render_heatmap does, which
+        # already has its own nearest-neighbor fallback for this).
+        return np.zeros(hh.shape, dtype=bool)
+    simplex_pts = pts[tri.simplices]
+    edge_lengths = np.stack([
+        np.linalg.norm(simplex_pts[:, 0] - simplex_pts[:, 1], axis=1),
+        np.linalg.norm(simplex_pts[:, 1] - simplex_pts[:, 2], axis=1),
+        np.linalg.norm(simplex_pts[:, 2] - simplex_pts[:, 0], axis=1),
+    ], axis=1)
+    long_simplex = edge_lengths.max(axis=1) > max_edge
+
+    query_pts = np.column_stack([hh.ravel(), ii.ravel()])
+    simplex_idx = tri.find_simplex(query_pts)
+    mask = simplex_idx < 0  # outside the triangulation entirely -> also fall back
+    inside = ~mask
+    mask[inside] = long_simplex[simplex_idx[inside]]
+    return mask.reshape(hh.shape)
+
+
 def _render_heatmap(held, injected, values, hh, ii, tolerance_nA, is_categorical=False):
-    """Merge-then-nearest-neighbor render: _merge_close_points collapses
-    near-duplicate real points into local averages (see its docstring),
-    then a plain nearest-neighbor lookup places each render pixel at its
-    closest *merged* point's value. Nearest-neighbor is bounded by the real
-    (now-deduplicated) data's own value range -- unlike cubic/linear, it
-    cannot ring or overshoot beyond what real nearby measurements support,
-    which is exactly what produced the reported "distorted" panels (cubic
-    interpolation over the extremely non-uniform point cloud described in
-    _merge_close_points). Returns an all-NaN grid if fewer than 1 real
-    (merged) point survives.
+    """Merge-then-interpolate render: _merge_close_points collapses
+    near-duplicate real points into local averages (see its docstring, and
+    the module's SCHEMA_VERSION-era investigation confirming that near-zero
+    -distance point pairs -- not resolution -- caused the original cubic
+    rendering to ring/overshoot). What happens after merging differs by
+    quantity type:
+
+    - Categorical (is_categorical=True): nearest-neighbor / mode only.
+      Blending two category codes has no meaning (e.g. "tonic"=1 blended
+      with "bursting"=2 could land near 1.5, an intermediate category that
+      doesn't exist), so there is no safe alternative to nearest-neighbor
+      here.
+    - Continuous: LINEAR interpolation, falling back to nearest for
+      whatever linear leaves as NaN (points outside the merged cloud's
+      convex hull). Linear is barycentric -- each rendered value is a
+      weighted average of its surrounding triangle's three real (merged)
+      corner values, so it is mathematically bounded by them and cannot
+      ring/overshoot the way cubic did. This gives smoother-looking
+      transitions than nearest-neighbor for quantities that vary gradually
+      (e.g. i_H, already smooth even under nearest-neighbor since nearby
+      real points already have close values) while staying just as honest
+      for quantities that don't: a genuine sharp jump between neighboring
+      real points (e.g. rebound latency's confirmed bimodal transitions)
+      still renders as a real, if narrower, transition, not a fabricated
+      smooth curve through it.
+
+    Returns an all-NaN grid if fewer than 1 real (merged) point survives.
     """
     m_held, m_injected, m_values = _merge_close_points(held, injected, values, tolerance_nA, is_categorical)
     if len(m_held) == 0:
         return np.full(hh.shape, np.nan)
     pts = np.column_stack([m_held, m_injected])
-    return griddata(pts, m_values, (hh, ii), method="nearest")
+    if is_categorical:
+        return griddata(pts, m_values, (hh, ii), method="nearest")
+    # Linear needs a genuine 2D point cloud to triangulate -- a sparse
+    # feature (e.g. adaptation_ratio_map, tonic-only, or iH-at-trough now
+    # restricted to fully-silenced points) can end up with too few merged
+    # points, or points that are collinear/near-collinear along some
+    # non-axis-aligned direction, either of which makes Qhull raise a hard
+    # error instead of returning NaN. The obvious axis-aligned check
+    # (np.ptp along held/injected separately) doesn't catch every
+    # degenerate case -- confirmed directly (a 4-point QhullError on a real
+    # cell whose points passed that check but were still coplanar/degenerate
+    # for Qhull's lifted-paraboloid Delaunay construction) -- so this
+    # catches the error directly rather than trying to predict it.
+    if len(m_held) < 3:
+        return griddata(pts, m_values, (hh, ii), method="nearest")
+    try:
+        rendered = griddata(pts, m_values, (hh, ii), method="linear")
+    except QhullError:
+        return griddata(pts, m_values, (hh, ii), method="nearest")
+    # Reject pixels whose triangle stretches too far relative to local real
+    # point density (see _mask_long_triangles) -- these render as visually
+    # misleading "rays", still bounded by real values but implying smooth
+    # structure the nearby data doesn't actually support. Route them (and
+    # the pre-existing outside-convex-hull NaNs) to nearest-neighbor.
+    nan_mask = np.isnan(rendered) | _mask_long_triangles(pts, hh, ii)
+    if nan_mask.any() and not nan_mask.all():
+        nearest = griddata(pts, m_values, (hh, ii), method="nearest")
+        rendered[nan_mask] = nearest[nan_mask]
+    return rendered
 
 
 def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: str = DEFAULT_FIGURE_FORMAT) -> None:
@@ -867,13 +962,25 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
     fig.colorbar(im, ax=axes[1, 0], label="ms")
     axes[1, 0].set_title("rebound latency", fontsize=9)
 
-    iH = np.array([p["rebound_peak_iH_nA"] if p["rebound_peak_iH_nA"] is not None else np.nan
+    # trough_idx = argmin(v_rec) (see run_test_and_recovery) is only a
+    # genuine post-inhibitory-rebound trough when the cell was actually
+    # silenced during the test window -- rebound_applicable/test_suppressed
+    # alone isn't strict enough (it allows a still-firing "tonic" test
+    # window as long as its rate dropped enough), so for a point that kept
+    # firing, argmin(v_rec) can land on an arbitrary ongoing spike's AHP
+    # trough instead, contaminating the value with spike-phase noise. Same
+    # category of issue already found and fixed for sag
+    # (test_v_min_pre_spike_mV) -- confirmed directly here too: one 9GBDEX
+    # point (held=-0.8, inj=-4.71) reports iH=-6.1 nA against a neighbor
+    # median of -2.0 nA, while test_pattern there is "tonic" not "silent".
+    iH = np.array([p["rebound_peak_iH_nA"] if (p["rebound_peak_iH_nA"] is not None
+                                                and p["test_pattern"] == "silent") else np.nan
                   for p in grid.values()])
     iH_grid = _render_heatmap(held, injected, iH, hh, ii, merge_tolerance_nA)
     im = axes[1, 1].imshow(iH_grid, origin="lower", extent=extent, aspect="auto", cmap="magma",
                            interpolation="bilinear")
     fig.colorbar(im, ax=axes[1, 1], label="nA")
-    axes[1, 1].set_title("i_H at recovery trough", fontsize=9)
+    axes[1, 1].set_title("i_H at recovery trough (test window fully silenced only)", fontsize=9)
 
     for ax in axes.flat:
         ax.set_xlabel("held (nA)")
