@@ -22,8 +22,10 @@ input resistance/tau, spike waveform features (threshold/amplitude/
 half-width/AHP), and exact ISI CV/LV.
 """
 
+import os
 import pickle
 import sys
+import time
 from pathlib import Path
 import argparse
 
@@ -60,7 +62,7 @@ def compute_fi_slope(grid: dict, held_level: float = 0.0) -> dict:
     """
     points = [p for p in grid.values()
              if p["held_nA"] == held_level and not p["blew_up"]
-             and p["test_pattern"] not in (None, "silent", "insufficient_data")]
+             and p["test_pattern"] not in (None, "silent")]
     if len(points) < 2:
         return {"fi_slope_hz_per_nA": None, "fi_slope_r2": None, "fi_slope_n_points": len(points)}
     x = np.array([p["injected_nA"] for p in points])
@@ -77,12 +79,11 @@ def compute_fi_slope(grid: dict, held_level: float = 0.0) -> dict:
 
 
 def compute_burstiness(grid: dict) -> dict:
-    # "sparse" points fired but too few spikes to confidently say tonic vs.
-    # bursting (see classify_burst_pattern) -- excluded here alongside
-    # insufficient_data for the same reason, even though (unlike
-    # insufficient_data) they do carry a real, nonzero test_freq_hz.
+    # test_pattern is only ever None (blew_up), "silent", "tonic", or
+    # "bursting" now (see to_stored_pattern in find_silencing_threshold.py),
+    # so "confident" here is just "not blew_up".
     confident = [p for p in grid.values() if not p["blew_up"]
-                and p["test_pattern"] not in (None, "insufficient_data", "sparse")]
+                and p["test_pattern"] is not None]
     n_confident = len(confident)
     n_bursting = sum(1 for p in confident if p["test_pattern"] == "bursting")
     n_tonic = sum(1 for p in confident if p["test_pattern"] == "tonic")
@@ -276,8 +277,7 @@ def compute_boundary_slopes(grid: dict) -> dict:
     rebound_crossings = _boundary_crossings(
         grid, lambda p: bool(p["rebound_applicable"] and p["rebound_occurred"]))
     burst_crossings = _boundary_crossings(
-        grid, lambda p: (p["test_pattern"] == "bursting")
-                       if p["test_pattern"] not in (None, "insufficient_data", "sparse") else None)
+        grid, lambda p: (p["test_pattern"] == "bursting") if p["test_pattern"] is not None else None)
     reb = _fit_boundary_slope(rebound_crossings)
     burst = _fit_boundary_slope(burst_crossings)
     return {
@@ -439,7 +439,12 @@ REBOUND_PATTERN_COLORS = {"none": "gray", "single_spike": "steelblue",
 # 0.0/1.0 -- merging near-duplicate points (see _merge_close_points) then
 # naturally reports the local fraction that occurred, not just an on/off flag.
 CONTINUOUS_MAP_PANELS = [
-    ("sag_depth_map", "sag depth (mV)", "coolwarm"),
+    # sag_depth_map is an absolute depth (mV below pre-spike baseline), not
+    # a signed quantity with a meaningful zero-crossing -- "coolwarm" (a
+    # diverging map) implied a center point that doesn't exist here and was
+    # a real perceptual-design mistake, not just a style choice. Sequential
+    # like every other magnitude panel below.
+    ("sag_depth_map", "sag depth (mV)", "YlGnBu"),
     ("adaptation_ratio_map", "adaptation ratio (tonic)", "plasma"),
     ("firing_rate_map", "firing rate (Hz)", "viridis"),
     ("rebound_occurred_map", "rebound occurred (fraction)", "Oranges"),
@@ -542,7 +547,7 @@ def plot_cell_features(cell_id: str, features: dict, outdir: Path, command: str,
     fig.text(0.5, 0.005, command, ha="center", va="bottom",
              fontsize=6, family="monospace", color="dimgray", wrap=True)
     outpath = outdir / f"{cell_id}_features.{fig_format}"
-    fig.savefig(outpath, format=fig_format, dpi=150)
+    fig.savefig(outpath, format=fig_format, dpi=180)
     plt.close(fig)
 
 
@@ -574,7 +579,7 @@ def plot_pca(pca_result: dict, outdir: Path, command: str, fig_format: str) -> N
     fig.text(0.5, 0.01, command, ha="center", va="bottom",
              fontsize=6, family="monospace", color="dimgray", wrap=True)
     outpath = outdir / f"grid_features_pca.{fig_format}"
-    fig.savefig(outpath, format=fig_format, dpi=150)
+    fig.savefig(outpath, format=fig_format, dpi=180)
     plt.close(fig)
 
 
@@ -590,8 +595,19 @@ def load_output_cache(cache_path: Path) -> dict:
 
 
 def save_output_cache(cache: dict, cache_path: Path) -> None:
-    with open(cache_path, "wb") as handle:
+    # Write-then-rename, with a retry on Windows's transient PermissionError
+    # -- see run_held_injected_grid.py's identical helper for why.
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    with open(tmp_path, "wb") as handle:
         pickle.dump(cache, handle)
+    for attempt in range(5):
+        try:
+            os.replace(tmp_path, cache_path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.2 * (attempt + 1))
 
 
 def parse_args() -> argparse.Namespace:
@@ -634,20 +650,27 @@ def main() -> None:
             return cell_id, {"cell_id": cell_id, "status": "no_grid_data", "grid_status": "missing"}
         return cell_id, extract_cell_features(cell_id, cell_result)
 
-    if args.jobs == 1:
-        results = [process(cid) for cid in cell_ids]
-    else:
-        results = Parallel(n_jobs=args.jobs)(delayed(process)(cid) for cid in cell_ids)
+    output_cache_path = Path(args.output_cache)
+    output_cache = load_output_cache(output_cache_path)
 
-    output_cache = load_output_cache(Path(args.output_cache))
+    # Save+plot after every cell -- see run_held_injected_grid.py's main()
+    # for the same fix and why.
+    if args.jobs == 1:
+        result_iter = (process(cid) for cid in cell_ids)
+    else:
+        result_iter = Parallel(n_jobs=args.jobs, return_as="generator_unordered")(
+            delayed(process)(cid) for cid in cell_ids)
+
     status_counts: dict = {}
-    for cell_id, features in results:
+    n_done = 0
+    for cell_id, features in result_iter:
         output_cache[cell_id] = features
         status_counts[features["status"]] = status_counts.get(features["status"], 0) + 1
         if not args.no_plot:
             plot_cell_features(cell_id, features, figures_dir, command, args.figure_format)
-
-    save_output_cache(output_cache, Path(args.output_cache))
+        save_output_cache(output_cache, output_cache_path)
+        n_done += 1
+        print(f"  [{n_done}/{len(cell_ids)}] {cell_id}: {features['status']}")
     print("\nStatus summary:")
     for status, count in sorted(status_counts.items()):
         print(f"  {status}: {count}")

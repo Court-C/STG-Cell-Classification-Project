@@ -49,8 +49,10 @@ burst stats, cross-cell PCA, etc.) is a separate future script that reads
 this script's output cache.
 """
 
+import os
 import pickle
 import sys
+import time
 from pathlib import Path
 import argparse
 
@@ -74,6 +76,7 @@ from steady_state_cache import (CACHE_PATH as DEFAULT_STEADY_STATE_CACHE_PATH,
                                 load_all_cells, get_cached_state)
 from find_silencing_threshold import (constant_iapp_func, count_spikes_and_rate,
                                       compute_isis_ms, classify_burst_pattern,
+                                      to_stored_pattern,
                                       settle_at_level, _round_level,
                                       PROMINENCE_FRACTION, FLATLINE_MV,
                                       DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_SILENCING_CACHE_PATH)
@@ -81,7 +84,16 @@ from find_silencing_threshold import (constant_iapp_func, count_spikes_and_rate,
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_held_injected_grid.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "held_injected_grid"
 DEFAULT_FIGURE_FORMAT = "svg"
-DEFAULT_TEMP = 25.0
+# temp == reftemp: at dtemp=0, every q10^(dtemp/10) factor in
+# singlecell_model_v1.py's _derivatives_core collapses to 1 regardless of a
+# cell's own q10 parameters, so every cell's conductances/kinetics run at
+# their literal reference-temperature values -- previously this and
+# find_silencing_threshold.py ran at temp=25 (a 15C offset from reftemp),
+# which q10-scaled conductances by up to ~2x between cells with identical
+# reftemp values but different q10 profiles (confirmed directly on
+# PWLDD3/QVVQF5's gH). generate_steady_state.py's baseline cache already
+# used temp=reftemp=10; this brings Step 1/2 into agreement with it.
+DEFAULT_TEMP = 10.0
 DEFAULT_REFTEMP = 10.0
 DEFAULT_DT_MS = 0.1
 
@@ -261,6 +273,11 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
         if test_pattern not in ("insufficient_data", "sparse") or window_s >= max_test_window_s:
             break
         window_s = min(window_s * test_window_extend_factor, max_test_window_s)
+
+    # Retry decision above is done -- collapse "insufficient_data"/"sparse"
+    # (whichever it still is) down to "silent" for the reported label. See
+    # to_stored_pattern's docstring for why this happens here, not earlier.
+    test_pattern = to_stored_pattern(test_pattern)
 
     test_v_min_pre_spike_mV, test_first_spike_ms = compute_pre_spike_sag_trough(
         v_test, t_test, sag_window_ms)
@@ -468,23 +485,40 @@ def get_or_settle_hold(params, held_nA, hold_settle_cache, y_ss, baseline_freq_h
 # 2a: coarse grid
 # ---------------------------------------------------------------------------
 
+SHALLOW_FLOOR_THRESHOLD_NA = 3.0
+SHALLOW_FLOOR_STEP_NA = 0.25
+
+
 def _adaptive_step(default_step_nA: float, floor_nA: float, min_points: int) -> float:
     """Shrinks the coarse-grid step for a shallow-floor cell so it still
-    gets at least min_points levels on this axis, without ever coarsening a
-    cell that already clears that bar at the default step. Confirmed
-    directly this matters: at the 0.5nA default, a cell with floor=-3nA
-    (e.g. 4QSWXH) gets only 7 held levels, while a cell with floor=-17nA
-    (e.g. VC08B6) gets 36 -- a >5x density gap driven purely by how deep
-    each cell's own floor happens to be, not by anything about the sweep
-    itself.
+    gets a reasonable number of levels on this axis, without ever
+    coarsening a cell that already clears that bar at the default step.
+    Confirmed directly this matters: at the 0.5nA default, a cell with
+    floor=-3nA (e.g. 4QSWXH) gets only 7 held levels, while a cell with
+    floor=-17nA (e.g. VC08B6) gets 36 -- a >5x density gap driven purely by
+    how deep each cell's own floor happens to be, not by anything about the
+    sweep itself.
 
-    _build_levels produces roughly |floor_nA| / step + 1 levels (0 plus
-    however many steps reach the floor, floor itself always included), so
-    solving for the step that yields exactly min_points gives
-    |floor_nA| / (min_points - 1); taking the min with default_step_nA means
-    this can only ever shrink the step, never grow it past the default.
+    Two regimes:
+    - |floor_nA| < SHALLOW_FLOOR_THRESHOLD_NA (3.0): flat SHALLOW_FLOOR_
+      STEP_NA (0.25) -- a simple, round, predictable step for genuinely
+      narrow-range cells, rather than the min-points formula's non-round
+      value (e.g. 0.179nA for floor=-2.5), which made grid values harder to
+      compare across shallow cells. Low added compute cost either way since
+      the range itself is small.
+    - |floor_nA| >= SHALLOW_FLOOR_THRESHOLD_NA: original min-points-based
+      shrinking, unchanged. _build_levels produces roughly |floor_nA| /
+      step + 1 levels (0 plus however many steps reach the floor, floor
+      itself always included), so solving for the step that yields exactly
+      min_points gives |floor_nA| / (min_points - 1); taking the min with
+      default_step_nA means this can only ever shrink the step, never grow
+      it past the default.
     """
-    if min_points < 2 or floor_nA == 0:
+    if floor_nA == 0:
+        return default_step_nA
+    if abs(floor_nA) < SHALLOW_FLOOR_THRESHOLD_NA:
+        return min(default_step_nA, SHALLOW_FLOOR_STEP_NA)
+    if min_points < 2:
         return default_step_nA
     guaranteed_step = abs(floor_nA) / (min_points - 1)
     return min(default_step_nA, guaranteed_step)
@@ -566,29 +600,30 @@ def build_edge_list(held_levels, injected_levels):
 
 
 def _point_status(point) -> str:
-    if point["blew_up"]:
-        return "blew_up"
-    if point["test_pattern"] in ("insufficient_data", "sparse"):
-        return "insufficient_data"
-    return "confident"
+    # test_pattern is only ever None (blew_up), "silent", "tonic", or
+    # "bursting" now -- to_stored_pattern (see find_silencing_threshold.py)
+    # already resolved "insufficient_data"/"sparse" into "silent" before a
+    # point ever reaches here, after run_test_and_recovery's own window-
+    # extension retry already gave it every chance to resolve into a real
+    # tonic/bursting call. So every non-blew_up point is "confident" now --
+    # there's no longer a separate "we genuinely don't know" bucket to
+    # distinguish (see edge_is_boundary for why that distinction used to
+    # matter for refinement cost).
+    return "blew_up" if point["blew_up"] else "confident"
 
 
 def edge_is_boundary(grid, edge) -> bool:
     """An edge is worth bisecting only when BOTH endpoints are confidently
-    classified and they disagree. "insufficient_data" (zero spikes) and
-    "sparse" (real but too-few-spikes-to-classify-burst-structure firing --
-    see classify_burst_pattern) are both common across much of the grid,
-    since the whole point of this sweep is to explore near and beyond each
-    cell's own 1D silencing threshold on both axes at once, and both are
-    deliberately NOT treated as an automatic boundary trigger: neither can be
-    resolved by bisecting further (the too-few-spikes issue is systemic to
-    the fixed test-window length, not a resolution problem), and earlier code
-    that gave every "ambiguous" edge one free bisection attempt did not
-    actually bound refinement cost -- each bisection creates two brand-new,
-    never-before-attempted child edges, so with most of the grid legitimately
-    unclassified the point count nearly doubled every depth (confirmed
-    empirically: 49 -> 74 -> 136 -> 260 -> 497 for one real cell, hitting the
-    truncation safety valve every time).
+    classified and they disagree. Only "blew_up" points are excluded from
+    "confident" now (see _point_status) -- a "silent" label already means
+    the point was given every chance to resolve into tonic/bursting via
+    run_test_and_recovery's window-extension retry, so a "silent"-vs-
+    "bursting" (or "silent"-vs-"tonic"/rebound-differs) edge is a genuine
+    boundary worth resolving, not the kind of unresolvable ambiguity earlier
+    code had to specifically guard against (an earlier version of this
+    function treated "insufficient_data"/"sparse" points as automatically
+    non-confident, since bisecting them couldn't help -- with those labels
+    gone, that guard is no longer needed).
     """
     a, b = grid[edge[0]], grid[edge[1]]
     if _point_status(a) != "confident" or _point_status(b) != "confident":
@@ -713,17 +748,47 @@ def load_output_cache(cache_path: Path = DEFAULT_OUTPUT_CACHE_PATH) -> dict:
 
 
 def save_output_cache(cache: dict, cache_path: Path = DEFAULT_OUTPUT_CACHE_PATH) -> None:
-    with open(cache_path, "wb") as handle:
+    # Write-then-rename rather than writing cache_path directly: this gets
+    # called after every cell now (see main()'s incremental save), not just
+    # once at the end, so a mid-write crash/kill or a concurrent reader
+    # (e.g. checking progress on a still-running sweep) must never be able
+    # to observe a truncated/corrupt pickle. os.replace is atomic on both
+    # POSIX and Windows.
+    #
+    # os.replace can still transiently fail on Windows with PermissionError
+    # (WinError 5) if something else briefly has cache_path open -- e.g. a
+    # concurrent read of the cache while checking progress on a still-
+    # running sweep (confirmed directly: this crashed a real 69-cell run).
+    # POSIX rename doesn't have this problem (an open file handle doesn't
+    # block a rename there), so retrying with a short backoff is enough --
+    # it's a transient OS-level lock, not a real conflict.
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    with open(tmp_path, "wb") as handle:
         pickle.dump(cache, handle)
+    for attempt in range(5):
+        try:
+            os.replace(tmp_path, cache_path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.2 * (attempt + 1))
 
 
 # ---------------------------------------------------------------------------
 # Figure
 # ---------------------------------------------------------------------------
 
-PATTERN_COLORS = {"silent": "gray", "tonic": "steelblue", "bursting": "mediumpurple",
-                  "sparse": "khaki", "insufficient_data": "lightgray"}
-HEATMAP_RESOLUTION = 150
+# test_pattern is exactly one of these three now -- to_stored_pattern (see
+# find_silencing_threshold.py) collapses "insufficient_data"/"sparse" into
+# "silent" before it's ever stored, so there's no fourth/fifth category to
+# render here anymore.
+PATTERN_COLORS = {"silent": "gray", "tonic": "steelblue", "bursting": "mediumpurple"}
+# 150->200: more render pixels for the bilinear pixel-blending step (see
+# _render_heatmap) to work with, so tile-boundary gradients look smoother
+# without changing the underlying nearest-neighbor VALUE at any pixel --
+# purely a rendering-resolution bump, not a data-fabrication concern.
+HEATMAP_RESOLUTION = 200
 
 
 def _fine_grid_coords(cell_floor_nA: float, injected_floor_nA: float, resolution: int = HEATMAP_RESOLUTION):
@@ -847,32 +912,30 @@ def _mask_long_triangles(pts, hh, ii, max_edge_multiple: float = 4.0):
     return mask.reshape(hh.shape)
 
 
-def _render_heatmap(held, injected, values, hh, ii, tolerance_nA, is_categorical=False):
-    """Merge-then-interpolate render: _merge_close_points collapses
-    near-duplicate real points into local averages (see its docstring, and
-    the module's SCHEMA_VERSION-era investigation confirming that near-zero
-    -distance point pairs -- not resolution -- caused the original cubic
-    rendering to ring/overshoot). What happens after merging differs by
-    quantity type:
+def _render_heatmap(held, injected, values, hh, ii, tolerance_nA, is_categorical=False, mode="tile"):
+    """Merge-then-render: _merge_close_points collapses near-duplicate real
+    points into local averages (see its docstring, and the module's
+    SCHEMA_VERSION-era investigation confirming that near-zero-distance
+    point pairs -- not resolution -- caused the original cubic rendering to
+    ring/overshoot). What happens after merging is controlled by `mode`:
 
-    - Categorical (is_categorical=True): nearest-neighbor / mode only.
-      Blending two category codes has no meaning (e.g. "tonic"=1 blended
-      with "bursting"=2 could land near 1.5, an intermediate category that
-      doesn't exist), so there is no safe alternative to nearest-neighbor
-      here.
-    - Continuous: LINEAR interpolation, falling back to nearest for
-      whatever linear leaves as NaN (points outside the merged cloud's
-      convex hull). Linear is barycentric -- each rendered value is a
-      weighted average of its surrounding triangle's three real (merged)
-      corner values, so it is mathematically bounded by them and cannot
-      ring/overshoot the way cubic did. This gives smoother-looking
-      transitions than nearest-neighbor for quantities that vary gradually
-      (e.g. i_H, already smooth even under nearest-neighbor since nearby
-      real points already have close values) while staying just as honest
-      for quantities that don't: a genuine sharp jump between neighboring
-      real points (e.g. rebound latency's confirmed bimodal transitions)
-      still renders as a real, if narrower, transition, not a fabricated
-      smooth curve through it.
+    - "tile" (default): nearest-neighbor only, for both categorical and
+      continuous quantities -- each real (merged) point owns a flat,
+      delineated Voronoi-style tile out to its nearest neighbors, with no
+      blending between tiles. Reverted to this as the default after the
+      "linear" mode below (despite its two accuracy safeguards) still
+      wasn't giving the reading the data actually supports -- tiling is the
+      more honest baseline (every pixel's value traces to exactly one real
+      point, never a fabricated blend), revisit smoothing separately later.
+    - "linear": LINEAR interpolation for continuous quantities (still
+      nearest-neighbor for categorical -- blending two category codes has
+      no meaning, e.g. "tonic"=1 blended with "bursting"=2 could land near
+      1.5, an intermediate category that doesn't exist). Linear is
+      barycentric -- each rendered value is a weighted average of its
+      surrounding triangle's three real (merged) corner values, so it's
+      mathematically bounded by them and cannot ring/overshoot the way
+      cubic did -- kept available (not deleted) for revisiting later, just
+      not the active default.
 
     Returns an all-NaN grid if fewer than 1 real (merged) point survives.
     """
@@ -880,8 +943,9 @@ def _render_heatmap(held, injected, values, hh, ii, tolerance_nA, is_categorical
     if len(m_held) == 0:
         return np.full(hh.shape, np.nan)
     pts = np.column_stack([m_held, m_injected])
-    if is_categorical:
+    if is_categorical or mode == "tile":
         return griddata(pts, m_values, (hh, ii), method="nearest")
+    # mode == "linear" from here down.
     # Linear needs a genuine 2D point cloud to triangulate -- a sparse
     # feature (e.g. adaptation_ratio_map, tonic-only, or iH-at-trough now
     # restricted to fully-silenced points) can end up with too few merged
@@ -928,7 +992,11 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
     fig, axes = plt.subplots(2, 3, figsize=(15.5, 9))
 
     pattern_names = list(PATTERN_COLORS.keys())
-    pattern_codes = np.array([pattern_names.index(p["test_pattern"] or "insufficient_data")
+    # test_pattern is None for a point whose test window never actually ran
+    # (e.g. hold_blew_up -- see _TEST_RECOVERY_DEFAULTS) -- "silent" is the
+    # nearest available bucket now that "insufficient_data" is gone (there's
+    # no meaningful data to distinguish it from either).
+    pattern_codes = np.array([pattern_names.index(p["test_pattern"] or "silent")
                               for p in grid.values()], dtype=float)
     pattern_grid = _render_heatmap(held, injected, pattern_codes, hh, ii, merge_tolerance_nA,
                                    is_categorical=True)
@@ -1051,7 +1119,7 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
     fig.text(0.5, 0.005, command, ha="center", va="bottom",
              fontsize=6, family="monospace", color="dimgray", wrap=True)
     outpath = outdir / f"{cell_id}_grid.{fig_format}"
-    fig.savefig(outpath, format=fig_format, dpi=150)
+    fig.savefig(outpath, format=fig_format, dpi=180)
     plt.close(fig)
 
 
@@ -1199,31 +1267,49 @@ def main() -> None:
         result = run_cell_grid(cell_id, params, ss_entry, silencing_entry, args)
         return cell_id, result
 
+    # Save+plot after EVERY cell, not once at the end -- a 69-cell sweep can
+    # run 30+ minutes, and the old batch-at-the-end behavior meant nothing
+    # was visible on disk (cache or figures) until the entire run finished,
+    # even though most cells complete far earlier. return_as="generator_
+    # unordered" (vs. the default "list") is what makes this possible with
+    # joblib: results stream back as each worker finishes, in completion
+    # order, rather than Parallel() blocking until every job is done before
+    # returning anything. save_output_cache's write-then-rename means a
+    # reader checking progress mid-run never sees a torn/partial file.
     if args.jobs == 1:
-        results = [process(cid, params) for cid, params in cells.items()]
+        result_iter = (process(cid, params) for cid, params in cells.items())
     else:
-        results = Parallel(n_jobs=args.jobs)(delayed(process)(cid, params) for cid, params in cells.items())
+        result_iter = Parallel(n_jobs=args.jobs, return_as="generator_unordered")(
+            delayed(process)(cid, params) for cid, params in cells.items())
 
     status_counts: dict = {}
-    for cell_id, result in results:
+    n_done = 0
+    for cell_id, result in result_iter:
         output_cache[cell_id] = result
         status_counts[result["status"]] = status_counts.get(result["status"], 0) + 1
         if not args.no_plot:
             plot_cell_grid(result, figures_dir, command, fig_format=args.figure_format)
+        save_output_cache(output_cache, output_cache_path)
+        n_done += 1
+        print(f"  [{n_done}/{len(cells)}] {cell_id}: {result['status']}")
 
-    save_output_cache(output_cache, output_cache_path)
+    # Derived from output_cache (not a `results` list -- the generator
+    # consumed above is exhausted, and per-cell entries already live in
+    # output_cache via the incremental-save loop) filtered to just the
+    # cells this run actually processed.
+    this_run_results = [(cid, output_cache[cid]) for cid in cells]
 
     print("\nStatus summary:")
     for status, count in sorted(status_counts.items()):
         print(f"  {status}: {count}")
-    truncated = [cid for cid, result in results if result.get("refinement_truncated")]
+    truncated = [cid for cid, result in this_run_results if result.get("refinement_truncated")]
     if truncated:
         print(f"\n{len(truncated)} cell(s) hit --max-boundary-edges-per-depth and were refinement_truncated: {truncated}")
     print(f"\nCache written to {output_cache_path}")
     if not args.no_plot:
         print(f"Figures written to {figures_dir}/")
 
-    flagged = [cid for cid, result in results if result["status"] != "ok"]
+    flagged = [cid for cid, result in this_run_results if result["status"] != "ok"]
     if flagged:
         print(f"\n{len(flagged)} cell(s) did not reach status 'ok': {flagged}")
         print("'no_cached_steady_state': run generate_steady_state.py first. "

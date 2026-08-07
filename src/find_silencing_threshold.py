@@ -44,8 +44,10 @@ tonic -> bursting -> tonic before eventually stopping, and every such
 transition is recorded, not just the first.
 """
 
+import os
 import pickle
 import sys
+import time
 from pathlib import Path
 import argparse
 
@@ -69,7 +71,8 @@ from steady_state_cache import (CACHE_PATH as DEFAULT_STEADY_STATE_CACHE_PATH,
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_silencing_thresholds.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "silencing"
 DEFAULT_FIGURE_FORMAT = "svg"  # matches generate_steady_state.py's figures/cache convention
-DEFAULT_TEMP = 25.0
+# temp == reftemp -- see run_held_injected_grid.py's DEFAULT_TEMP comment.
+DEFAULT_TEMP = 10.0
 DEFAULT_REFTEMP = 10.0
 DEFAULT_DT_MS = 0.1
 
@@ -273,6 +276,23 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
             "n_long_isis": int(long_mask.sum())}
 
 
+def to_stored_pattern(pattern: str) -> str:
+    """Collapses classify_burst_pattern's two "not enough data" intermediate
+    labels ("insufficient_data": zero spikes, "sparse": some spikes but too
+    few to run the bimodality test) into a single reported "silent" -- a
+    handful of scattered spikes that can't sustain a classifiable rhythm is
+    functionally silent for this project's tonic/bursting/silent
+    classification, not a fourth ambiguous category to report. The two
+    labels are kept distinct ONLY as an internal signal for callers that
+    retry with a longer window when they see one (see
+    run_held_injected_grid.py's run_test_and_recovery) -- this collapse is
+    meant to be applied to whatever pattern comes out AFTER that retry
+    decision is made (succeeded, or gave up and exhausted its window
+    budget), not before.
+    """
+    return "silent" if pattern in ("insufficient_data", "sparse") else pattern
+
+
 def settle_at_level(params: np.ndarray, y0: np.ndarray, level_nA: float,
                     dt: float, temp: float, reftemp: float,
                     chunk_s: float, max_settle_s: float, settle_rtol: float,
@@ -391,6 +411,11 @@ def probe_level(params: np.ndarray, state: np.ndarray, level_nA: float,
 
     burst_info = classify_burst_pattern(isis_ms, min_isis_for_burst_test, isi_mode_prominence_frac, min_isi_ratio,
                                         n_peaks=n_peaks)
+    # Kept as the RAW (uncollapsed) label here -- find_pattern_transitions
+    # needs to tell "insufficient_data"/"sparse" (bridge over, keep
+    # scanning) apart from genuine "silent" (stop scanning). Collapsed to
+    # the reported 3-category label only in _finalize_curve, once all
+    # scanning/transition-detection that needs the raw distinction is done.
     r["burst_pattern"] = burst_info["pattern"]
     r["isi_short_ms"] = burst_info["isi_short_ms"]
     r["isi_long_ms"] = burst_info["isi_long_ms"]
@@ -477,7 +502,14 @@ def _finalize_curve(merged: dict) -> dict:
     ordered_levels = sorted(merged.keys(), reverse=True)
     freqs = [merged[lv].get("freq_hz") or 0.0 for lv in ordered_levels]
     settled = [bool(merged[lv].get("settled")) for lv in ordered_levels]
-    patterns = [merged[lv].get("burst_pattern", "insufficient_data") for lv in ordered_levels]
+    # Collapsed to the reported 3-category label (tonic/bursting/silent)
+    # here, at the very end -- find_pattern_transitions/refine_transition
+    # already ran on the raw per-level "burst_pattern" values upstream
+    # (via merged directly, not through this function) and need the raw
+    # "insufficient_data"/"sparse" distinction to bridge over ambiguous
+    # gaps correctly; only the final persisted/reported curve collapses.
+    patterns = [to_stored_pattern(merged[lv].get("burst_pattern", "insufficient_data"))
+               for lv in ordered_levels]
     isi_short = [merged[lv].get("isi_short_ms") for lv in ordered_levels]
     isi_long = [merged[lv].get("isi_long_ms") for lv in ordered_levels]
     fine_traces = {lv: (merged[lv]["last_chunk_t"], merged[lv]["last_chunk_v"])
@@ -716,10 +748,11 @@ def summarize_burst_transitions(burst_pattern_curve: np.ndarray, burst_transitio
     burst before stopping, and where" answer) -- None if the cell never
     bursts on the way to silence.
     """
+    # burst_pattern_curve is always the post-_finalize_curve collapsed
+    # curve (tonic/bursting/silent only, see to_stored_pattern) -- no
+    # "insufficient_data"/"sparse" entries ever reach here.
     sequence = []
     for pattern in burst_pattern_curve:
-        if pattern == "insufficient_data":
-            continue
         if not sequence or sequence[-1] != pattern:
             sequence.append(str(pattern))
     tonic_to_burst = [t for t in burst_transitions if t["direction"] == "tonic_to_bursting"]
@@ -819,8 +852,26 @@ def load_output_cache(cache_path: Path = DEFAULT_OUTPUT_CACHE_PATH) -> dict:
 
 
 def save_output_cache(cache: dict, cache_path: Path = DEFAULT_OUTPUT_CACHE_PATH) -> None:
-    with open(cache_path, "wb") as handle:
+    # Write-then-rename -- see run_held_injected_grid.py's identical helper
+    # for why (called after every cell now, not just once at the end).
+    # os.replace can transiently fail on Windows with PermissionError
+    # (WinError 5) if something else briefly has cache_path open -- e.g. a
+    # concurrent read of the cache while checking progress on a still-
+    # running sweep (confirmed directly: this crashed a real 69-cell run at
+    # cell 36). POSIX rename doesn't have this problem (an open file handle
+    # doesn't block a rename there), so retrying with a short backoff is
+    # enough -- it's a transient OS-level lock, not a real conflict.
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    with open(tmp_path, "wb") as handle:
         pickle.dump(cache, handle)
+    for attempt in range(5):
+        try:
+            os.replace(tmp_path, cache_path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                raise
+            time.sleep(0.2 * (attempt + 1))
 
 
 def _contiguous_label_spans(levels: np.ndarray, labels: np.ndarray, target_label: str) -> list:
@@ -948,8 +999,15 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--coarse-step-nA", type=float, default=0.5,
                         help="Coarse hyperpolarizing step size in nA.")
-    parser.add_argument("--fine-step-nA", type=float, default=0.05,
-                        help="Fine step size (within a bracket) in nA.")
+    parser.add_argument("--fine-step-nA", type=float, default=0.25,
+                        help="Fine step size (within a bracket) in nA. 0.25 (not a finer value) is "
+                             "deliberate: the resulting threshold precision is still well within "
+                             "run_held_injected_grid.py's --cell-floor-margin-nA (1.0 nA default) "
+                             "margin past it, so finer precision here isn't load-bearing downstream "
+                             "-- confirmed directly this cuts point count ~3.6x on the densest cells "
+                             "(61->17 for one real cell) with no loss of downstream precision. Also a "
+                             "clean divisor of run_held_injected_grid.py's own default grid step "
+                             "(0.5 nA), so Step 1's sampled Iapp levels align with Step 2's grid nodes.")
     parser.add_argument("--max-hyperpolarizing-nA", type=float, default=-25.0,
                         help="Hard stop for the coarse scan; beyond this a cell is "
                              "flagged did_not_silence_within_range rather than swept "
@@ -1025,24 +1083,30 @@ def main() -> None:
         result, fine_traces = find_cell_silencing_threshold(cell_id, params, ss_entry, args)
         return cell_id, result, fine_traces
 
+    # Save+plot after EVERY cell -- see run_held_injected_grid.py's main()
+    # for the same fix and why (streams results via generator_unordered
+    # instead of blocking on the whole batch, write-then-rename keeps a
+    # mid-run read of the cache safe).
     if args.jobs == 1:
-        results = [process(cid, params) for cid, params in cells.items()]
+        result_iter = (process(cid, params) for cid, params in cells.items())
     else:
-        results = Parallel(n_jobs=args.jobs)(
+        result_iter = Parallel(n_jobs=args.jobs, return_as="generator_unordered")(
             delayed(process)(cid, params) for cid, params in cells.items()
         )
 
     status_counts: dict = {}
     bursting_cells = []
-    for cell_id, result, fine_traces in results:
+    n_done = 0
+    for cell_id, result, fine_traces in result_iter:
         output_cache[cell_id] = result
         status_counts[result["status"]] = status_counts.get(result["status"], 0) + 1
         if result.get("any_bursting_detected"):
             bursting_cells.append(cell_id)
         if not args.no_plot:
             plot_cell_silencing(result, fine_traces, figures_dir, command, fig_format=args.figure_format)
-
-    save_output_cache(output_cache, output_cache_path)
+        save_output_cache(output_cache, output_cache_path)
+        n_done += 1
+        print(f"  [{n_done}/{len(cells)}] {cell_id}: {result['status']}")
 
     print("\nStatus summary:")
     for status, count in sorted(status_counts.items()):
@@ -1052,7 +1116,9 @@ def main() -> None:
     if not args.no_plot:
         print(f"Figures written to {figures_dir}/")
 
-    flagged = [cid for cid, result, _ in results if result["status"] not in ("ok",)]
+    # results (the generator) is exhausted -- derive from output_cache,
+    # which the incremental-save loop above already populated.
+    flagged = [cid for cid in cells if output_cache[cid]["status"] not in ("ok",)]
     if flagged:
         print(f"\n{len(flagged)} cell(s) did not reach status 'ok': {flagged}")
         print("Check their figures, and for 'no_cached_steady_state' run "

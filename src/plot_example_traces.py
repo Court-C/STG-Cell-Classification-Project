@@ -51,12 +51,59 @@ DEFAULT_FIGURE_FORMAT = "svg"
 DEFAULT_CURATED_CELLS = ["W0E22J", "WX7CJ9", "2EXYPV", "4QSWXH", "5A6WBD"]
 
 
-def select_exemplar_points(grid: dict) -> dict:
+def _prominence_score(point: dict) -> float:
+    """How clearly a point demonstrates its own test_pattern classification
+    -- used so an example trace actually backs up the label it's plotted
+    under, rather than an arbitrary or borderline point that only just
+    cleared the classification threshold. Each pattern uses whichever
+    already-computed scalar most directly reflects "how obviously is this
+    happening":
+      - bursting: test_bimodality_metric (how separated the short/long ISI
+        modes are -- a clean burst, not a marginal one right at
+        classify_burst_pattern's threshold).
+      - tonic: |test_adaptation_ratio - 1| (bigger deviation from
+        non-adapting is more visually interesting/informative, whichever
+        direction it goes).
+      - silent: depth below rest (test_v_min_mV) -- decisively silenced,
+        not just barely quiet. (test_pattern is only ever "tonic",
+        "bursting", or "silent" now -- to_stored_pattern in
+        find_silencing_threshold.py already collapses ambiguous/sparse
+        windows into "silent" before a point is ever stored.)
+    Rebound spike count is folded in as a secondary tiebreak whenever
+    rebound_applicable, since more rebound spikes makes a rebound_pattern
+    label more visibly demonstrated too.
+    """
+    pattern = point["test_pattern"]
+    if pattern == "bursting":
+        score = point.get("test_bimodality_metric") or 0.0
+    elif pattern == "tonic":
+        ratio = point.get("test_adaptation_ratio")
+        score = abs(ratio - 1.0) if ratio is not None else 0.0
+    elif pattern == "silent":
+        v = point.get("test_v_min_mV")
+        score = -v if v is not None else 0.0
+    else:
+        score = 0.0
+    if point.get("rebound_applicable"):
+        score += 0.01 * (point.get("rebound_spike_count") or 0)
+    return score
+
+
+def select_exemplar_points(grid: dict, require_held_lt_injected: bool = True) -> dict:
     """One representative point per distinct (test_pattern, rebound_pattern)
-    combination actually present in this cell's grid. Prefers coarse-grid
-    points (sit further from a bisected boundary, more "typical" of their
-    region than a refinement point deliberately placed right at a
-    transition) with a deterministic tie-break for reproducibility.
+    combination actually present in this cell's grid, chosen by
+    _prominence_score to most clearly demonstrate that combination rather
+    than an arbitrary or borderline point -- so the resulting trace
+    actually backs up its own label.
+
+    Restricted by default to held_nA < injected_nA (the test window
+    releases somewhat from the held baseline, rather than deepening it) --
+    confirmed directly this is where illustrative/interesting dynamics
+    concentrate across a randomly-sampled population; the opposite
+    direction rarely shows anything worth spotlighting. Falls back to the
+    full candidate set for any (pattern, rebound) combination that has NO
+    point at all satisfying that constraint, rather than silently losing
+    combinations that only occur on the other side.
     """
     candidates: dict = {}
     for key, point in grid.items():
@@ -67,7 +114,12 @@ def select_exemplar_points(grid: dict) -> dict:
 
     selected = {}
     for combo, pts in candidates.items():
-        pts_sorted = sorted(pts, key=lambda kp: (kp[1]["source"] != "coarse", kp[0]))
+        if require_held_lt_injected:
+            filtered = [(k, p) for k, p in pts if k[0] < k[1]]
+            pool = filtered if filtered else pts
+        else:
+            pool = pts
+        pts_sorted = sorted(pool, key=lambda kp: (-_prominence_score(kp[1]), kp[1]["source"] != "coarse", kp[0]))
         selected[combo] = pts_sorted[0]
     return selected
 
@@ -184,6 +236,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--figure-format", default=DEFAULT_FIGURE_FORMAT, choices=["svg", "png", "pdf"])
     parser.add_argument("--hold-tail-s", type=float, default=2.0,
                         help="Duration of hold-only context shown before the test window (s).")
+    parser.add_argument("--allow-held-gt-injected", action="store_true",
+                        help="Don't restrict exemplar selection to held_nA < injected_nA (test window "
+                             "releasing from the held baseline) -- by default this is where illustrative "
+                             "dynamics concentrate across a randomly-sampled population, so the opposite "
+                             "direction is excluded unless a (pattern, rebound) combination has no point "
+                             "at all on the preferred side. Pass this to consider the full grid instead.")
     return parser.parse_args()
 
 
@@ -212,7 +270,8 @@ def main() -> None:
             continue
         y_ss, baseline_freq_hz = ss_entry["y_ss"], ss_entry["freq_hz"]
 
-        exemplars = select_exemplar_points(cell_result["grid"])
+        exemplars = select_exemplar_points(cell_result["grid"],
+                                           require_held_lt_injected=not args.allow_held_gt_injected)
         print(f"{cell_id}: {len(exemplars)} exemplar point(s)")
         for (test_pattern, rebound_pattern), (key, _point) in sorted(exemplars.items()):
             held_nA, injected_nA = key
