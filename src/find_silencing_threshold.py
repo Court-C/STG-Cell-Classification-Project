@@ -119,32 +119,47 @@ def count_spikes_and_rate(voltage: np.ndarray, duration_ms: float,
 
 
 def compute_isis_ms(voltage: np.ndarray, t_ms: np.ndarray,
-                    prominence_fraction: float = PROMINENCE_FRACTION) -> np.ndarray:
+                    prominence_fraction: float = PROMINENCE_FRACTION) -> tuple[np.ndarray, int]:
     """Inter-spike intervals (ms) from a voltage trace, for the burst-pattern
-    bimodality test. Empty if the trace is flat or has fewer than 2 spikes
-    (not enough to form even one interval).
+    bimodality test, plus the raw spike count. The ISI array alone can't
+    distinguish "0 spikes" from "1 spike" (both give an empty array, since
+    forming even one interval needs 2 spikes) -- returning n_peaks alongside
+    it lets a caller tell a genuinely silent-but-not-flatlined window apart
+    from one with real, if too-sparse-to-classify, spiking activity (see
+    classify_burst_pattern's n_peaks parameter).
     """
     if voltage.max() - voltage.min() < FLATLINE_MV:
-        return np.array([])
+        return np.array([]), 0
     peaks, _ = find_peaks(voltage, prominence=(voltage.max() - voltage.min()) * prominence_fraction)
     if len(peaks) < 2:
-        return np.array([])
-    return np.diff(t_ms[peaks])
+        return np.array([]), len(peaks)
+    return np.diff(t_ms[peaks]), len(peaks)
 
 
 def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
-                          isi_mode_prominence_frac: float, min_isi_ratio: float = 1.5) -> dict:
+                          isi_mode_prominence_frac: float, min_isi_ratio: float = 1.5,
+                          min_spikes_per_burst: float = 1.5, n_peaks: int = None) -> dict:
     """Log-ISI bimodality test. A tonically firing cell has one dominant
     inter-spike interval (log(ISI) density is unimodal); a burster has two
     -- a short mode (intra-burst ISI) and a long mode (the gap from the last
     spike of one burst to the first spike of the next). Requires at least
     min_isis_for_burst_test ISIs to attempt the test at all -- with too few
     spikes the test is unreliable and is reported as "insufficient_data"
-    rather than guessed.
+    (n_peaks == 0: no real spikes detected, just some subthreshold voltage
+    excursion) or "sparse" (n_peaks >= 1: the cell genuinely spiked, just not
+    enough to run the bimodality test confidently) rather than guessed.
+    "sparse" is real, observed data, not a data gap -- distinguishing it from
+    "insufficient_data" avoids conflating "we don't know what this point is
+    doing" with "this point rarely fires," which n_peaks alone can tell apart
+    (isis_ms can't: 0 or 1 spike both give an empty ISI array, since forming
+    even one interval needs 2 spikes). n_peaks=None keeps the old
+    "insufficient_data" label for call sites that don't have a spike count
+    handy.
     """
     n = len(isis_ms)
     if n < min_isis_for_burst_test:
-        return {"pattern": "insufficient_data", "isi_short_ms": None,
+        pattern = "insufficient_data" if not n_peaks else "sparse"
+        return {"pattern": pattern, "isi_short_ms": None,
                 "isi_long_ms": None, "n_isis": n, "bimodality_metric": None,
                 "n_long_isis": None}
 
@@ -203,6 +218,40 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     # bursting -- intra-burst vs inter-burst gaps in this model differ by
     # 10x or more, so this threshold has a lot of room below genuine cases.
     if isi_long_ms / isi_short_ms < min_isi_ratio:
+        return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
+                "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0,
+                "n_long_isis": None}
+
+    # A burst is defined by >=2 spikes in rapid succession, not by ISI
+    # timescale alone -- confirmed directly this matters: a real VC08B6
+    # point (held=-12.5, inj=-4.4) passed the isi_long/isi_short ratio check
+    # (9.6ms vs 14.5ms, 1.5x, right at the old threshold) and got called
+    # "bursting" with n_bursts=174, but averaged only 1.29 spikes per burst
+    # -- i.e. almost every "burst" was a single isolated spike with mild ISI
+    # jitter around it, not a real burst. A near-unimodal but slightly noisy
+    # tonic ISI cluster can get KDE-split into two adjacent modes that both
+    # individually look "short" (9-15ms, nothing like the 30ms+ genuine
+    # inter-burst gaps seen in confirmed real bursters), which the ratio
+    # check alone doesn't catch. n = len(isis_ms) is the total ISI count
+    # (n+1 spikes); n_long is the count of "long" (inter-burst) ISIs, so
+    # there are n_long+1 bursts and (n+1)/(n_long+1) average spikes/burst.
+    #
+    # Threshold is 1.5, not a literal 2.0, because of a confirmed off-by-one
+    # edge effect: a perfectly clean, genuine doublet train (real burst of
+    # exactly 2 spikes, repeating) computes to just UNDER 2.0 whenever the
+    # sampled window happens to end on a long (inter-burst) ISI -- the
+    # trailing spike after that last gap has no partner within the window,
+    # so one "burst" out of n_long+1 is an incomplete 1-spike fragment,
+    # pulling the average to 2 - 2/n_bursts (e.g. 65 real spikes forming 32
+    # clean doublets plus one dangling trailing spike -> 65/33 = 1.97, not
+    # 2.0). Confirmed directly on a synthetic clean 31.4ms/60.0ms alternating
+    # doublet train (only Gaussian jitter, no other noise) -- it scored 1.97
+    # and would have been wrongly rejected by a literal >=2.0 cutoff. 1.5
+    # keeps a wide margin below genuine doublets (~1.97-2.0+) while staying
+    # well above the confirmed-spurious VC08B6 case (~1.29-1.34).
+    n_long = int(long_mask.sum())
+    avg_spikes_per_burst = (n + 1) / (n_long + 1)
+    if avg_spikes_per_burst < min_spikes_per_burst:
         return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
                 "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0,
                 "n_long_isis": None}
@@ -325,6 +374,7 @@ def probe_level(params: np.ndarray, state: np.ndarray, level_nA: float,
         r["isi_short_ms"] = None
         r["isi_long_ms"] = None
         r["n_isis"] = 0
+        r["n_spikes"] = 0
         return r
 
     if use_isi_window:
@@ -333,15 +383,19 @@ def probe_level(params: np.ndarray, state: np.ndarray, level_nA: float,
             r["blew_up"] = True
             r["error"] = isi_result.get("error")
             return r
-        isis_ms = compute_isis_ms(isi_result["v"], isi_result["t_ms"])
+        isis_ms, n_peaks = compute_isis_ms(isi_result["v"], isi_result["t_ms"])
+    elif r["last_chunk_v"] is not None:
+        isis_ms, n_peaks = compute_isis_ms(r["last_chunk_v"], r["last_chunk_t"])
     else:
-        isis_ms = compute_isis_ms(r["last_chunk_v"], r["last_chunk_t"]) if r["last_chunk_v"] is not None else np.array([])
+        isis_ms, n_peaks = np.array([]), 0
 
-    burst_info = classify_burst_pattern(isis_ms, min_isis_for_burst_test, isi_mode_prominence_frac, min_isi_ratio)
+    burst_info = classify_burst_pattern(isis_ms, min_isis_for_burst_test, isi_mode_prominence_frac, min_isi_ratio,
+                                        n_peaks=n_peaks)
     r["burst_pattern"] = burst_info["pattern"]
     r["isi_short_ms"] = burst_info["isi_short_ms"]
     r["isi_long_ms"] = burst_info["isi_long_ms"]
     r["n_isis"] = burst_info["n_isis"]
+    r["n_spikes"] = n_peaks
     return r
 
 
@@ -464,9 +518,10 @@ def sweep_cell(params: np.ndarray, ss_entry: dict, args: argparse.Namespace) -> 
     # directly: 2EXYPV) would silently miss its tonic->bursting transition,
     # since it may have happened anywhere between 0 and -coarse_step_nA,
     # a range the coarse scan itself never probes.
-    baseline_isis = compute_isis_ms(ss_entry["burnin_v"], ss_entry["burnin_t"])
+    baseline_isis, baseline_n_peaks = compute_isis_ms(ss_entry["burnin_v"], ss_entry["burnin_t"])
     baseline_burst = classify_burst_pattern(baseline_isis, args.min_isis_for_burst_test,
-                                            args.isi_mode_prominence_frac, args.min_isi_ratio)
+                                            args.isi_mode_prominence_frac, args.min_isi_ratio,
+                                            n_peaks=baseline_n_peaks)
     merged[0.0] = {
         "blew_up": False, "settled": True, "freq_hz": ss_entry["freq_hz"], "is_flatline": False,
         "final_state": y_ss.copy(), "total_settle_s_used": 0.0,
@@ -474,6 +529,7 @@ def sweep_cell(params: np.ndarray, ss_entry: dict, args: argparse.Namespace) -> 
         "last_chunk_v": ss_entry["burnin_v"], "last_chunk_t": ss_entry["burnin_t"],
         "burst_pattern": baseline_burst["pattern"], "isi_short_ms": baseline_burst["isi_short_ms"],
         "isi_long_ms": baseline_burst["isi_long_ms"], "n_isis": baseline_burst["n_isis"],
+        "n_spikes": baseline_n_peaks,
     }
 
     # --- coarse scan ---

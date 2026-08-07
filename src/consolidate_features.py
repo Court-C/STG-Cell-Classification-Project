@@ -178,29 +178,26 @@ def build_master_table(track_a_path: Path, steady_state_cache_path: Path,
     return table
 
 
-def run_pca_on_master_table(table: pd.DataFrame, min_feature_coverage: float = 0.85) -> dict:
-    """PCA restricted to cells with a fully complete row -- imputing this
-    many disparate scalar sources for an incomplete cell would manufacture
-    signal that isn't there, rather than honestly reporting which cells the
-    current pipeline stage couldn't reach.
+def select_complete_case_matrix(numeric: pd.DataFrame, min_feature_coverage: float = 0.85):
+    """Two-stage complete-case selection, shared by run_pca_on_master_table
+    and cluster_features.py so both apply the same missing-data convention:
+    imputing disparate scalar sources for an incomplete cell would
+    manufacture signal that isn't there, rather than honestly reporting
+    which cells the current pipeline stage couldn't reach.
 
-    Complete-case selection is applied in two stages, not one: first drop
-    any FEATURE covering fewer than min_feature_coverage of cells (e.g.
-    burst_boundary_slope, which needs a burst-onset boundary to actually
-    exist within a cell's swept grid to be defined at all -- confirmed
-    directly this single column alone was excluding 32/69 cells, most of
-    which have every OTHER feature and were only being dropped for this one
-    genuinely-sparse one). Only THEN drop cells still missing something
-    among the remaining, well-covered features. Skipping the first step and
-    going straight to complete-case rows would let one sparse feature veto
-    the whole table's coverage.
+    Applied in two stages, not one: first drop any FEATURE covering fewer
+    than min_feature_coverage of cells (e.g. burst_boundary_slope, which
+    needs a burst-onset boundary to actually exist within a cell's swept
+    grid to be defined at all -- confirmed directly this single column
+    alone was excluding 32/69 cells, most of which have every OTHER
+    feature and were only being dropped for this one genuinely-sparse
+    one). Only THEN drop cells still missing something among the
+    remaining, well-covered features. Skipping the first step and going
+    straight to complete-case rows would let one sparse feature veto the
+    whole table's coverage.
+
+    Returns (complete_df, kept_cols, dropped_cols, excluded_row_ids).
     """
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.decomposition import PCA
-
-    numeric_cols = [c for c in table.columns if pd.api.types.is_numeric_dtype(table[c])]
-    numeric = table[numeric_cols]
-
     coverage = numeric.notna().mean()
     kept_cols = coverage[coverage >= min_feature_coverage].index.tolist()
     dropped_cols = coverage[coverage < min_feature_coverage].index.tolist()
@@ -208,7 +205,22 @@ def run_pca_on_master_table(table: pd.DataFrame, min_feature_coverage: float = 0
     numeric = numeric[kept_cols]
     complete_mask = numeric.notna().all(axis=1)
     complete = numeric[complete_mask]
-    excluded = table.index[~complete_mask].tolist()
+    excluded = numeric.index[~complete_mask].tolist()
+    return complete, kept_cols, dropped_cols, excluded
+
+
+def run_pca_on_master_table(table: pd.DataFrame, min_feature_coverage: float = 0.85) -> dict:
+    """PCA restricted to cells with a fully complete row -- see
+    select_complete_case_matrix for why incomplete cells/sparse features
+    are dropped rather than imputed.
+    """
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+
+    numeric_cols = [c for c in table.columns if pd.api.types.is_numeric_dtype(table[c])]
+    numeric = table[numeric_cols]
+
+    complete, kept_cols, dropped_cols, excluded = select_complete_case_matrix(numeric, min_feature_coverage)
 
     if len(complete) < 3:
         return {"status": "insufficient_cells", "n_complete": len(complete), "excluded_cell_ids": excluded,

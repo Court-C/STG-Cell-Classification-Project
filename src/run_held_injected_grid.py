@@ -241,18 +241,24 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
             test_pattern = "silent"
             test_isi_short_ms = test_isi_long_ms = None
             test_n_isis = 0
+            test_n_spikes = _n_peaks
             test_bimodality_metric = None
         else:
-            isis_test = compute_isis_ms(v_test, t_test, PROMINENCE_FRACTION)
+            isis_test, test_n_spikes = compute_isis_ms(v_test, t_test, PROMINENCE_FRACTION)
             burst_test = classify_burst_pattern(isis_test, min_isis_for_burst_test,
-                                                isi_mode_prominence_frac, min_isi_ratio)
+                                                isi_mode_prominence_frac, min_isi_ratio,
+                                                n_peaks=test_n_spikes)
             test_pattern = burst_test["pattern"]
             test_isi_short_ms = burst_test["isi_short_ms"]
             test_isi_long_ms = burst_test["isi_long_ms"]
             test_n_isis = burst_test["n_isis"]
             test_bimodality_metric = burst_test["bimodality_metric"]
 
-        if test_pattern != "insufficient_data" or window_s >= max_test_window_s:
+        # "sparse" (real but under-sampled firing, see classify_burst_pattern)
+        # gets the same window-extension retry as "insufficient_data" -- more
+        # window time is exactly what a too-few-spikes case needs, regardless
+        # of which of the two labels it currently carries.
+        if test_pattern not in ("insufficient_data", "sparse") or window_s >= max_test_window_s:
             break
         window_s = min(window_s * test_window_extend_factor, max_test_window_s)
 
@@ -275,6 +281,7 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
     test_result = {
         "test_pattern": test_pattern, "test_isi_short_ms": test_isi_short_ms,
         "test_isi_long_ms": test_isi_long_ms, "test_n_isis": test_n_isis,
+        "test_n_spikes": test_n_spikes,
         "test_bimodality_metric": test_bimodality_metric, "test_freq_hz": test_freq_hz,
         # test/recovery windows are fixed adaptive-duration ISI-capture windows
         # (like Step 1's dedicated isi_window_s), not a chunked settle-loop like
@@ -352,7 +359,8 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
         else:
             rebound_isis = np.diff(qualifying)
             rebound_burst = classify_burst_pattern(rebound_isis, min_isis_for_burst_test,
-                                                   isi_mode_prominence_frac, min_isi_ratio)
+                                                   isi_mode_prominence_frac, min_isi_ratio,
+                                                   n_peaks=rebound_spike_count)
             rebound_pattern = "bursting_rebound" if rebound_burst["pattern"] == "bursting" else "tonic_rebound"
 
     recovery_result = {
@@ -381,7 +389,7 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
 # partial dict.
 _TEST_RECOVERY_DEFAULTS = {
     "test_pattern": None, "test_isi_short_ms": None, "test_isi_long_ms": None,
-    "test_n_isis": 0, "test_bimodality_metric": None, "test_freq_hz": 0.0,
+    "test_n_isis": 0, "test_n_spikes": 0, "test_bimodality_metric": None, "test_freq_hz": 0.0,
     "test_settled": None, "test_v_min_mV": float("nan"), "test_v_end_mV": float("nan"),
     "test_v_min_pre_spike_mV": float("nan"), "test_first_spike_ms": None,
     "test_adaptation_ratio": None, "test_n_bursts": None, "test_spikes_per_burst": None,
@@ -560,25 +568,27 @@ def build_edge_list(held_levels, injected_levels):
 def _point_status(point) -> str:
     if point["blew_up"]:
         return "blew_up"
-    if point["test_pattern"] == "insufficient_data":
+    if point["test_pattern"] in ("insufficient_data", "sparse"):
         return "insufficient_data"
     return "confident"
 
 
 def edge_is_boundary(grid, edge) -> bool:
     """An edge is worth bisecting only when BOTH endpoints are confidently
-    classified and they disagree. "insufficient_data" (sparse/no firing,
-    common across much of the grid since the whole point of this sweep is
-    to explore near and beyond each cell's own 1D silencing threshold on
-    both axes at once) is deliberately NOT treated as an automatic boundary
-    trigger: it can't be resolved by bisecting further (the sparse-firing
-    issue is systemic to the fixed test-window length, not a resolution
-    problem), and earlier code that gave every "ambiguous" edge one free
-    bisection attempt did not actually bound refinement cost -- each
-    bisection creates two brand-new, never-before-attempted child edges, so
-    with most of the grid legitimately "insufficient_data" the point count
-    nearly doubled every depth (confirmed empirically: 49 -> 74 -> 136 -> 260
-    -> 497 for one real cell, hitting the truncation safety valve every time).
+    classified and they disagree. "insufficient_data" (zero spikes) and
+    "sparse" (real but too-few-spikes-to-classify-burst-structure firing --
+    see classify_burst_pattern) are both common across much of the grid,
+    since the whole point of this sweep is to explore near and beyond each
+    cell's own 1D silencing threshold on both axes at once, and both are
+    deliberately NOT treated as an automatic boundary trigger: neither can be
+    resolved by bisecting further (the too-few-spikes issue is systemic to
+    the fixed test-window length, not a resolution problem), and earlier code
+    that gave every "ambiguous" edge one free bisection attempt did not
+    actually bound refinement cost -- each bisection creates two brand-new,
+    never-before-attempted child edges, so with most of the grid legitimately
+    unclassified the point count nearly doubled every depth (confirmed
+    empirically: 49 -> 74 -> 136 -> 260 -> 497 for one real cell, hitting the
+    truncation safety valve every time).
     """
     a, b = grid[edge[0]], grid[edge[1]]
     if _point_status(a) != "confident" or _point_status(b) != "confident":
@@ -712,7 +722,7 @@ def save_output_cache(cache: dict, cache_path: Path = DEFAULT_OUTPUT_CACHE_PATH)
 # ---------------------------------------------------------------------------
 
 PATTERN_COLORS = {"silent": "gray", "tonic": "steelblue", "bursting": "mediumpurple",
-                  "insufficient_data": "lightgray"}
+                  "sparse": "khaki", "insufficient_data": "lightgray"}
 HEATMAP_RESOLUTION = 150
 
 
@@ -915,7 +925,7 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
     # possibly-mismatched constant.
     merge_tolerance_nA = cell_result["run_args"]["min_edge_nA"]
 
-    fig, axes = plt.subplots(2, 2, figsize=(11, 9))
+    fig, axes = plt.subplots(2, 3, figsize=(15.5, 9))
 
     pattern_names = list(PATTERN_COLORS.keys())
     pattern_codes = np.array([pattern_names.index(p["test_pattern"] or "insufficient_data")
@@ -941,6 +951,36 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
               for lbl, c in PATTERN_COLORS.items()]
     axes[0, 0].legend(handles=handles, loc="best", fontsize=6)
 
+    # Firing rate is otherwise invisible in the categorical panel above (a
+    # near-rheobase 2 Hz tonic point and a fast 40 Hz one both just read
+    # "tonic") -- shown for every non-silent point regardless of pattern
+    # (bursting included: test_freq_hz is the whole-window spike count over
+    # window duration, still a meaningful rate even when spikes cluster into
+    # bursts) since it's already computed for every point via
+    # count_spikes_and_rate, not just the confidently-classified ones.
+    freq = np.array([p["test_freq_hz"] if p["test_pattern"] != "silent" else np.nan
+                     for p in grid.values()])
+    freq_grid = _render_heatmap(held, injected, freq, hh, ii, merge_tolerance_nA)
+    im = axes[0, 1].imshow(freq_grid, origin="lower", extent=extent, aspect="auto", cmap="viridis",
+                           interpolation="bilinear")
+    fig.colorbar(im, ax=axes[0, 1], label="Hz")
+    axes[0, 1].set_title("test-window firing rate (blank = silent)", fontsize=9)
+
+    # spikes_per_burst is only meaningful where test_pattern == "bursting"
+    # (see run_test_and_recovery's test_n_bursts/test_spikes_per_burst,
+    # computed only in that branch) -- exactly the quantity today's
+    # avg_spikes_per_burst >= 1.5 fix (see classify_burst_pattern) now
+    # gates on, so this panel is the direct visual check that the fix
+    # behaves sensibly across a whole cell's grid, not just the handful of
+    # points spot-checked during calibration.
+    spb = np.array([p["test_spikes_per_burst"] if p["test_pattern"] == "bursting" else np.nan
+                    for p in grid.values()])
+    spb_grid = _render_heatmap(held, injected, spb, hh, ii, merge_tolerance_nA)
+    im = axes[0, 2].imshow(spb_grid, origin="lower", extent=extent, aspect="auto", cmap="plasma",
+                           interpolation="bilinear")
+    fig.colorbar(im, ax=axes[0, 2], label="spikes/burst")
+    axes[0, 2].set_title("spikes per burst (bursting points only)", fontsize=9)
+
     # rebound_spike_count where applicable+occurred (0 where applicable but
     # didn't occur); NaN (excluded from interpolation) where rebound wasn't
     # even applicable -- those points' recovery windows were never
@@ -950,17 +990,17 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
     rebound_counts = np.array([float(p["rebound_spike_count"]) if p["rebound_applicable"] else np.nan
                                for p in grid.values()])
     rebound_grid = _render_heatmap(held, injected, rebound_counts, hh, ii, merge_tolerance_nA)
-    im = axes[0, 1].imshow(rebound_grid, origin="lower", extent=extent, aspect="auto", cmap="Oranges",
+    im = axes[1, 0].imshow(rebound_grid, origin="lower", extent=extent, aspect="auto", cmap="Oranges",
                            interpolation="bilinear")
-    fig.colorbar(im, ax=axes[0, 1], label="rebound spike count")
-    axes[0, 1].set_title("rebound spike count (blank = not applicable)", fontsize=9)
+    fig.colorbar(im, ax=axes[1, 0], label="rebound spike count")
+    axes[1, 0].set_title("rebound spike count (blank = not applicable)", fontsize=9)
 
     lat = np.array([p["rebound_latency_ms"] if p["rebound_occurred"] else np.nan for p in grid.values()])
     lat_grid = _render_heatmap(held, injected, lat, hh, ii, merge_tolerance_nA)
-    im = axes[1, 0].imshow(lat_grid, origin="lower", extent=extent, aspect="auto", cmap="viridis",
+    im = axes[1, 1].imshow(lat_grid, origin="lower", extent=extent, aspect="auto", cmap="viridis",
                            interpolation="bilinear")
-    fig.colorbar(im, ax=axes[1, 0], label="ms")
-    axes[1, 0].set_title("rebound latency", fontsize=9)
+    fig.colorbar(im, ax=axes[1, 1], label="ms")
+    axes[1, 1].set_title("rebound latency", fontsize=9)
 
     # trough_idx = argmin(v_rec) (see run_test_and_recovery) is only a
     # genuine post-inhibitory-rebound trough when the cell was actually
@@ -977,10 +1017,10 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
                                                 and p["test_pattern"] == "silent") else np.nan
                   for p in grid.values()])
     iH_grid = _render_heatmap(held, injected, iH, hh, ii, merge_tolerance_nA)
-    im = axes[1, 1].imshow(iH_grid, origin="lower", extent=extent, aspect="auto", cmap="magma",
+    im = axes[1, 2].imshow(iH_grid, origin="lower", extent=extent, aspect="auto", cmap="magma",
                            interpolation="bilinear")
-    fig.colorbar(im, ax=axes[1, 1], label="nA")
-    axes[1, 1].set_title("i_H at recovery trough (test window fully silenced only)", fontsize=9)
+    fig.colorbar(im, ax=axes[1, 2], label="nA")
+    axes[1, 2].set_title("i_H at recovery trough (test window fully silenced only)", fontsize=9)
 
     for ax in axes.flat:
         ax.set_xlabel("held (nA)")

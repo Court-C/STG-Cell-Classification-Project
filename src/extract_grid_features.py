@@ -77,8 +77,12 @@ def compute_fi_slope(grid: dict, held_level: float = 0.0) -> dict:
 
 
 def compute_burstiness(grid: dict) -> dict:
+    # "sparse" points fired but too few spikes to confidently say tonic vs.
+    # bursting (see classify_burst_pattern) -- excluded here alongside
+    # insufficient_data for the same reason, even though (unlike
+    # insufficient_data) they do carry a real, nonzero test_freq_hz.
     confident = [p for p in grid.values() if not p["blew_up"]
-                and p["test_pattern"] not in (None, "insufficient_data")]
+                and p["test_pattern"] not in (None, "insufficient_data", "sparse")]
     n_confident = len(confident)
     n_bursting = sum(1 for p in confident if p["test_pattern"] == "bursting")
     n_tonic = sum(1 for p in confident if p["test_pattern"] == "tonic")
@@ -272,7 +276,8 @@ def compute_boundary_slopes(grid: dict) -> dict:
     rebound_crossings = _boundary_crossings(
         grid, lambda p: bool(p["rebound_applicable"] and p["rebound_occurred"]))
     burst_crossings = _boundary_crossings(
-        grid, lambda p: (p["test_pattern"] == "bursting") if p["test_pattern"] not in (None, "insufficient_data") else None)
+        grid, lambda p: (p["test_pattern"] == "bursting")
+                       if p["test_pattern"] not in (None, "insufficient_data", "sparse") else None)
     reb = _fit_boundary_slope(rebound_crossings)
     burst = _fit_boundary_slope(burst_crossings)
     return {
