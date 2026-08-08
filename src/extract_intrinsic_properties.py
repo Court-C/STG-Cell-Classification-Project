@@ -106,12 +106,27 @@ DEFAULT_DVDT_THRESHOLD_MV_PER_MS = 10.0
 # upstroke itself (which is not RC-relaxation behavior).
 SPIKE_BACKOFF_MS = 2.0
 MIN_FIT_SAMPLES = 20
+# Bi-exponential fit has 5 free parameters (vs 3 for single-exponential) --
+# needs more samples to be identifiable at all, not just numerically stable.
+MIN_FIT_SAMPLES_BIEXP = 40
 # Sag-detection thresholds (see compute_rin_tau) -- a rebound from the step
 # response's own trough must clear BOTH an absolute noise floor (0.2 mV) AND
 # a fraction of the dip's own depth (15%) to count as genuine Ih-mediated
 # sag rather than numerical noise on an otherwise-flat/small response.
 SAG_REBOUND_MIN_MV = 0.2
 SAG_REBOUND_MIN_FRACTION = 0.15
+# Thresholds for adopting a two-exponential fit over the single-exponential
+# one (see compute_rin_tau) -- tau2 must be at least this many times tau1 to
+# count as a genuinely separated fast/slow pair (not a collapsed/degenerate
+# fit), and r2 must improve by at least this much to justify the 2 extra
+# free parameters (not just numerically higher from added flexibility).
+MIN_BIEXP_TAU_SEPARATION = 2.0
+MIN_BIEXP_R2_GAIN = 0.05
+# Absolute floor, not just relative to the (possibly also-bad) single-exp
+# r2 -- confirmed directly a relative-only bar let a visibly bad, boundary-
+# pinned fit through (5A6WBD: r2=0.478 improved on single-exp's 0.134, but
+# the fit line didn't track the real trace at all).
+MIN_BIEXP_R2_ABSOLUTE = 0.9
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +219,75 @@ def fit_exponential_relaxation(t_ms: np.ndarray, v_mV: np.ndarray):
             "t_rel_ms": t_rel, "v_fit_mV": v_fit}
 
 
+def _biexp_relaxation_model(t_rel_ms, C, A1, tau1_ms, A2, tau2_ms):
+    return C + A1 * np.exp(-t_rel_ms / tau1_ms) + A2 * np.exp(-t_rel_ms / tau2_ms)
+
+
+def fit_biexponential_relaxation(t_ms: np.ndarray, v_mV: np.ndarray):
+    """Two-exponential fit: fast RC-charging component (tau1) plus a slower
+    Ih-mediated sag/rebound component (tau2) -- V(t) = C + A1*exp(-t/tau1) +
+    A2*exp(-t/tau2). Tried as a follow-up to the single-exponential fit
+    specifically for has_sag cases, where a single exponential is the wrong
+    model by construction (see compute_rin_tau).
+
+    tau1 is bounded to [0.01, 100] ms and tau2 to [20, 10*window+1] ms --
+    a deliberate ordering constraint (not a hard non-overlap, there's a
+    20-50ms zone either could land in) so the optimizer can't "label-switch"
+    which component it calls fast vs slow between fit attempts, which would
+    make tau1/tau2 meaningless to compare across cells. The bound values
+    themselves come from this model's own documented current time constants
+    (see run_chirp_protocol.py's module docstring: tauCaTM ~5-40ms, tauHM/Ih
+    ~60-300+ms subthreshold) -- Ih is the sag-generating current here, so
+    tau2's lower bound is set comfortably below its fast end, not at it.
+
+    Needs more samples than the single-exponential fit (5 free parameters
+    vs 3) to be identifiable at all -- returns None below MIN_FIT_SAMPLES_
+    BIEXP rather than attempting an underdetermined fit.
+    """
+    if len(t_ms) < MIN_FIT_SAMPLES_BIEXP:
+        return None
+    t_rel = t_ms - t_ms[0]
+
+    min_idx = int(np.argmin(v_mV))
+    A1_0 = float(v_mV[0] - v_mV[min_idx])
+    tau1_0 = max(float(t_rel[min_idx]) / 3.0, 1.0) if min_idx > 0 else 5.0
+    A2_0 = float(v_mV[min_idx] - v_mV[-1])
+    tau2_0 = max(float(t_rel[-1] - t_rel[min_idx]) / 2.0, 30.0)
+    C0 = float(v_mV[-1])
+
+    lower = [-200.0, -300.0, 0.01, -300.0, 20.0]
+    upper = [200.0, 300.0, 100.0, 300.0, 10.0 * t_rel[-1] + 1.0]
+    p0 = [C0, A1_0, tau1_0, A2_0, tau2_0]
+    # p0 must lie strictly inside bounds -- clip rather than let curve_fit
+    # raise on a boundary-violating initial guess (a genuinely tiny/short
+    # window can push tau2_0 outside its own upper bound).
+    p0 = [min(max(v, lo), hi) for v, lo, hi in zip(p0, lower, upper)]
+    try:
+        popt, _pcov = curve_fit(
+            _biexp_relaxation_model, t_rel, v_mV, p0=p0, bounds=(lower, upper), maxfev=20000)
+    except (RuntimeError, ValueError):
+        return None
+    C, A1, tau1, A2, tau2 = popt
+    if not (np.isfinite(tau1) and np.isfinite(tau2)) or tau1 <= 0 or tau2 <= 0:
+        return None
+    v_fit = _biexp_relaxation_model(t_rel, *popt)
+    ss_res = float(np.sum((v_mV - v_fit) ** 2))
+    ss_tot = float(np.sum((v_mV - np.mean(v_mV)) ** 2))
+    r2 = (1.0 - ss_res / ss_tot) if ss_tot > 0 else None
+    # Pinned-at-bound is the standard tell for a non-converged/underdetermined
+    # curve_fit result: the optimizer ran out of room to explore rather than
+    # settling on an interior optimum -- confirmed directly this happens here
+    # (a real 5A6WBD fit landed with tau1 EXACTLY at 50.00ms and tau2 EXACTLY
+    # at 3000.00ms, its two bounds, while visibly not tracking the real
+    # trace despite r2=0.478 clearing the old relative-improvement-only
+    # bar). 0.1% of each bound's own span is the tolerance for "at" a bound.
+    at_bound = (tau1 >= upper[2] * 0.999 or tau1 <= lower[2] + 0.001 * (upper[2] - lower[2])
+               or tau2 >= upper[4] * 0.999)
+    return {"C_mV": float(C), "A1_mV": float(A1), "tau1_ms": float(tau1),
+           "A2_mV": float(A2), "tau2_ms": float(tau2), "r2": r2, "at_bound": bool(at_bound),
+           "t_rel_ms": t_rel, "v_fit_mV": v_fit}
+
+
 def compute_rin_tau(params, onset_state, step_nA, step_duration_ms, dt, temp, reftemp) -> dict:
     """Apply step_nA from onset_state for step_duration_ms and fit R_in/tau
     from the response. R_in is computed from the fitted asymptote (C_mV),
@@ -284,14 +368,76 @@ def compute_rin_tau(params, onset_state, step_nA, step_duration_ms, dt, temp, re
         notes.append("exponential relaxation fit did not converge")
         return {**base_out, "r_in_MOhm": None, "tau_ms": None, "r_in_r2": None, "has_sag": has_sag, "notes": notes}
 
+    fit_model = "single_exp"
+    biexp_fit = None
+    if has_sag:
+        # Try the two-exponential model as a follow-up specifically for the
+        # sag case -- a single exponential is the wrong model by
+        # construction here (see the sag-detection comment above), but that
+        # doesn't mean R_in/tau are unrecoverable, only that a second
+        # (slower, Ih-mediated) component needs to be fit alongside the fast
+        # RC one. Adoption requires ALL of: convergence; a genuine fast/slow
+        # split (tau2 meaningfully > tau1, not collapsed together); an
+        # absolute (not just relative-to-single-exp) r2 floor, since a bad
+        # fit can still "improve" on an even-worse baseline; neither tau
+        # pinned at its own optimizer bound (the standard non-convergence
+        # tell); and a physically valid R_in SIGN -- a hyperpolarizing step
+        # must settle net-hyperpolarized relative to baseline no matter how
+        # slow the Ih rebound is, so a positive C-v_baseline (with step_nA
+        # negative) is not just unlikely, it's a contradiction, regardless
+        # of how good r2 looks. Confirmed directly why all of these are
+        # needed, not just some: on a 4-cell test batch, requiring only
+        # convergence + tau separation + relative r2 gain "adopted" a fit
+        # for every cell, but visual inspection showed 3 of 4 were
+        # boundary-pinned garbage that happened to have a high or improved
+        # r2 anyway (5A6WBD: tau1/tau2 both exactly at their bounds, r2=
+        # 0.478, visibly not tracking the real trace; 4QSWXH and W0E22J:
+        # tau2 pinned at 3000ms/its own bound despite r2 > 0.97).
+        biexp_fit = fit_biexponential_relaxation(t_ms[:end_idx], v[:end_idx])
+        candidate_r_in = ((biexp_fit["C_mV"] - v_baseline) / step_nA) if biexp_fit is not None else None
+        if (biexp_fit is not None and biexp_fit["r2"] is not None and fit["r2"] is not None
+                and not biexp_fit["at_bound"]
+                and biexp_fit["tau2_ms"] > MIN_BIEXP_TAU_SEPARATION * biexp_fit["tau1_ms"]
+                and biexp_fit["r2"] >= MIN_BIEXP_R2_ABSOLUTE
+                and biexp_fit["r2"] - fit["r2"] > MIN_BIEXP_R2_GAIN
+                and candidate_r_in is not None and candidate_r_in > 0):
+            fit_model = "biexp"
+            notes.append(f"single-exponential fit rejected (sag); two-exponential fit adopted "
+                        f"instead (tau1={biexp_fit['tau1_ms']:.2f} ms fast + "
+                        f"tau2={biexp_fit['tau2_ms']:.2f} ms slow/Ih, "
+                        f"r2 {fit['r2']:.3f} -> {biexp_fit['r2']:.3f})")
+        else:
+            if biexp_fit is None:
+                reason = "did not converge"
+            elif biexp_fit["at_bound"]:
+                reason = (f"tau pinned at its own optimizer bound (tau1={biexp_fit['tau1_ms']:.2f}, "
+                         f"tau2={biexp_fit['tau2_ms']:.2f} ms) -- not a genuine convergence")
+            elif candidate_r_in is not None and candidate_r_in <= 0:
+                reason = f"resulting R_in sign is still non-physical ({candidate_r_in:.2f} MOhm)"
+            else:
+                reason = (f"r2 {fit['r2']:.3f} -> {biexp_fit['r2']:.3f} "
+                         f"(needs >= {MIN_BIEXP_R2_ABSOLUTE} absolute)")
+            notes.append(f"two-exponential fit attempted but not adopted ({reason}) -- "
+                        f"R_in/tau from the single-exponential fit remains flagged invalid (has_sag)")
+
+    chosen = biexp_fit if fit_model == "biexp" else fit
     # mV / nA = MOhm directly (1e-3 V / 1e-9 A = 1e6 Ohm) -- no extra
     # conversion factor needed. Still computed and returned even when
-    # has_sag -- never silently discarded -- but the caller/consumer must
-    # check has_sag before trusting it (same "flag, don't discard" pattern
-    # as run_chirp_protocol.py's impedance_valid).
-    r_in_MOhm = (fit["C_mV"] - v_baseline) / step_nA
-    return {**base_out, "r_in_MOhm": float(r_in_MOhm), "tau_ms": fit["tau_ms"], "r_in_r2": fit["r2"],
-           "has_sag": has_sag, "notes": notes, "fit_t_rel_ms": fit["t_rel_ms"], "fit_v_fit_mV": fit["v_fit_mV"]}
+    # has_sag and no biexp adoption -- never silently discarded -- but the
+    # caller/consumer must check has_sag (and fit_model) before trusting it
+    # (same "flag, don't discard" pattern as run_chirp_protocol.py's
+    # impedance_valid). tau_ms reports tau2 (the slow/Ih component) when
+    # biexp is adopted, since that's the one comparable in meaning to a
+    # single-exponential tau (the fast component is closer to true passive
+    # membrane tau -- both are exposed via tau1_ms/tau2_ms below).
+    r_in_MOhm = (chosen["C_mV"] - v_baseline) / step_nA
+    reported_tau_ms = chosen["tau2_ms"] if fit_model == "biexp" else chosen["tau_ms"]
+    return {**base_out, "r_in_MOhm": float(r_in_MOhm), "tau_ms": reported_tau_ms,
+           "r_in_r2": chosen["r2"], "has_sag": has_sag, "fit_model": fit_model,
+           "tau1_ms": biexp_fit["tau1_ms"] if biexp_fit else None,
+           "tau2_ms": biexp_fit["tau2_ms"] if biexp_fit else None,
+           "single_exp_r2": fit["r2"], "biexp_r2": biexp_fit["r2"] if biexp_fit else None,
+           "notes": notes, "fit_t_rel_ms": chosen["t_rel_ms"], "fit_v_fit_mV": chosen["v_fit_mV"]}
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +690,9 @@ def extract_cell_intrinsic_properties(cell_id: str, params: np.ndarray, ss_entry
         **base, "status": "ok", "error": None,
         "r_in_MOhm": step_result.get("r_in_MOhm"), "tau_ms": step_result.get("tau_ms"),
         "r_in_r2": step_result.get("r_in_r2"), "has_sag": step_result.get("has_sag"),
+        "fit_model": step_result.get("fit_model"), "tau1_ms": step_result.get("tau1_ms"),
+        "tau2_ms": step_result.get("tau2_ms"), "single_exp_r2": step_result.get("single_exp_r2"),
+        "biexp_r2": step_result.get("biexp_r2"),
         "step_nA_used": float(step_nA), "step_reference_nA": step_reference_nA,
         "step_delta_nA": float(step_delta_nA), "hold_settled": hold_result["settled"],
         "hold_is_flatline": hold_result["is_flatline"],
@@ -623,17 +772,29 @@ def plot_cell_intrinsic(result: dict, trace_data: dict, outdir: Path, command: s
             ax_step.axhline(v_base, color="gray", ls=":", lw=1, label="pre-step baseline")
         fit_t_rel = trace_data.get("step_fit_t_rel_ms")
         fit_v = trace_data.get("step_fit_v_fit_mV")
+        fit_model = result.get("fit_model")
         if fit_t_rel is not None:
-            ax_step.plot(t_step[0] + fit_t_rel, fit_v, color="firebrick", lw=1.2, ls="--",
-                        label=f"exp fit (tau={_fmt(result.get('tau_ms'), '{:.2f}')} ms)")
+            if fit_model == "biexp":
+                fit_label = (f"2-exp fit (tau1={_fmt(result.get('tau1_ms'), '{:.2f}')}ms + "
+                            f"tau2={_fmt(result.get('tau2_ms'), '{:.2f}')}ms)")
+            else:
+                fit_label = f"exp fit (tau={_fmt(result.get('tau_ms'), '{:.2f}')} ms)"
+            ax_step.plot(t_step[0] + fit_t_rel, fit_v, color="firebrick", lw=1.2, ls="--", label=fit_label)
         has_sag = result.get("has_sag")
         title = (f"step response ({trace_data.get('step_nA', float('nan')):.3f} nA)\n"
                 f"R_in={_fmt(result.get('r_in_MOhm'), '{:.1f}')} MOhm, "
                 f"r2={_fmt(result.get('r_in_r2'), '{:.3f}')}")
-        if has_sag:
+        if has_sag and fit_model == "biexp":
+            ax_step.set_title(title + "  [sag present, resolved via 2-exp fit]", fontsize=8, color="darkorange")
+            ax_step.text(0.5, 0.15, "sag detected, but a two-exponential fit\n"
+                                   "converged with a genuine fast+slow split", transform=ax_step.transAxes,
+                        ha="center", va="center", fontsize=7, color="darkorange", style="italic",
+                        bbox=dict(boxstyle="round", facecolor="#fdf0dc", edgecolor="darkorange", alpha=0.9))
+        elif has_sag:
             ax_step.set_title(title + "  [INVALID: sag detected]", fontsize=8, color="firebrick")
             ax_step.text(0.5, 0.5, "INVALID -- non-monotonic (sag-like) response;\n"
-                                  "single-exponential fit does not apply",
+                                  "single-exponential fit does not apply\n"
+                                  "(2-exp fit attempted, not adopted -- see notes)",
                         transform=ax_step.transAxes, ha="center", va="center", fontsize=7,
                         color="firebrick", style="italic",
                         bbox=dict(boxstyle="round", facecolor="mistyrose", edgecolor="firebrick", alpha=0.9))
@@ -720,10 +881,15 @@ def parse_args() -> argparse.Namespace:
                              "FURTHER hyperpolarization (never back toward threshold). Scaled per "
                              "cell, not a fixed nA value that could be negligible for a deep cell "
                              "or too large for a shallow one.")
-    parser.add_argument("--step-duration-ms", type=float, default=300.0,
-                        help="Step duration -- long relative to expected membrane time "
-                             "constants (tens of ms at most for this model) to give the "
-                             "relaxation time to approach its asymptote.")
+    parser.add_argument("--step-duration-ms", type=float, default=1000.0,
+                        help="Step duration. 1000ms (not the naive 'tens of ms is enough for a "
+                             "membrane tau' guess) because sag-affected cells need real time for "
+                             "the slow Ih-mediated rebound component to develop and separate from "
+                             "the fast RC component in a two-exponential fit -- confirmed directly "
+                             "300ms only let 1 of 4 sag-affected test cells resolve a valid "
+                             "two-exponential fit, 1000ms let 2 of 4 (see compute_rin_tau). Longer "
+                             "than this risks the cell firing its own spontaneous next spike before "
+                             "the step ends (these are all pacemakers) rather than helping further.")
     parser.add_argument("--hold-settle-chunk-s", type=float, default=2.0,
                         help="Integration chunk length (s) while settling at step_reference_nA "
                              "before the test step -- see find_silencing_threshold.py's "
@@ -810,9 +976,14 @@ def main() -> None:
         print(f"  {status}: {count}")
     sagged = [cid for cid in cells if output_cache[cid].get("status") == "ok"
              and output_cache[cid].get("has_sag")]
-    if sagged:
-        print(f"\n{len(sagged)} cell(s) reached 'ok' but showed a non-monotonic (sag-like) step "
-             f"response -- their R_in/tau numbers are not valid single-exponential fits: {sagged}")
+    sagged_resolved = [cid for cid in sagged if output_cache[cid].get("fit_model") == "biexp"]
+    sagged_unresolved = [cid for cid in sagged if cid not in sagged_resolved]
+    if sagged_resolved:
+        print(f"\n{len(sagged_resolved)} cell(s) showed sag but a two-exponential fit resolved "
+             f"R_in/tau anyway: {sagged_resolved}")
+    if sagged_unresolved:
+        print(f"\n{len(sagged_unresolved)} cell(s) showed sag with no valid fit (single- or "
+             f"two-exponential) -- R_in/tau are not available for these: {sagged_unresolved}")
     print(f"\nCache written to {output_cache_path}")
     if not args.no_plot:
         print(f"Figures written to {figures_dir}/")
