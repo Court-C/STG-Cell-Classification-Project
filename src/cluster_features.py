@@ -25,15 +25,22 @@ No feature is dropped for having low total variance: low variance across
 all cells doesn't mean a feature is irrelevant for clustering -- it could
 be exactly what separates a small, real minority cluster from everything
 else, which a variance-ranked cut would erase before ever looking for it.
-Only two things are dropped outright: features with essentially zero
-variance (uninformative, and would blow up under z-scoring) and features
-below --min-feature-coverage (too many missing cells to trust, same
-convention as consolidate_features.py's PCA -- see
-select_complete_case_matrix there). Near-duplicate/collinear pairs are
-flagged, not auto-dropped -- the raw-vs-pca cross-check above is the
-intended way to see whether collinearity is distorting the raw-space
-clustering, rather than guessing which of two correlated columns to
-discard.
+Three things ARE dropped: features with essentially zero variance
+(uninformative, and would blow up under z-scoring); features below
+--min-feature-coverage (too many missing cells to trust, same convention
+as consolidate_features.py's PCA -- see select_complete_case_matrix
+there); and, as of the full 69-cell run, one column from each highly-
+correlated pair (see prune_correlated_features). That last one used to be
+flag-only, but confirmed directly this was letting redundant features
+silently multiply-count the same underlying axis in the raw Euclidean
+distance (baseline_freq_hz/peak_test_freq_hz/max_rebound_spike_count, all
+mutually r=0.94-0.99, were really one "how excitable is this cell"
+dimension counted three times) -- almost certainly why unconstrained
+silhouette-based k selection kept climbing to the search boundary (k=7 of
+8) instead of settling on anything, despite never exceeding ~0.34 (weak
+structure by any conventional read). --k now defaults to 3, matching the
+known AB/PD, LP, PY count, rather than trusting silhouette to pick an
+unconstrained k blind -- pass --k explicitly to override for exploration.
 """
 
 import pickle
@@ -106,6 +113,41 @@ def report_collinear_pairs(numeric: pd.DataFrame, corr_thresh: float = 0.9) -> l
     return sorted(pairs, key=lambda t: -abs(t[2]))
 
 
+def prune_correlated_features(numeric: pd.DataFrame, corr_thresh: float = 0.9) -> tuple:
+    """Drops one column from each highly-correlated pair (|r| >= corr_thresh)
+    before clustering -- promoted from "flag only" after confirming directly
+    this matters: with the full 69-cell dataset, 3 features (baseline_freq_hz,
+    peak_test_freq_hz, max_rebound_spike_count, mutually r=0.94-0.99) all
+    measure essentially the same "how excitable is this cell" axis, but a
+    raw standardized-Euclidean clustering counts each one as an independent
+    dimension -- silently giving that one underlying axis ~3x the weight of
+    any other, genuinely-independent feature. This is very likely why
+    unconstrained silhouette-based k selection kept climbing all the way to
+    the k_range boundary (k=7 of a max-8 search) instead of settling
+    anywhere -- more clusters can keep "improving" apparent separation when
+    a few over-weighted, redundant dimensions dominate the distance metric,
+    which isn't the same thing as real structure (silhouette here never
+    exceeded ~0.34, well under the ~0.5 rule-of-thumb for genuine
+    clustering, at ANY k).
+
+    Processes pairs sorted by |r| descending (the strongest redundancies
+    first) and greedily drops the SECOND column of each pair not already
+    dropped -- deterministic, and avoids double-dropping a column that
+    appears in more than one flagged pair (e.g. all three of the mutually-
+    correlated features above only cost two drops, not three, since once
+    peak_test_freq_hz and max_rebound_spike_count are both gone from the
+    baseline_freq_hz pairs there's nothing left to drop there).
+    """
+    pairs = report_collinear_pairs(numeric, corr_thresh)
+    dropped = []
+    for a, b, _r in pairs:
+        if a in dropped or b in dropped:
+            continue
+        dropped.append(b)
+    kept_cols = [c for c in numeric.columns if c not in dropped]
+    return numeric[kept_cols], dropped, pairs
+
+
 # ---------------------------------------------------------------------------
 # Clustering
 # ---------------------------------------------------------------------------
@@ -160,14 +202,14 @@ def run_clustering(table: pd.DataFrame, feature_set: str = "behavioral",
     cols = select_feature_columns(table, feature_set)
     numeric = table[cols]
     numeric, zero_var_dropped = drop_zero_variance(numeric)
+    numeric, collinear_dropped, collinear_pairs = prune_correlated_features(numeric, corr_thresh)
     complete, kept_cols, coverage_dropped, excluded = select_complete_case_matrix(
         numeric, min_feature_coverage)
 
     if len(complete) < 4:
         return {"status": "insufficient_cells", "n_complete": len(complete),
-                "excluded_cell_ids": excluded, "dropped_feature_names": zero_var_dropped + coverage_dropped}
-
-    collinear_pairs = report_collinear_pairs(complete, corr_thresh)
+                "excluded_cell_ids": excluded,
+                "dropped_feature_names": zero_var_dropped + collinear_dropped + coverage_dropped}
 
     from sklearn.preprocessing import StandardScaler
     from sklearn.decomposition import PCA
@@ -188,7 +230,8 @@ def run_clustering(table: pd.DataFrame, feature_set: str = "behavioral",
         chosen_k = silhouette_raw["k"]
     if chosen_k is None:
         return {"status": "no_valid_k", "n_complete": len(complete),
-                "excluded_cell_ids": excluded, "dropped_feature_names": zero_var_dropped + coverage_dropped}
+                "excluded_cell_ids": excluded,
+                "dropped_feature_names": zero_var_dropped + collinear_dropped + coverage_dropped}
 
     raw_result = cluster_view(X_raw, chosen_k)
     pca_result = cluster_view(X_pca, chosen_k)
@@ -198,7 +241,8 @@ def run_clustering(table: pd.DataFrame, feature_set: str = "behavioral",
 
     return {
         "status": "ok", "feature_set": feature_set, "cell_ids": complete.index.tolist(),
-        "excluded_cell_ids": excluded, "dropped_feature_names": zero_var_dropped + coverage_dropped,
+        "excluded_cell_ids": excluded,
+        "dropped_feature_names": zero_var_dropped + collinear_dropped + coverage_dropped,
         "feature_names": kept_cols, "collinear_pairs": collinear_pairs,
         "k": chosen_k, "silhouette_by_k": silhouette_raw["scores"],
         "X_raw": X_raw, "X_pca": X_pca, "n_pcs_90pct": n_pcs,
@@ -290,10 +334,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-set", default="behavioral", choices=["behavioral", "conductance", "all"])
     parser.add_argument("--min-feature-coverage", type=float, default=0.85)
     parser.add_argument("--corr-thresh", type=float, default=0.9,
-                        help="Report (not drop) feature pairs correlated at or above this, in absolute value.")
-    parser.add_argument("--k", type=int, default=None,
-                        help="Cluster count. Default: chosen automatically by max silhouette score "
-                             "over --k-min..--k-max on the raw feature space.")
+                        help="Feature pairs correlated at or above this (absolute value) get one "
+                             "column pruned before clustering -- see prune_correlated_features.")
+    parser.add_argument("--k", type=int, default=3,
+                        help="Cluster count. Defaults to 3 (the known AB/PD, LP, PY count) rather "
+                             "than unconstrained silhouette-based selection -- confirmed directly "
+                             "silhouette alone climbs to the k-range boundary on this data without "
+                             "ever exceeding weak (~0.34) scores, i.e. it doesn't reliably pick a "
+                             "real k here. Pass e.g. --k 0 to fall back to automatic selection over "
+                             "--k-min..--k-max for exploration.")
     parser.add_argument("--k-min", type=int, default=2)
     parser.add_argument("--k-max", type=int, default=8)
     parser.add_argument("--output-csv", default=DEFAULT_OUTPUT_CSV_PATH)
@@ -309,9 +358,10 @@ def main() -> None:
     command = "python " + " ".join(sys.argv)
 
     table = pd.read_csv(args.master_csv, index_col="cell_id")
+    k = None if args.k == 0 else args.k  # 0 == request automatic silhouette-based selection
     result = run_clustering(table, feature_set=args.feature_set,
                             min_feature_coverage=args.min_feature_coverage,
-                            corr_thresh=args.corr_thresh, k=args.k,
+                            corr_thresh=args.corr_thresh, k=k,
                             k_range=range(args.k_min, args.k_max + 1))
 
     if result["status"] != "ok":
@@ -323,9 +373,9 @@ def main() -> None:
     if result["excluded_cell_ids"]:
         print(f"Excluded for missing data: {result['excluded_cell_ids']}")
     if result["dropped_feature_names"]:
-        print(f"Dropped features (zero-variance or low coverage): {result['dropped_feature_names']}")
+        print(f"Dropped features (zero-variance, collinear, or low coverage): {result['dropped_feature_names']}")
     if result["collinear_pairs"]:
-        print(f"\nFlagged collinear pairs (|r| >= {args.corr_thresh}), not dropped:")
+        print(f"\nCollinear pairs found (|r| >= {args.corr_thresh}) -- one column of each pruned:")
         for a, b, r in result["collinear_pairs"]:
             print(f"  {a} <-> {b}: r={r:+.3f}")
 
