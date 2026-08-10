@@ -1030,7 +1030,7 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
                      for p in grid.values()])
     freq_grid = _render_heatmap(held, injected, freq, hh, ii, merge_tolerance_nA)
     im = axes[0, 1].imshow(freq_grid, origin="lower", extent=extent, aspect="auto", cmap="viridis",
-                           interpolation="bilinear")
+                           interpolation="bicubic")
     fig.colorbar(im, ax=axes[0, 1], label="Hz")
     axes[0, 1].set_title("test-window firing rate (blank = silent)", fontsize=9)
 
@@ -1045,7 +1045,7 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
                     for p in grid.values()])
     spb_grid = _render_heatmap(held, injected, spb, hh, ii, merge_tolerance_nA)
     im = axes[0, 2].imshow(spb_grid, origin="lower", extent=extent, aspect="auto", cmap="plasma",
-                           interpolation="bilinear")
+                           interpolation="bicubic")
     fig.colorbar(im, ax=axes[0, 2], label="spikes/burst")
     axes[0, 2].set_title("spikes per burst (bursting points only)", fontsize=9)
 
@@ -1059,14 +1059,14 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
                                for p in grid.values()])
     rebound_grid = _render_heatmap(held, injected, rebound_counts, hh, ii, merge_tolerance_nA)
     im = axes[1, 0].imshow(rebound_grid, origin="lower", extent=extent, aspect="auto", cmap="Oranges",
-                           interpolation="bilinear")
+                           interpolation="bicubic")
     fig.colorbar(im, ax=axes[1, 0], label="rebound spike count")
     axes[1, 0].set_title("rebound spike count (blank = not applicable)", fontsize=9)
 
     lat = np.array([p["rebound_latency_ms"] if p["rebound_occurred"] else np.nan for p in grid.values()])
     lat_grid = _render_heatmap(held, injected, lat, hh, ii, merge_tolerance_nA)
     im = axes[1, 1].imshow(lat_grid, origin="lower", extent=extent, aspect="auto", cmap="viridis",
-                           interpolation="bilinear")
+                           interpolation="bicubic")
     fig.colorbar(im, ax=axes[1, 1], label="ms")
     axes[1, 1].set_title("rebound latency", fontsize=9)
 
@@ -1086,7 +1086,7 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
                   for p in grid.values()])
     iH_grid = _render_heatmap(held, injected, iH, hh, ii, merge_tolerance_nA)
     im = axes[1, 2].imshow(iH_grid, origin="lower", extent=extent, aspect="auto", cmap="magma",
-                           interpolation="bilinear")
+                           interpolation="bicubic")
     fig.colorbar(im, ax=axes[1, 2], label="nA")
     axes[1, 2].set_title("i_H at recovery trough (test window fully silenced only)", fontsize=9)
 

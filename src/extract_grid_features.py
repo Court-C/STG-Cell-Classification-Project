@@ -495,7 +495,7 @@ def plot_cell_features(cell_id: str, features: dict, outdir: Path, command: str,
             held, injected, values = _map_to_arrays(feature_map)
             grid = _render_heatmap(held, injected, values, hh, ii, tolerance_nA)
             im = ax.imshow(grid, origin="lower", extent=extent, aspect="auto", cmap=cmap,
-                           interpolation="bilinear")
+                           interpolation="bicubic")
             fig.colorbar(im, ax=ax)
         else:
             # Blank panel (e.g. no bursting points at all for this cell) --

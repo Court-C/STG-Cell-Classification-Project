@@ -311,7 +311,7 @@ def plot_cluster_feature_means(result: dict, table: pd.DataFrame, outdir: Path,
     means = df.groupby("cluster").mean()
 
     fig, ax = plt.subplots(figsize=(max(6, 0.35 * len(feature_names)), max(3, 0.6 * len(means))))
-    im = ax.imshow(means.values, cmap="coolwarm", vmin=-2, vmax=2, aspect="auto", interpolation="bilinear")
+    im = ax.imshow(means.values, cmap="coolwarm", vmin=-2, vmax=2, aspect="auto", interpolation="bicubic")
     ax.set_xticks(range(len(feature_names)))
     ax.set_xticklabels(feature_names, rotation=90, fontsize=6)
     ax.set_yticks(range(len(means)))
