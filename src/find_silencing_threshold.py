@@ -139,6 +139,79 @@ def compute_isis_ms(voltage: np.ndarray, t_ms: np.ndarray,
     return np.diff(t_ms[peaks]), len(peaks)
 
 
+DEFAULT_DVDT_THRESHOLD_MV_PER_MS = 10.0  # same Bean (2007) convention/value as extract_intrinsic_properties.py
+DEFAULT_MIN_PRE_SPIKE_MS = 20.0  # matches extract_intrinsic_properties.py's own default
+
+
+def detect_spikes_dvdt_confirmed(v: np.ndarray, t_ms: np.ndarray, dt_ms: float,
+                                 prominence_fraction: float = PROMINENCE_FRACTION,
+                                 flatline_mv: float = FLATLINE_MV,
+                                 dvdt_threshold: float = DEFAULT_DVDT_THRESHOLD_MV_PER_MS,
+                                 min_pre_spike_ms: float = DEFAULT_MIN_PRE_SPIKE_MS) -> tuple:
+    """Prominence-based candidate peaks (identical convention to every other
+    detector in this project), each then required to have a genuine fast
+    upstroke -- dV/dt >= dvdt_threshold somewhere in its own backward search
+    window -- before counting as a confirmed spike. Prominence alone can't
+    tell a real fast Na+ spike apart from a large but slow non-spike
+    transient (e.g. a strong rebound/plateau depolarization) that happens to
+    be a big fraction of a window's range; this adds that missing shape
+    check as a GATE on top of prominence, not a replacement for it.
+
+    The backward search is anchored AT the peak and walks backward through
+    the contiguous run of dV/dt >= dvdt_threshold samples immediately
+    preceding it -- NOT a forward scan from search_start for the first
+    qualifying sample anywhere in the window. That distinction matters and
+    was caught directly during validation on a real bursting cell (MXIC4S):
+    a forward scan can land on a fast (but unrelated) dV/dt swing from the
+    TAIL of the previous spike's own repolarization/AHP, which sits right at
+    the window's start when consecutive spikes are close together (as in a
+    burst) -- producing a bogus "threshold" voltage that's actually higher
+    than the current peak, a spurious negative amplitude, and a false
+    rejection of a genuine spike. Anchoring at the peak and walking backward
+    through the LAST (closest-to-peak) contiguous qualifying run avoids
+    this: an earlier, disconnected fast-dV/dt event from a prior spike is
+    correctly ignored. (extract_intrinsic_properties.py's analyze_spike_
+    waveform has the same forward-scan pattern and likely the same latent
+    issue -- out of scope to fix here, flagged separately.)
+
+    Returns (confirmed_peaks, rejected_peaks), both index arrays into v, so
+    a caller can see exactly what changed rather than just a final count.
+    Purely additive: does not change count_spikes_and_rate/compute_isis_ms/
+    classify_burst_pattern or any existing call site.
+    """
+    if v.max() - v.min() < flatline_mv:
+        return np.array([], dtype=int), np.array([], dtype=int)
+    candidates, _ = find_peaks(v, prominence=(v.max() - v.min()) * prominence_fraction)
+    if len(candidates) == 0:
+        return np.array([], dtype=int), np.array([], dtype=int)
+
+    dvdt = np.gradient(v, dt_ms)  # mV/ms
+    back_samples = int(round(min_pre_spike_ms / dt_ms))
+    confirmed, rejected = [], []
+    for k, peak_idx in enumerate(candidates):
+        prev_bound = int(candidates[k - 1]) if k > 0 else 0
+        search_start = max(prev_bound, peak_idx - back_samples, 0)
+        if search_start >= peak_idx:
+            rejected.append(peak_idx)
+            continue
+        window = dvdt[search_start:peak_idx + 1]
+        hits = np.where(window >= dvdt_threshold)[0]
+        if len(hits) == 0:
+            rejected.append(peak_idx)
+            continue
+        run_start = int(hits[-1])  # closest-to-peak qualifying sample
+        while run_start > 0 and window[run_start - 1] >= dvdt_threshold:
+            run_start -= 1
+        threshold_idx = search_start + run_start
+        amplitude_mV = float(v[peak_idx] - v[threshold_idx])
+        if amplitude_mV <= 0:
+            rejected.append(peak_idx)
+            continue
+        confirmed.append(peak_idx)
+
+    return np.array(confirmed, dtype=int), np.array(rejected, dtype=int)
+
+
 def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
                           isi_mode_prominence_frac: float, min_isi_ratio: float = 1.5,
                           min_spikes_per_burst: float = 1.5, n_peaks: int = None) -> dict:
