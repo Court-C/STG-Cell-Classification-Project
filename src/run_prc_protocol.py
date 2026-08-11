@@ -339,8 +339,17 @@ def run_cell_prc(cell_id: str, params: np.ndarray, ss_entry, fi_features_entry, 
     this cell's diagnostic figure, not to bloat the cache with full voltage
     traces for every cell.
     """
+    cell_floor_nA = fi_features_entry.get("cell_floor_nA") if fi_features_entry else None
+    if args.pulse_amplitude_frac_of_floor is not None and cell_floor_nA is not None:
+        pulse_amplitude_nA = args.pulse_amplitude_frac_of_floor * cell_floor_nA
+        pulse_amplitude_source = "frac_of_floor"
+    else:
+        pulse_amplitude_nA = args.pulse_amplitude_nA
+        pulse_amplitude_source = "fixed_nA"
+
     base = {"cell_id": cell_id, "params": params, "dt": args.dt, "temp": args.temp, "reftemp": args.reftemp,
-            "pulse_amplitude_nA": args.pulse_amplitude_nA, "n_phases": args.n_phases,
+            "pulse_amplitude_nA": pulse_amplitude_nA, "pulse_amplitude_source": pulse_amplitude_source,
+            "cell_floor_nA": cell_floor_nA, "n_phases": args.n_phases,
             "pulse_duration_frac_of_period": args.pulse_duration_frac_of_period,
             "horizon_cycles": args.horizon_cycles}
 
@@ -373,7 +382,7 @@ def run_cell_prc(cell_id: str, params: np.ndarray, ss_entry, fi_features_entry, 
 
     for i, phase in enumerate(phases):
         r = run_phase_trial(params, y_ref, phase, natural_period_ms, pulse_duration_ms,
-                            args.pulse_amplitude_nA, args.dt, args.temp, args.reftemp,
+                            pulse_amplitude_nA, args.dt, args.temp, args.reftemp,
                             horizon_ms, pattern, burst_isi_threshold_ms)
         if r["blew_up"]:
             trial_blew_up[i] = True
@@ -403,7 +412,7 @@ def run_cell_prc(cell_id: str, params: np.ndarray, ss_entry, fi_features_entry, 
             # the shift itself was already measured above without needing
             # full traces for every phase.
             example = run_phase_trial(params, y_ref, phase_of_max_sensitivity, natural_period_ms,
-                                      pulse_duration_ms, args.pulse_amplitude_nA, args.dt, args.temp,
+                                      pulse_duration_ms, pulse_amplitude_nA, args.dt, args.temp,
                                       args.reftemp, horizon_ms, pattern, burst_isi_threshold_ms,
                                       return_trace=True)
             control = run_phase_trial(params, y_ref, phase_of_max_sensitivity, natural_period_ms,
@@ -539,19 +548,54 @@ def plot_cell_prc(result: dict, example_trace, outdir: Path, command: str,
                 label=f"perturbed (φ={example_trace['phase']:.2f})")
         ax2.axvspan(pert["pulse_start_ms"], pert["pulse_end_ms"], color="firebrick", alpha=0.3,
                    label="pulse")
+
+        # natural_period_ms trace annotation: t=0 IS the reference event
+        # itself (phase phi=0 convention, see module docstring), and
+        # control_next_event_ms is the very next unperturbed event measured
+        # in THIS SAME baseline recording -- bracketing [0, control_next_
+        # event_ms] shows one real, concrete period instance directly on
+        # the trace, not just the printed natural_period_ms number (the
+        # median ISI over the whole baseline recording, of which this is
+        # one instance -- close but not necessarily bit-identical, which
+        # the label states explicitly rather than implying exact equality).
+        v_span = ctrl["v"].max() - ctrl["v"].min()
+        y_bracket = ctrl["v"].max() + 0.08 * v_span
+        ax2.annotate("", xy=(result["control_next_event_ms"], y_bracket), xytext=(0, y_bracket),
+                    arrowprops=dict(arrowstyle="<->", color="black", lw=0.9))
+        ax2.text(result["control_next_event_ms"] / 2.0, y_bracket, f"T ≈ {result['natural_period_ms']:.1f} ms",
+                 ha="center", va="bottom", fontsize=7)
+        # autoscale only accounts for plotted line/patch data, not
+        # annotate()/text() extents -- without this, a short-period cell
+        # (small y-range) can place the bracket+label right at or above the
+        # axes' autoscaled top edge, overlapping the panel title above it.
+        ylo, yhi = ax2.get_ylim()
+        ax2.set_ylim(ylo, max(yhi, y_bracket + 0.15 * v_span))
+
         ax2.set_xlabel("time since reference event (ms)")
         ax2.set_ylabel("V (mV)")
         ax2.set_title("most phase-sensitive trial: perturbed vs. unperturbed", fontsize=9)
         ax2.legend(loc="best", fontsize=6.5)
 
-    fig.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
-    fig.text(0.5, 0.045,
-             f"pulse: {result['pulse_amplitude_nA']:.2f} nA x {result['pulse_duration_ms']:.2f} ms "
-             f"({result['pulse_duration_frac_of_period'] * 100:.1f}% of T={result['natural_period_ms']:.2f} ms); "
-             f"F-I cross-check: slope={result['fi_slope_hz_per_nA']}, R²={result['fi_slope_r2']} "
-             "(no onset-shape class available -- see fi_cross_check_note)",
-             ha="center", va="bottom", fontsize=6, style="italic", color="dimgray", wrap=True)
-    fig.text(0.5, 0.01, command, ha="center", va="bottom", fontsize=6, family="monospace",
+    if result.get("pulse_amplitude_source") == "frac_of_floor" and result.get("cell_floor_nA"):
+        pulse_source_note = f"{result['pulse_amplitude_nA'] / result['cell_floor_nA'] * 100:.0f}% of cell_floor_nA={result['cell_floor_nA']:.2f} nA"
+    else:
+        pulse_source_note = "fixed nA"
+    fi_slope_str = f"{result['fi_slope_hz_per_nA']:.3f}" if result["fi_slope_hz_per_nA"] is not None else "None"
+    fi_r2_str = f"{result['fi_slope_r2']:.3f}" if result["fi_slope_r2"] is not None else "None"
+    # explicit "\n" line breaks, not wrap=True -- letting matplotlib's own
+    # wrap algorithm choose break points on two fig.text calls placed close
+    # together was landing lines on top of each other for cells whose
+    # numbers made either line longer than usual (e.g. large cell_floor_nA).
+    info_text = (
+        f"pulse: {result['pulse_amplitude_nA']:.2f} nA ({pulse_source_note}) x "
+        f"{result['pulse_duration_ms']:.2f} ms "
+        f"({result['pulse_duration_frac_of_period'] * 100:.1f}% of T={result['natural_period_ms']:.2f} ms)\n"
+        f"F-I cross-check: slope={fi_slope_str}, R²={fi_r2_str} "
+        "(no onset-shape class available -- see fi_cross_check_note)"
+    )
+    fig.tight_layout(rect=(0.0, 0.14, 1.0, 1.0))
+    fig.text(0.5, 0.045, info_text, ha="center", va="bottom", fontsize=6.5, style="italic", color="dimgray")
+    fig.text(0.5, 0.005, command, ha="center", va="bottom", fontsize=6, family="monospace",
              color="dimgray", wrap=True)
     outpath = outdir / f"{cell_id}_prc.{fig_format}"
     fig.savefig(outpath, format=fig_format, dpi=150)
@@ -588,7 +632,21 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--pulse-amplitude-nA", type=float, default=-1.0,
                         help="Constant current during the pulse (nA). Negative (hyperpolarizing) "
-                             "by default -- see module docstring for why.")
+                             "by default -- see module docstring for why. Used directly unless "
+                             "--pulse-amplitude-frac-of-floor is set, in which case it's only the "
+                             "fallback for cells with no grid_features_cache entry.")
+    parser.add_argument("--pulse-amplitude-frac-of-floor", type=float, default=None,
+                        help="If set, overrides --pulse-amplitude-nA PER CELL as this fraction of "
+                             "the cell's own cell_floor_nA (from --grid-features-cache, same "
+                             "silencing-threshold-anchored quantity run_held_injected_grid.py scales "
+                             "its grid with) -- e.g. 0.5 = 50%% of this cell's own silencing "
+                             "threshold, negative*positive=negative so the pulse stays hyperpolarizing. "
+                             "A fixed absolute nA (the old default) is an arbitrary fraction of each "
+                             "cell's dynamic range -- as small as 5%% of floor for the deepest-floor "
+                             "cells, over 100%% of floor for the shallowest (see project memory/"
+                             "2026-08-11 investigation) -- this makes the pulse size comparable "
+                             "across cells instead. Falls back to --pulse-amplitude-nA for any cell "
+                             "missing a grid_features_cache entry.")
     parser.add_argument("--pulse-duration-frac-of-period", type=float, default=0.05,
                         help="Pulse duration as a fraction of the cell's own measured natural "
                              "period, so the pulse stays 'brief' relative to each cell's own "

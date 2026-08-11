@@ -56,7 +56,8 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from singlecell_model_v1 import simulate
 from steady_state_cache import PARAMS_DIR as DEFAULT_PARAMS_DIR
 from steady_state_cache import CACHE_PATH as DEFAULT_STEADY_STATE_CACHE_PATH, get_cached_state
-from run_prc_protocol import characterize_baseline, pick_reference_anchor, detect_spike_times_ms
+from run_prc_protocol import (characterize_baseline, pick_reference_anchor, detect_spike_times_ms,
+                              DEFAULT_GRID_FEATURES_CACHE_PATH, load_grid_features_cache)
 from predict_entrainment import DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_PREDICTION_CACHE_PATH
 
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_entrainment_validation.pkl"
@@ -150,9 +151,18 @@ def classify_observed_lock(response_phases: np.ndarray, tolerance: float = LOCK_
 # Top-level per-cell orchestrator
 # ---------------------------------------------------------------------------
 
-def run_cell_entrainment(cell_id: str, params: np.ndarray, ss_entry, args) -> tuple:
+def run_cell_entrainment(cell_id: str, params: np.ndarray, ss_entry, fi_features_entry, args) -> tuple:
+    cell_floor_nA = fi_features_entry.get("cell_floor_nA") if fi_features_entry else None
+    if args.pulse_amplitude_frac_of_floor is not None and cell_floor_nA is not None:
+        pulse_amplitude_nA = args.pulse_amplitude_frac_of_floor * cell_floor_nA
+        pulse_amplitude_source = "frac_of_floor"
+    else:
+        pulse_amplitude_nA = args.pulse_amplitude_nA
+        pulse_amplitude_source = "fixed_nA"
+
     base = {"cell_id": cell_id, "dt": args.dt, "temp": args.temp, "reftemp": args.reftemp,
-           "pulse_amplitude_nA": args.pulse_amplitude_nA,
+           "pulse_amplitude_nA": pulse_amplitude_nA, "pulse_amplitude_source": pulse_amplitude_source,
+           "cell_floor_nA": cell_floor_nA,
            "pulse_duration_frac_of_period": args.pulse_duration_frac_of_period,
            "n_cycles": args.n_cycles, "n_transient_cycles": args.n_transient_cycles}
 
@@ -175,7 +185,7 @@ def run_cell_entrainment(cell_id: str, params: np.ndarray, ss_entry, args) -> tu
     burst_isi_threshold_ms = baseline["burst_isi_threshold_ms"]
     pulse_duration_ms = args.pulse_duration_ms_fixed or (args.pulse_duration_frac_of_period * period_ms)
 
-    Iapp_func = make_periodic_pulse_iapp_func(period_ms, pulse_duration_ms, args.pulse_amplitude_nA)
+    Iapp_func = make_periodic_pulse_iapp_func(period_ms, pulse_duration_ms, pulse_amplitude_nA)
     horizon_s = args.n_cycles * period_ms / 1000.0
     try:
         t_ms, states = simulate(params, horizon_s, args.temp, dt=args.dt, reftemp=args.reftemp,
@@ -264,6 +274,19 @@ def plot_cell_entrainment(result: dict, trace, prediction: dict, outdir: Path, c
     cycles = np.arange(result["n_cycles"])
     ax.plot(cycles, result["response_phases"], "o-", color="steelblue", ms=4, lw=1)
     ax.axvspan(-0.5, result["n_transient_cycles"] - 0.5, color="gray", alpha=0.15, label="transient (excluded)")
+
+    # observed_phase_spread trace annotation: shade [min, max] of the same
+    # post-transient response phases classify_observed_lock computed the
+    # spread from, so the printed number is directly traceable to the
+    # scatter it summarizes rather than only asserted in a cache field.
+    spread = result.get("observed_phase_spread")
+    if spread is not None:
+        analyzed = result["response_phases"][result["n_transient_cycles"]:]
+        valid = analyzed[~np.isnan(analyzed)]
+        lo, hi = float(valid.min()), float(valid.max())
+        ax.axhspan(lo, hi, color="mediumpurple", alpha=0.15,
+                  label=f"post-transient spread = {spread:.3f}")
+
     if result["observed_lock"]:
         ax.axhline(result["observed_locked_phase"], color="mediumseagreen", ls="--", lw=1,
                   label=f"observed lock @ φ={result['observed_locked_phase']:.3f}")
@@ -290,7 +313,14 @@ def plot_cell_entrainment(result: dict, trace, prediction: dict, outdir: Path, c
         ax2.set_ylabel("V (mV)")
         ax2.set_title(f"first {show_n} forcing cycles (shaded = pulse)", fontsize=9)
 
-    fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
+    if result.get("pulse_amplitude_source") == "frac_of_floor" and result.get("cell_floor_nA"):
+        pulse_source_note = f"{result['pulse_amplitude_nA'] / result['cell_floor_nA'] * 100:.0f}% of cell_floor_nA={result['cell_floor_nA']:.2f} nA"
+    else:
+        pulse_source_note = "fixed nA"
+    fig.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
+    fig.text(0.5, 0.045, f"pulse: {result['pulse_amplitude_nA']:.2f} nA ({pulse_source_note}) x "
+             f"{result['pulse_duration_ms']:.2f} ms/cycle, period={result['natural_period_ms']:.2f} ms",
+             ha="center", va="bottom", fontsize=6, style="italic", color="dimgray", wrap=True)
     fig.text(0.5, 0.01, command, ha="center", va="bottom", fontsize=6, family="monospace",
              color="dimgray", wrap=True)
     fig.savefig(outdir / f"{cell_id}_entrainment.{fig_format}", format=fig_format, dpi=150)
@@ -311,6 +341,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prediction-cache", default=DEFAULT_PREDICTION_CACHE_PATH,
                         help="Step 6a's predictions (read-only, used only to overlay the predicted "
                              "phase on each figure and in the comparison summary).")
+    parser.add_argument("--grid-features-cache", default=DEFAULT_GRID_FEATURES_CACHE_PATH,
+                        help="Read-only source of each cell's cell_floor_nA, only consulted when "
+                             "--pulse-amplitude-frac-of-floor is set.")
     parser.add_argument("--output-cache", default=DEFAULT_OUTPUT_CACHE_PATH)
     parser.add_argument("--figures-dir", default=DEFAULT_FIGURES_DIR)
     parser.add_argument("--figure-format", default=DEFAULT_FIGURE_FORMAT, choices=["svg", "png", "pdf"])
@@ -322,7 +355,15 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--pulse-amplitude-nA", type=float, default=-1.0,
                         help="Same default as run_prc_protocol.py -- see module docstring for why "
-                             "this script deliberately matches that convention.")
+                             "this script deliberately matches that convention. Used directly unless "
+                             "--pulse-amplitude-frac-of-floor is set, in which case it's only the "
+                             "fallback for cells with no grid_features_cache entry.")
+    parser.add_argument("--pulse-amplitude-frac-of-floor", type=float, default=None,
+                        help="Same option/reasoning as run_prc_protocol.py's flag of the same name -- "
+                             "see there for why a fixed absolute nA pulse is an arbitrary fraction of "
+                             "different cells' own dynamic range (5%%-400%%+ of cell_floor_nA across "
+                             "the population). Falls back to --pulse-amplitude-nA for any cell "
+                             "missing a grid_features_cache entry.")
     parser.add_argument("--pulse-duration-frac-of-period", type=float, default=0.05)
     parser.add_argument("--pulse-duration-ms-fixed", type=float, default=None)
     parser.add_argument("--n-cycles", type=int, default=20,
@@ -364,11 +405,13 @@ def main() -> None:
     print(f"Running entrainment validation for {len(cells)} cell(s): {sorted(cells)}")
 
     prediction_cache = load_prediction_cache(Path(args.prediction_cache))
+    grid_features_cache = load_grid_features_cache(Path(args.grid_features_cache))
     output_cache = load_output_cache(Path(args.output_cache))
 
     def process(cell_id: str, params: np.ndarray):
         ss_entry = get_cached_state(cell_id, params, cache_path=Path(args.steady_state_cache))
-        result, trace = run_cell_entrainment(cell_id, params, ss_entry, args)
+        fi_features_entry = grid_features_cache.get(cell_id)
+        result, trace = run_cell_entrainment(cell_id, params, ss_entry, fi_features_entry, args)
         return cell_id, result, trace
 
     if args.jobs == 1:
