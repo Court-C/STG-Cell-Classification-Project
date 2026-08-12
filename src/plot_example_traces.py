@@ -119,7 +119,7 @@ def select_exemplar_points(grid: dict, require_held_lt_injected: bool = True) ->
             pool = filtered if filtered else pts
         else:
             pool = pts
-        pts_sorted = sorted(pool, key=lambda kp: (-_prominence_score(kp[1]), kp[1]["source"] != "coarse", kp[0]))
+        pts_sorted = sorted(pool, key=lambda kp: (-_prominence_score(kp[1]), kp[0]))
         selected[combo] = pts_sorted[0]
     return selected
 

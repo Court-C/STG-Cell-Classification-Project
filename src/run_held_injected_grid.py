@@ -35,18 +35,21 @@ further than held by default -- so the test window can probe past the
 deepest level held itself ever reaches; held stays the "lowest hold
 current" reference point unchanged.
 
-Sweep strategy is coarse-to-fine: a coarse NxM grid is swept first, then
-edges where classification changes between neighbors (rebound-onset or
-burst-onset boundaries) are recursively bisected and independently
-re-simulated -- never interpolated -- since find_silencing_threshold.py
-found this model shows path-dependent (hysteretic) settling near dynamical
-transitions, so a coarse call about a boundary is not trustworthy at fine
-resolution without re-confirmation.
+Sweep strategy (2026-08-11): a simple uniform NxM grid -- args.n_points_held
+x args.n_points_injected evenly-spaced levels from 0 to each axis's own
+floor, the SAME point count for every cell regardless of floor depth.
+Replaces an earlier two-stage coarse-grid-then-boundary-driven-adaptive-
+refinement design (fixed-nA-step coarse grid, edges where classification
+changed between neighbors recursively bisected and re-simulated) that
+produced wildly uneven per-cell point counts -- deliberately dropped in
+favor of standardizing simulation count across the population, at the cost
+of no longer concentrating extra samples right at classification
+boundaries.
 
-This script covers 2a (coarse grid) and 2b (adaptive refinement) only.
-Feature extraction (2c: Rin/tau, spike waveform, F-I slope, ISI stats,
-burst stats, cross-cell PCA, etc.) is a separate future script that reads
-this script's output cache.
+This script covers Step 2 (the grid sweep) only. Feature extraction (2c:
+Rin/tau, spike waveform, F-I slope, ISI stats, burst stats, cross-cell PCA,
+etc.) lives in extract_grid_features.py, which reads this script's output
+cache.
 """
 
 import os
@@ -63,8 +66,6 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 import numpy as np
 from joblib import Parallel, delayed
 from scipy.signal import find_peaks
-from scipy.interpolate import griddata
-from scipy.spatial import QhullError
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
@@ -82,7 +83,11 @@ from find_silencing_threshold import (constant_iapp_func, count_spikes_and_rate,
                                       DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_SILENCING_CACHE_PATH)
 
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_held_injected_grid.pkl"
-DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "held_injected_grid"
+# This script no longer renders a figure itself (2026-08-11 merge) -- the
+# merged panel figure needs both this cache's grid AND extract_grid_
+# features.py's features dict, so it's built and called from there. Kept
+# here (not moved) since plot_cell_grid_features itself still lives in
+# this module, alongside _fine_grid_coords/_render_heatmap.
 DEFAULT_FIGURE_FORMAT = "svg"
 # temp == reftemp: at dtemp=0, every q10^(dtemp/10) factor in
 # singlecell_model_v1.py's _derivatives_core collapses to 1 regardless of a
@@ -135,16 +140,48 @@ def settle_hold_level(params, held_nA, warm_start_state, dt, temp, reftemp,
     if r["blew_up"]:
         return r
     r["hold_v_end_mV"] = float(r["last_chunk_v"][-1]) if r["last_chunk_v"] is not None else float("nan")
+    # Trough of the held level's OWN last settle chunk -- for a flatline hold
+    # this equals hold_v_end_mV (a constant trace's min is its endpoint), but
+    # for a hold that's itself tonically/burst firing at rest (e.g. XB2IQX at
+    # held=-3nA, 19.5Hz), hold_v_end_mV is just whatever single sample the
+    # chunked settle loop happened to stop on -- effectively a random phase
+    # of the oscillation (confirmed: -39.8mV, mid-cycle, for a trace that
+    # spans spike peak down to ~-70mV AHP). That single sample is not a valid
+    # "resting baseline" a sag depth can be measured against, which is why
+    # compute_sag_depth_map used to gate on hold_is_flatline and simply skip
+    # every oscillating-hold point -- silently, not as a real 0. Using the
+    # already-fully-simulated last_chunk_v's own minimum instead gives a
+    # well-defined, reproducible reference (how far the cell already dips on
+    # its own) that sag can be measured beyond, with no extra simulation and
+    # no is_flatline branching needed downstream.
+    r["hold_v_trough_mV"] = float(np.min(r["last_chunk_v"])) if r["last_chunk_v"] is not None else float("nan")
     return r
 
 
-def compute_pre_spike_sag_trough(v_test, t_test, sag_window_ms: float):
+def compute_pre_spike_sag_trough(v_test, t_test, sag_window_ms: float,
+                                 spike_dead_zone_ms: float = 5.0):
     """Minimum voltage from test-window onset up to whichever comes first:
     sag_window_ms elapsed, or the first spike. Isolates the passive,
     Ih-relaxation-style sag trough from post-spike AHP troughs, so it stays
     meaningful even for a test window that goes on to fire tonically or
     burst -- sag is a subthreshold phenomenon that precedes the first spike,
     not something restricted to windows that stay silent throughout.
+
+    spike_dead_zone_ms excludes any "spike" within this many ms of test
+    onset from counting as the first spike, mirroring the exact same
+    already-in-flight-at-release guard run_test_and_recovery's recovery-
+    window rebound detection uses (rebound_latency_min_ms). Needed because
+    the test window continues directly from the held level's own final
+    state -- if the held level fires spontaneously (common: e.g. XB2IQX
+    fires even at held=0), that state can land mid-upstroke of a spike
+    already committed before the injected step ever took effect. Without
+    this guard, that leftover spike fires ~1ms into the test window
+    regardless of injected depth, truncating the sag window down to ~1ms
+    and understating (or corrupting) the sag reading -- confirmed directly:
+    22/120 points on a real XB2IQX 0.5nA-resolution grid showed a
+    first_spike_ms under 5ms, concentrated at held=0 and weak injected
+    steps, each reporting the exact same ~1ms first-spike time regardless
+    of how deep injected was.
 
     Deliberately does NOT also try to report a "recovered/relaxed" reference
     voltage at the window boundary (which would let a full trough-relative-
@@ -167,7 +204,10 @@ def compute_pre_spike_sag_trough(v_test, t_test, sag_window_ms: float):
     if v_range >= FLATLINE_MV:
         peaks, _ = find_peaks(v_test, prominence=v_range * PROMINENCE_FRACTION)
         if len(peaks) > 0:
-            first_spike_ms = float(t_test[peaks[0]])
+            peak_times_ms = t_test[peaks]
+            qualifying = peak_times_ms[peak_times_ms >= spike_dead_zone_ms]
+            if len(qualifying) > 0:
+                first_spike_ms = float(qualifying[0])
     window_end_ms = min(sag_window_ms, first_spike_ms) if first_spike_ms is not None else sag_window_ms
     mask = t_test <= window_end_ms
     if not np.any(mask):
@@ -201,10 +241,53 @@ def compute_adaptation_ratio(isis_ms: np.ndarray, edge_n: int):
     return float(np.mean(isis_ms[-edge_n:])) / float(np.mean(isis_ms[:edge_n]))
 
 
+def detect_onset_burst(isis_ms: np.ndarray, min_isi_ratio: float, min_onset_isis: int = 2):
+    """A leading run of consecutive short ISIs at the very START of the test
+    window, immediately followed by a jump of at least min_isi_ratio to the
+    next ISI. This is classify_burst_pattern's own short/long timescale
+    separation (same min_isi_ratio, same "meaningfully different timescale,
+    not just noise" reasoning), applied locally to the first few ISIs
+    instead of globally via KDE across the whole train -- so it can catch a
+    genuine onset burst even in a window whose whole-window classification
+    comes back "tonic" because what follows the burst isn't a second clean
+    KDE mode.
+
+    Confirmed case this exists for: XB2IQX held=-2.48/inj=-4.04, ISIs
+    13.1, 13.5, 16.8 | 41.0, 60.0, 30.0, 61.0, 42.2, 72.2, 53.7, 111.7 (ms).
+    The whole-window KDE test calls this "tonic" (bimodality_metric=0.0) --
+    the post-burst ISIs span 30-112ms, too wide/noisy to form their own
+    tight KDE peak -- so classify_burst_pattern never sees the burst at
+    all, and test_n_bursts/test_spikes_per_burst are never computed for a
+    window that plainly opens with one. Scanning locally for the first big
+    jump sidesteps needing the tail to look like anything in particular.
+
+    min_onset_isis=2 (i.e. >=3 spikes) mirrors classify_burst_pattern's own
+    min_spikes_per_burst=1.5 in spirit: a single short ISI followed by a
+    jump is indistinguishable from ordinary tonic jitter, but two
+    consecutive short ISIs both followed by the same jump is a real
+    burst-shaped feature.
+
+    Returns (onset_n_spikes, onset_isi_mean_ms), or (None, None) if no
+    qualifying leading run is found (including: the whole train is one
+    consistent cluster, with no jump at all -- already handled by the
+    whole-window classifier in that case, nothing extra to report here).
+    """
+    n = len(isis_ms)
+    if n < min_onset_isis + 1:
+        return None, None
+    for j in range(min_onset_isis, n):
+        if isis_ms[j] / isis_ms[j - 1] >= min_isi_ratio:
+            onset_isis = isis_ms[:j]
+            return int(j + 1), float(np.mean(onset_isis))
+    return None, None
+
+
 def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz, dt, temp, reftemp,
                           test_window_s, recovery_window_s, rebound_latency_min_ms,
                           min_isis_for_burst_test, isi_mode_prominence_frac, min_isi_ratio,
-                          sag_window_ms: float = 500.0, adaptation_edge_n: int = 3,
+                          sag_window_ms: float = 500.0, sag_dead_zone_ms: float = 5.0,
+                          adaptation_edge_n: int = 3, min_onset_isis: int = 2,
+                          trailing_silence_ratio: float = 3.0,
                           max_test_window_s: float = None, test_window_extend_factor: float = 2.0,
                           return_traces: bool = False) -> dict:
     """Test window at the ABSOLUTE injected current level (held is not added
@@ -280,12 +363,53 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
     test_pattern = to_stored_pattern(test_pattern)
 
     test_v_min_pre_spike_mV, test_first_spike_ms = compute_pre_spike_sag_trough(
-        v_test, t_test, sag_window_ms)
+        v_test, t_test, sag_window_ms, spike_dead_zone_ms=sag_dead_zone_ms)
 
-    # Restricted to "tonic": a bursting train's first-k/last-k ISIs would mix
-    # intra-/inter-burst intervals (see compute_adaptation_ratio docstring).
+    # test_onset_n_spikes: a burst-shaped leading run at the very start of
+    # the window, detected locally (see detect_onset_burst) independent of
+    # test_pattern -- catches an onset burst that the whole-window KDE test
+    # misses when the rest of the train doesn't form its own clean second
+    # mode (e.g. a decaying, irregular trickle of single spikes rather than
+    # a repeating burst rhythm). Computed unconditionally: harmless/
+    # redundant when test_pattern == "bursting" already reports the same
+    # opening burst via test_n_bursts, useful specifically when it's
+    # "tonic" or "silent" and would otherwise be invisible.
+    test_onset_n_spikes, test_onset_isi_mean_ms = (
+        detect_onset_burst(isis_test, min_isi_ratio, min_onset_isis)
+        if isis_test is not None and len(isis_test) > 0 else (None, None))
+
+    # test_trailing_silence_ms: gap between the last detected spike and the
+    # end of the (possibly window-extended) test window -- invisible to any
+    # ISI-based statistic, since ISIs only exist between spikes. Needed to
+    # tell "still firing, window just cut off" apart from "genuinely
+    # stopped partway through" -- compute_adaptation_ratio's first-k/last-k
+    # ratio silently assumes the former. test_likely_ceased_firing flags the
+    # latter: trailing silence at least trailing_silence_ratio times the
+    # most recent ISI is no longer ordinary inter-spike jitter. Left None
+    # (rather than False) when there isn't at least one ISI to set a scale
+    # from, e.g. 0-1 total spikes -- "ceased" isn't a meaningful question
+    # for a window that barely started firing in the first place.
+    test_trailing_silence_ms = None
+    test_likely_ceased_firing = None
+    if test_n_spikes >= 1 and test_first_spike_ms is not None:
+        last_spike_ms = test_first_spike_ms + (float(np.sum(isis_test))
+                                                if isis_test is not None and len(isis_test) > 0 else 0.0)
+        test_trailing_silence_ms = window_s * 1000.0 - last_spike_ms
+        if isis_test is not None and len(isis_test) > 0:
+            test_likely_ceased_firing = bool(
+                test_trailing_silence_ms >= trailing_silence_ratio * isis_test[-1])
+
+    # Restricted to "tonic" AND not likely-ceased: a bursting train's
+    # first-k/last-k ISIs would mix intra-/inter-burst intervals (see
+    # compute_adaptation_ratio docstring), and a train that stops partway
+    # through the window isn't smoothly rate-adapting either -- a first-k/
+    # last-k ratio over a decaying-then-silent train (confirmed case:
+    # XB2IQX held=-2.48/inj=-4.04, ISIs 13-17ms onset then an irregular
+    # 30-112ms trickle that stops with ~2.3s of the 3s window left silent)
+    # reports a large, "clean-looking" number that isn't measuring the same
+    # thing it measures for a train that keeps firing steadily to the end.
     test_adaptation_ratio = (compute_adaptation_ratio(isis_test, adaptation_edge_n)
-                             if test_pattern == "tonic" else None)
+                             if test_pattern == "tonic" and not test_likely_ceased_firing else None)
     # n_bursts = n_long_isis + 1 (a "burst" is a maximal run of consecutive
     # short ISIs, so each inter-burst gap marks one more burst boundary);
     # spikes_per_burst is the average over the whole test window, not a
@@ -312,6 +436,9 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
         "test_first_spike_ms": test_first_spike_ms,
         "test_adaptation_ratio": test_adaptation_ratio,
         "test_n_bursts": test_n_bursts, "test_spikes_per_burst": test_spikes_per_burst,
+        "test_onset_n_spikes": test_onset_n_spikes, "test_onset_isi_mean_ms": test_onset_isi_mean_ms,
+        "test_trailing_silence_ms": test_trailing_silence_ms,
+        "test_likely_ceased_firing": test_likely_ceased_firing,
         "test_window_s_used": window_s,
     }
 
@@ -410,6 +537,8 @@ _TEST_RECOVERY_DEFAULTS = {
     "test_settled": None, "test_v_min_mV": float("nan"), "test_v_end_mV": float("nan"),
     "test_v_min_pre_spike_mV": float("nan"), "test_first_spike_ms": None,
     "test_adaptation_ratio": None, "test_n_bursts": None, "test_spikes_per_burst": None,
+    "test_onset_n_spikes": None, "test_onset_isi_mean_ms": None,
+    "test_trailing_silence_ms": None, "test_likely_ceased_firing": None,
     "test_window_s_used": float("nan"),
     "rebound_applicable": False,
     "rebound_occurred": False, "rebound_spike_count": 0, "rebound_latency_ms": None,
@@ -423,7 +552,7 @@ def make_blew_up_point(held_nA, injected_nA, source, error, hold_blew_up=False) 
     return {
         "held_nA": held_nA, "injected_nA": injected_nA, "source": source,
         "hold_settled": False, "hold_freq_hz": 0.0, "hold_is_flatline": False,
-        "hold_v_end_mV": float("nan"), "hold_blew_up": hold_blew_up,
+        "hold_v_end_mV": float("nan"), "hold_v_trough_mV": float("nan"), "hold_blew_up": hold_blew_up,
         **_TEST_RECOVERY_DEFAULTS,
         "blew_up": True, "error": error,
     }
@@ -443,6 +572,7 @@ def run_trial_point(params, hold_result, held_nA, injected_nA, dt, temp, reftemp
         "held_nA": held_nA, "injected_nA": injected_nA, "source": source,
         "hold_settled": hold_result["settled"], "hold_freq_hz": hold_result["freq_hz"] or 0.0,
         "hold_is_flatline": hold_result["is_flatline"], "hold_v_end_mV": hold_result["hold_v_end_mV"],
+        "hold_v_trough_mV": hold_result["hold_v_trough_mV"],
         "hold_blew_up": False,
         **_TEST_RECOVERY_DEFAULTS,
     }
@@ -451,19 +581,27 @@ def run_trial_point(params, hold_result, held_nA, injected_nA, dt, temp, reftemp
 
 
 def get_or_settle_hold(params, held_nA, hold_settle_cache, y_ss, baseline_freq_hz,
-                       dt, temp, reftemp, settle_kwargs) -> dict:
+                       dt, temp, reftemp, settle_kwargs, y_ss_trough_mV=None) -> dict:
     """Settle at held_nA, reusing a cached settle if this exact (rounded)
     held level has already been solved, else warm-starting from whichever
     already-settled held level is numerically nearest. held=0 is free --
     reuses the cell's own cached Iapp=0 limit-cycle state.
+
+    y_ss_trough_mV (min V over the cached Iapp=0 burn-in trace, see
+    run_cell_grid) plays the same role for held=0 as hold_v_trough_mV plays
+    for every other held level -- held=0.0 also fires spontaneously for many
+    cells (XB2IQX included), so it has the identical single-sample-baseline
+    problem settle_hold_level's hold_v_trough_mV addition fixes. Falls back
+    to the single y_ss sample only if no burn-in trace was cached.
     """
     key = _round_level(held_nA)
     if key in hold_settle_cache:
         return hold_settle_cache[key]
     if key == 0.0:
+        trough = y_ss_trough_mV if y_ss_trough_mV is not None else float(y_ss[V_INDEX])
         result = {"blew_up": False, "settled": True, "freq_hz": baseline_freq_hz,
                   "is_flatline": False, "final_state": y_ss.copy(),
-                  "hold_v_end_mV": float(y_ss[V_INDEX])}
+                  "hold_v_end_mV": float(y_ss[V_INDEX]), "hold_v_trough_mV": trough}
         hold_settle_cache[key] = result
         return result
     # Only warm-start from a PREVIOUSLY SUCCESSFUL settle -- a blown-up cache
@@ -482,77 +620,26 @@ def get_or_settle_hold(params, held_nA, hold_settle_cache, y_ss, baseline_freq_h
 
 
 # ---------------------------------------------------------------------------
-# 2a: coarse grid
+# 2a: uniform grid
 # ---------------------------------------------------------------------------
+#
+# Replaces a previous two-stage design (fixed-step coarse grid + boundary-
+# driven adaptive bisection refinement) with a single, simple, non-adaptive
+# division of each axis into a fixed point count -- per explicit request
+# (2026-08-11) to standardize simulation count across all 69 cells rather
+# than let it vary with each cell's own floor depth (the old design ranged
+# 7-42 coarse levels/axis depending on floor depth, and refinement itself
+# had NO point-count budget at all, only an absolute nA edge-length floor
+# and a recursion-depth cap, so total simulated points per cell varied even
+# more than the coarse stage alone did). Every cell now gets exactly
+# args.n_points_held x args.n_points_injected simulated points, full stop
+# -- deeper-floor cells are sampled at coarser absolute nA spacing, not
+# simulated more or fewer times.
 
-SHALLOW_FLOOR_THRESHOLD_NA = 3.0
-SHALLOW_FLOOR_STEP_NA = 0.25
-
-
-def _adaptive_step(default_step_nA: float, floor_nA: float, min_points: int) -> float:
-    """Shrinks the coarse-grid step for a shallow-floor cell so it still
-    gets a reasonable number of levels on this axis, without ever
-    coarsening a cell that already clears that bar at the default step.
-    Confirmed directly this matters: at the 0.5nA default, a cell with
-    floor=-3nA (e.g. 4QSWXH) gets only 7 held levels, while a cell with
-    floor=-17nA (e.g. VC08B6) gets 36 -- a >5x density gap driven purely by
-    how deep each cell's own floor happens to be, not by anything about the
-    sweep itself.
-
-    Two regimes:
-    - |floor_nA| < SHALLOW_FLOOR_THRESHOLD_NA (3.0): flat SHALLOW_FLOOR_
-      STEP_NA (0.25) -- a simple, round, predictable step for genuinely
-      narrow-range cells, rather than the min-points formula's non-round
-      value (e.g. 0.179nA for floor=-2.5), which made grid values harder to
-      compare across shallow cells. Low added compute cost either way since
-      the range itself is small.
-    - |floor_nA| >= SHALLOW_FLOOR_THRESHOLD_NA: original min-points-based
-      shrinking, unchanged. _build_levels produces roughly |floor_nA| /
-      step + 1 levels (0 plus however many steps reach the floor, floor
-      itself always included), so solving for the step that yields exactly
-      min_points gives |floor_nA| / (min_points - 1); taking the min with
-      default_step_nA means this can only ever shrink the step, never grow
-      it past the default.
-    """
-    if floor_nA == 0:
-        return default_step_nA
-    if abs(floor_nA) < SHALLOW_FLOOR_THRESHOLD_NA:
-        return min(default_step_nA, SHALLOW_FLOOR_STEP_NA)
-    if min_points < 2:
-        return default_step_nA
-    guaranteed_step = abs(floor_nA) / (min_points - 1)
-    return min(default_step_nA, guaranteed_step)
-
-
-def _build_levels(step_nA: float, cell_floor_nA: float) -> list:
-    """Steps down from 0 by a FIXED step size (matching Step 1's own
-    coarse_step_nA convention) until reaching cell_floor_nA, rather than
-    dividing this cell's own (non-round, cell-specific) floor into a fixed
-    number of points. The latter was the original design and produced
-    non-round, cell-specific step sizes (e.g. 0.68 nA for one cell, 3.2 nA
-    for another) that made grid values look arbitrary and hard to compare
-    across cells -- fixed step size gives round, physically interpretable
-    values (0, -0.5, -1.0, ...) at the cost of point count varying by each
-    cell's own range instead of being forced to a constant count.
-    cell_floor_nA is always included as the final point even if it isn't an
-    exact multiple of step_nA, so the swept range still reaches exactly as
-    far as Step 1's threshold anchoring intended.
-    """
-    levels = [0.0]
-    level = _round_level(-step_nA)
-    while level > cell_floor_nA:
-        levels.append(level)
-        level = _round_level(level - step_nA)
-    if levels[-1] != _round_level(cell_floor_nA):
-        levels.append(_round_level(cell_floor_nA))
-    return levels
-
-
-def build_coarse_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_floor_nA, args):
-    held_step = _adaptive_step(args.coarse_step_held_nA, cell_floor_nA, args.min_coarse_points)
-    injected_step = _adaptive_step(args.coarse_step_injected_nA, injected_floor_nA, args.min_coarse_points)
-    held_levels = _build_levels(held_step, cell_floor_nA)
-    injected_levels = _build_levels(injected_step, injected_floor_nA)
+def build_uniform_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_floor_nA, args,
+                       y_ss_trough_mV=None):
+    held_levels = [_round_level(v) for v in np.linspace(0.0, cell_floor_nA, args.n_points_held)]
+    injected_levels = [_round_level(v) for v in np.linspace(0.0, injected_floor_nA, args.n_points_injected)]
 
     settle_kwargs = dict(chunk_s=args.hold_settle_chunk_s, max_settle_s=args.max_hold_settle_s,
                          settle_rtol=args.hold_settle_rtol, min_peaks_for_rate=args.min_peaks_for_rate)
@@ -560,7 +647,10 @@ def build_coarse_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_fl
                       isi_mode_prominence_frac=args.isi_mode_prominence_frac,
                       min_isi_ratio=args.min_isi_ratio,
                       sag_window_ms=args.sag_window_ms,
+                      sag_dead_zone_ms=args.sag_dead_zone_ms,
                       adaptation_edge_n=args.adaptation_edge_n,
+                      min_onset_isis=args.min_onset_isis,
+                      trailing_silence_ratio=args.trailing_silence_ratio,
                       max_test_window_s=args.max_test_window_s,
                       test_window_extend_factor=args.test_window_extend_factor)
 
@@ -574,114 +664,15 @@ def build_coarse_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_fl
     hold_settle_cache = {}
     for held in held_levels:
         hold_result = get_or_settle_hold(params, held, hold_settle_cache, y_ss, baseline_freq_hz,
-                                         args.dt, args.temp, args.reftemp, settle_kwargs)
+                                         args.dt, args.temp, args.reftemp, settle_kwargs,
+                                         y_ss_trough_mV=y_ss_trough_mV)
         for injected in injected_levels:
             point = run_trial_point(params, hold_result, held, injected, args.dt, args.temp, args.reftemp,
                                     test_window_s, recovery_window_s, args.rebound_latency_min_ms,
-                                    isi_kwargs, source="coarse")
+                                    isi_kwargs, source="uniform")
             grid[(held, injected)] = point
 
     return grid, hold_settle_cache, held_levels, injected_levels, test_window_s, recovery_window_s
-
-
-# ---------------------------------------------------------------------------
-# 2b: adaptive refinement (edge bisection)
-# ---------------------------------------------------------------------------
-
-def build_edge_list(held_levels, injected_levels):
-    edges = []
-    for held in held_levels:
-        for j in range(len(injected_levels) - 1):
-            edges.append(((held, injected_levels[j]), (held, injected_levels[j + 1])))
-    for injected in injected_levels:
-        for i in range(len(held_levels) - 1):
-            edges.append(((held_levels[i], injected), (held_levels[i + 1], injected)))
-    return edges
-
-
-def _point_status(point) -> str:
-    # test_pattern is only ever None (blew_up), "silent", "tonic", or
-    # "bursting" now -- to_stored_pattern (see find_silencing_threshold.py)
-    # already resolved "insufficient_data"/"sparse" into "silent" before a
-    # point ever reaches here, after run_test_and_recovery's own window-
-    # extension retry already gave it every chance to resolve into a real
-    # tonic/bursting call. So every non-blew_up point is "confident" now --
-    # there's no longer a separate "we genuinely don't know" bucket to
-    # distinguish (see edge_is_boundary for why that distinction used to
-    # matter for refinement cost).
-    return "blew_up" if point["blew_up"] else "confident"
-
-
-def edge_is_boundary(grid, edge) -> bool:
-    """An edge is worth bisecting only when BOTH endpoints are confidently
-    classified and they disagree. Only "blew_up" points are excluded from
-    "confident" now (see _point_status) -- a "silent" label already means
-    the point was given every chance to resolve into tonic/bursting via
-    run_test_and_recovery's window-extension retry, so a "silent"-vs-
-    "bursting" (or "silent"-vs-"tonic"/rebound-differs) edge is a genuine
-    boundary worth resolving, not the kind of unresolvable ambiguity earlier
-    code had to specifically guard against (an earlier version of this
-    function treated "insufficient_data"/"sparse" points as automatically
-    non-confident, since bisecting them couldn't help -- with those labels
-    gone, that guard is no longer needed).
-    """
-    a, b = grid[edge[0]], grid[edge[1]]
-    if _point_status(a) != "confident" or _point_status(b) != "confident":
-        return False
-    rebound_differs = a["rebound_occurred"] != b["rebound_occurred"]
-    burst_boundary = ("bursting" in (a["test_pattern"], b["test_pattern"])
-                      and a["test_pattern"] != b["test_pattern"])
-    return rebound_differs or burst_boundary
-
-
-def refine_grid(params, grid, hold_settle_cache, y_ss, baseline_freq_hz, held_levels, injected_levels,
-                test_window_s, recovery_window_s, args):
-    settle_kwargs = dict(chunk_s=args.hold_settle_chunk_s, max_settle_s=args.max_hold_settle_s,
-                         settle_rtol=args.hold_settle_rtol, min_peaks_for_rate=args.min_peaks_for_rate)
-    isi_kwargs = dict(min_isis_for_burst_test=args.min_isis_for_burst_test,
-                      isi_mode_prominence_frac=args.isi_mode_prominence_frac,
-                      min_isi_ratio=args.min_isi_ratio,
-                      sag_window_ms=args.sag_window_ms,
-                      adaptation_edge_n=args.adaptation_edge_n,
-                      max_test_window_s=args.max_test_window_s,
-                      test_window_extend_factor=args.test_window_extend_factor)
-
-    depth = 0
-    edges = build_edge_list(held_levels, injected_levels)
-    refinement_truncated = False
-    max_depth_reached = 0
-
-    while depth < args.max_refine_depth:
-        boundary_edges = [e for e in edges if edge_is_boundary(grid, e)]
-        if not boundary_edges:
-            break
-        if len(boundary_edges) > args.max_boundary_edges_per_depth:
-            refinement_truncated = True
-            break
-
-        next_edges = []
-        for (p1, p2) in boundary_edges:
-            held1, inj1 = p1
-            held2, inj2 = p2
-            edge_len = max(abs(held1 - held2), abs(inj1 - inj2))
-            if edge_len < args.min_edge_nA:
-                continue
-            mid = _round_point(((held1 + held2) / 2.0, (inj1 + inj2) / 2.0))
-            if mid not in grid:
-                mid_held, mid_injected = mid
-                hold_result = get_or_settle_hold(params, mid_held, hold_settle_cache, y_ss, baseline_freq_hz,
-                                                 args.dt, args.temp, args.reftemp, settle_kwargs)
-                grid[mid] = run_trial_point(params, hold_result, mid_held, mid_injected,
-                                            args.dt, args.temp, args.reftemp,
-                                            test_window_s, recovery_window_s, args.rebound_latency_min_ms,
-                                            isi_kwargs, source=f"refine_depth_{depth + 1}")
-            next_edges.append((p1, mid))
-            next_edges.append((mid, p2))
-        edges = next_edges
-        depth += 1
-        max_depth_reached = depth
-
-    return grid, max_depth_reached, refinement_truncated
 
 
 # ---------------------------------------------------------------------------
@@ -707,19 +698,15 @@ def run_cell_grid(cell_id: str, params: np.ndarray, ss_entry, silencing_entry, a
 
     y_ss = ss_entry["y_ss"]
     baseline_freq_hz = ss_entry["freq_hz"]
+    burnin_v = ss_entry.get("burnin_v")
+    y_ss_trough_mV = float(np.min(burnin_v)) if burnin_v is not None else None
 
     try:
         grid, hold_settle_cache, held_levels, injected_levels, test_window_s, recovery_window_s = \
-            build_coarse_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_floor_nA, args)
-        grid, max_depth_reached, refinement_truncated = refine_grid(
-            params, grid, hold_settle_cache, y_ss, baseline_freq_hz, held_levels, injected_levels,
-            test_window_s, recovery_window_s, args)
+            build_uniform_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_floor_nA, args,
+                               y_ss_trough_mV=y_ss_trough_mV)
     except (FloatingPointError, OverflowError, ValueError) as exc:
         return {**base, "status": "blew_up", "error": str(exc)}
-
-    n_points_by_source: dict = {}
-    for point in grid.values():
-        n_points_by_source[point["source"]] = n_points_by_source.get(point["source"], 0) + 1
 
     hold_states = {lvl: r["final_state"] for lvl, r in hold_settle_cache.items() if not r["blew_up"]}
 
@@ -727,11 +714,10 @@ def run_cell_grid(cell_id: str, params: np.ndarray, ss_entry, silencing_entry, a
         **base, "status": "ok",
         "cell_floor_nA": cell_floor_nA, "injected_floor_nA": injected_floor_nA,
         "floor_anchor_source": floor_anchor_source,
-        "coarse_held_levels_nA": np.array(held_levels), "coarse_injected_levels_nA": np.array(injected_levels),
+        "held_levels_nA": np.array(held_levels), "injected_levels_nA": np.array(injected_levels),
         "test_window_s": test_window_s, "recovery_window_s": recovery_window_s,
         "grid": grid, "hold_states": hold_states,
-        "refine_max_depth_reached": max_depth_reached, "refinement_truncated": refinement_truncated,
-        "n_points_total": len(grid), "n_points_by_source": n_points_by_source,
+        "n_points_total": len(grid),
         "error": None,
     }
 
@@ -784,291 +770,181 @@ def save_output_cache(cache: dict, cache_path: Path = DEFAULT_OUTPUT_CACHE_PATH)
 # "silent" before it's ever stored, so there's no fourth/fifth category to
 # render here anymore.
 PATTERN_COLORS = {"silent": "gray", "tonic": "steelblue", "bursting": "mediumpurple"}
-# 150->200: more render pixels for the bilinear pixel-blending step (see
-# _render_heatmap) to work with, so tile-boundary gradients look smoother
-# without changing the underlying nearest-neighbor VALUE at any pixel --
-# purely a rendering-resolution bump, not a data-fabrication concern.
-HEATMAP_RESOLUTION = 200
+# Moved here from extract_grid_features.py (2026-08-11 figure merge) --
+# plot_cell_grid_features needs both this and PATTERN_COLORS, and the
+# established one-directional import convention (extract_grid_features.py
+# imports FROM this module, never the reverse) means any constant shared
+# by both panels has to live here.
+REBOUND_PATTERN_COLORS = {"none": "gray", "single_spike": "steelblue",
+                          "tonic_rebound": "seagreen", "bursting_rebound": "mediumpurple",
+                          "not_applicable": "lightgray"}
+NO_DATA_COLOR = (0.88, 0.88, 0.88, 1.0)  # light gray, distinct from every real category color
 
 
-def _fine_grid_coords(cell_floor_nA: float, injected_floor_nA: float, resolution: int = HEATMAP_RESOLUTION):
-    """Regular (held, injected) grid in nA, spanning [floor, 0] on each axis
-    at this cell's own resolution -- the render target every scattered
-    (adaptively-sampled) point below gets interpolated onto, so the figure
-    reads as a smooth heat map regardless of how sparse the underlying
-    simulated points actually are (a coarse 7x9 sweep still fills the whole
-    canvas; it just interpolates over more area per real data point).
+def _exact_grid_matrix(value_map: dict, held_levels, injected_levels) -> np.ndarray:
+    """Builds an exact (n_injected, n_held) matrix directly from a
+    {(held_nA, injected_nA): value} mapping and this cell's own uniform
+    grid axis levels (cell_result["held_levels_nA"]/["injected_levels_nA"])
+    -- NO interpolation, merging, or nearest-neighbor lookup of any kind
+    (2026-08-11/12, per explicit instruction: every rendered heat-map pixel
+    must show exactly what was simulated, never a value blended or
+    borrowed from a neighboring point).
+
+    Replaces the old griddata/_merge_close_points/_render_heatmap pipeline
+    entirely. That machinery existed to interpolate the OLD adaptively-
+    refined, irregularly-spaced grid onto a regular canvas for imshow; the
+    uniform grid (2026-08-11) already IS a regular canvas (every (held,
+    injected) combination on a fixed n_points_held x n_points_injected grid
+    was actually simulated), so no interpolation step is needed, and one
+    less step means one less place for rendering artifacts to creep in.
+
+    A coordinate missing from value_map (e.g. a feature only computed for
+    bursting points, or "rebound pattern" wherever rebound wasn't even
+    applicable) renders as NaN -- the honest "no data here", never a value
+    borrowed from a real but different point (which is what the old
+    nearest-neighbor-over-an-upsampled-canvas approach did silently: e.g.
+    the old "rebound pattern" panel would tile a NOT-applicable cell with
+    whichever real applicable neighbor happened to be nearest, misreporting
+    it as some real pattern rather than "not applicable").
     """
-    # Ascending order (floor -> 0), matplotlib's natural default -- panels
-    # call ax.invert_xaxis()/invert_yaxis() afterward (same as the previous
-    # scatter-based version) to display 0 at the left/bottom edge. Building
-    # this descending instead and skipping the invert calls would look
-    # identical for a single panel, but would silently double-flip if
-    # anything ever draws overlay artists (e.g. a marker at a specific
-    # (held, injected)) using the un-inverted axes convention.
-    held_coords = np.linspace(cell_floor_nA, 0, resolution)
-    injected_coords = np.linspace(injected_floor_nA, 0, resolution)
-    return np.meshgrid(held_coords, injected_coords)
+    matrix = np.full((len(injected_levels), len(held_levels)), np.nan)
+    for i, held in enumerate(held_levels):
+        for j, injected in enumerate(injected_levels):
+            v = value_map.get((held, injected))
+            if v is not None:
+                matrix[j, i] = v
+    return matrix
 
 
-def _merge_close_points(held, injected, values, tolerance_nA, is_categorical=False):
-    """Groups real points whose (held, injected) coordinates fall within
-    tolerance_nA of each other (snapped to a tolerance_nA grid) and averages
-    their values into one representative point per group -- mean for a
-    continuous quantity, mode (most common code) for a categorical one.
-
-    This is where genuine "averaging between data points" happens, targeted
-    specifically at near-duplicate point clusters: confirmed directly on
-    real data (4QSWXH) that nearest-neighbor distances between real grid
-    points span from 4e-6 nA to 0.214 nA -- a >53,000x spread -- because
-    refine_grid's edge bisection keeps halving the gap between two points
-    right up to --min-edge-nA, while coarse regions stay at the full coarse
-    step. That extreme non-uniformity, not sparse resolution, is what made
-    cubic interpolation ring/overshoot (Clough-Tocher triangulation is
-    numerically ill-conditioned on near-zero-area triangles). tolerance_nA
-    defaults to --min-edge-nA itself: refinement never intentionally places
-    two distinct points closer than that, so anything closer than it is a
-    near-duplicate artifact of the bisection process, not independent
-    signal -- merging it isn't discarding real information.
-
-    Returns (merged_held, merged_injected, merged_values), each 1D arrays,
-    one entry per group.
+def _panel_map(ax, value_map, held_levels, injected_levels, extent, cmap, label, title):
+    """Shared continuous-panel renderer for plot_cell_grid_features -- an
+    exact per-point matrix (see _exact_grid_matrix), imshow'd with
+    interpolation="nearest" (meaning: no resampling/blending even when the
+    figure's saved pixel density differs from the grid's own N_held x
+    N_injected point count -- every displayed pixel still traces to
+    exactly one real matrix cell, never an average of neighbors).
     """
-    finite = np.isfinite(values) if not is_categorical else np.ones(len(values), dtype=bool)
-    held, injected, values = held[finite], injected[finite], values[finite]
-    if len(held) == 0:
-        return held, injected, values
-
-    snapped_h = np.round(held / tolerance_nA).astype(np.int64)
-    snapped_i = np.round(injected / tolerance_nA).astype(np.int64)
-    groups: dict = {}
-    for h, i, v, sh, si in zip(held, injected, values, snapped_h, snapped_i):
-        groups.setdefault((sh, si), {"h": [], "i": [], "v": []})
-        g = groups[(sh, si)]
-        g["h"].append(h)
-        g["i"].append(i)
-        g["v"].append(v)
-
-    merged_h = np.empty(len(groups))
-    merged_i = np.empty(len(groups))
-    merged_v = np.empty(len(groups))
-    for idx, g in enumerate(groups.values()):
-        merged_h[idx] = np.mean(g["h"])
-        merged_i[idx] = np.mean(g["i"])
-        if is_categorical:
-            vals, counts = np.unique(g["v"], return_counts=True)
-            merged_v[idx] = vals[np.argmax(counts)]
-        else:
-            merged_v[idx] = np.mean(g["v"])
-    return merged_h, merged_i, merged_v
+    matrix = _exact_grid_matrix(value_map, held_levels, injected_levels)
+    if np.all(np.isnan(matrix)):
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+    else:
+        im = ax.imshow(matrix, origin="lower", extent=extent, aspect="auto", cmap=cmap,
+                       interpolation="nearest")
+        plt.colorbar(im, ax=ax, label=label)
+    ax.set_title(title, fontsize=9)
 
 
-def _mask_long_triangles(pts, hh, ii, max_edge_multiple: float = 4.0):
-    """Marks render pixels that fall inside a Delaunay triangle (over the
-    real, merged point cloud) whose longest edge exceeds max_edge_multiple
-    times the median real-point spacing.
-
-    Linear interpolation is bounded by its triangle's own corner values, so
-    it never fabricates a value outside what's real -- but stretched across
-    an unusually long/thin triangle (common where an adaptively-refined
-    point cloud goes from densely-sampled near a boundary to sparse
-    elsewhere), the result reads visually as a "ray" implying smooth local
-    structure over a distance where no nearby real data actually supports
-    that reading. This flags exactly those triangles so the caller can fall
-    back to honest nearest-neighbor there instead, keeping linear's smooth
-    blending only where real local point density actually earns it.
+def _panel_categorical(ax, value_map, held_levels, injected_levels, extent, colors, title):
+    """Shared categorical-panel renderer -- colormaps category codes to RGBA
+    (never blends raw integer codes: "silent"=0 blended with "tonic"=1
+    could land near 0.5, a fabricated intermediate category that doesn't
+    exist), then imshow's with interpolation="nearest". Missing coordinates
+    (see _exact_grid_matrix) are painted a fixed NO_DATA_COLOR, distinct
+    from every real category color and explicitly labeled in the legend --
+    never silently absorbed into whichever real category happens to render
+    nearby.
     """
-    from scipy.spatial import Delaunay, cKDTree
-    if len(pts) < 4:
-        return np.zeros(hh.shape, dtype=bool)
-    tree = cKDTree(pts)
-    nn_dist, _ = tree.query(pts, k=2)
-    median_spacing = np.median(nn_dist[:, 1])
-    if not np.isfinite(median_spacing) or median_spacing <= 0:
-        return np.zeros(hh.shape, dtype=bool)
-    max_edge = max_edge_multiple * median_spacing
-
-    try:
-        tri = Delaunay(pts)
-    except QhullError:
-        # Same degenerate/near-collinear point configurations _render_heatmap's
-        # own linear-interpolation call can hit -- no masking is the safe
-        # default (falls through to whatever _render_heatmap does, which
-        # already has its own nearest-neighbor fallback for this).
-        return np.zeros(hh.shape, dtype=bool)
-    simplex_pts = pts[tri.simplices]
-    edge_lengths = np.stack([
-        np.linalg.norm(simplex_pts[:, 0] - simplex_pts[:, 1], axis=1),
-        np.linalg.norm(simplex_pts[:, 1] - simplex_pts[:, 2], axis=1),
-        np.linalg.norm(simplex_pts[:, 2] - simplex_pts[:, 0], axis=1),
-    ], axis=1)
-    long_simplex = edge_lengths.max(axis=1) > max_edge
-
-    query_pts = np.column_stack([hh.ravel(), ii.ravel()])
-    simplex_idx = tri.find_simplex(query_pts)
-    mask = simplex_idx < 0  # outside the triangulation entirely -> also fall back
-    inside = ~mask
-    mask[inside] = long_simplex[simplex_idx[inside]]
-    return mask.reshape(hh.shape)
+    names = list(colors.keys())
+    matrix = _exact_grid_matrix(value_map, held_levels, injected_levels)
+    cmap = ListedColormap(list(colors.values()))
+    norm = BoundaryNorm(np.arange(len(names) + 1) - 0.5, cmap.N)
+    no_data = np.isnan(matrix)
+    rgba = cmap(norm(np.where(no_data, 0, matrix)))
+    rgba[no_data] = NO_DATA_COLOR
+    ax.imshow(rgba, origin="lower", extent=extent, aspect="auto", interpolation="nearest")
+    ax.set_title(title, fontsize=9)
+    handles = [plt.Line2D([0], [0], marker="s", color="w", markerfacecolor=c, markersize=8, label=lbl)
+              for lbl, c in colors.items()]
+    if no_data.any():
+        handles.append(plt.Line2D([0], [0], marker="s", color="w", markerfacecolor=NO_DATA_COLOR,
+                                  markersize=8, label="no data"))
+    ax.legend(handles=handles, loc="best", fontsize=6)
 
 
-def _render_heatmap(held, injected, values, hh, ii, tolerance_nA, is_categorical=False, mode="tile"):
-    """Merge-then-render: _merge_close_points collapses near-duplicate real
-    points into local averages (see its docstring, and the module's
-    SCHEMA_VERSION-era investigation confirming that near-zero-distance
-    point pairs -- not resolution -- caused the original cubic rendering to
-    ring/overshoot). What happens after merging is controlled by `mode`:
+def plot_cell_grid_features(cell_result: dict, features: dict, outdir: Path, command: str,
+                            fig_format: str = DEFAULT_FIGURE_FORMAT) -> None:
+    """Merged replacement for the old plot_cell_grid (6 panels, this module)
+    + plot_cell_features (12 panels, extract_grid_features.py) -- 4 of the
+    6/12 were exact duplicates (firing rate, rebound count, rebound
+    latency, spikes/burst); this shows the 14 genuinely distinct panels
+    once each, grouped thematically (classification overview / rate-timing
+    / rebound / passive-other) rather than in arbitrary reading order.
 
-    - "tile" (default): nearest-neighbor only, for both categorical and
-      continuous quantities -- each real (merged) point owns a flat,
-      delineated Voronoi-style tile out to its nearest neighbors, with no
-      blending between tiles. Reverted to this as the default after the
-      "linear" mode below (despite its two accuracy safeguards) still
-      wasn't giving the reading the data actually supports -- tiling is the
-      more honest baseline (every pixel's value traces to exactly one real
-      point, never a fabricated blend), revisit smoothing separately later.
-    - "linear": LINEAR interpolation for continuous quantities (still
-      nearest-neighbor for categorical -- blending two category codes has
-      no meaning, e.g. "tonic"=1 blended with "bursting"=2 could land near
-      1.5, an intermediate category that doesn't exist). Linear is
-      barycentric -- each rendered value is a weighted average of its
-      surrounding triangle's three real (merged) corner values, so it's
-      mathematically bounded by them and cannot ring/overshoot the way
-      cubic did -- kept available (not deleted) for revisiting later, just
-      not the active default.
+    Needs BOTH the raw cell_result (grid: test_pattern, rebound_peak_iH_nA
+    -- neither is exposed as a features map) and the precomputed features
+    dict (everything else, already computed by extract_cell_features).
 
-    Returns an all-NaN grid if fewer than 1 real (merged) point survives.
+    Firing-rate definition reconciled (2026-08-11): the old plot_cell_grid
+    NaN'd out silent points; features["firing_rate_map"] (compute_
+    firing_rate_map) includes them at their real 0.0 Hz -- kept here, since
+    a silent-but-not-blown-up point has a well-defined rate, not an
+    undefined one.
     """
-    m_held, m_injected, m_values = _merge_close_points(held, injected, values, tolerance_nA, is_categorical)
-    if len(m_held) == 0:
-        return np.full(hh.shape, np.nan)
-    pts = np.column_stack([m_held, m_injected])
-    if is_categorical or mode == "tile":
-        return griddata(pts, m_values, (hh, ii), method="nearest")
-    # mode == "linear" from here down.
-    # Linear needs a genuine 2D point cloud to triangulate -- a sparse
-    # feature (e.g. adaptation_ratio_map, tonic-only, or iH-at-trough now
-    # restricted to fully-silenced points) can end up with too few merged
-    # points, or points that are collinear/near-collinear along some
-    # non-axis-aligned direction, either of which makes Qhull raise a hard
-    # error instead of returning NaN. The obvious axis-aligned check
-    # (np.ptp along held/injected separately) doesn't catch every
-    # degenerate case -- confirmed directly (a 4-point QhullError on a real
-    # cell whose points passed that check but were still coplanar/degenerate
-    # for Qhull's lifted-paraboloid Delaunay construction) -- so this
-    # catches the error directly rather than trying to predict it.
-    if len(m_held) < 3:
-        return griddata(pts, m_values, (hh, ii), method="nearest")
-    try:
-        rendered = griddata(pts, m_values, (hh, ii), method="linear")
-    except QhullError:
-        return griddata(pts, m_values, (hh, ii), method="nearest")
-    # Reject pixels whose triangle stretches too far relative to local real
-    # point density (see _mask_long_triangles) -- these render as visually
-    # misleading "rays", still bounded by real values but implying smooth
-    # structure the nearby data doesn't actually support. Route them (and
-    # the pre-existing outside-convex-hull NaNs) to nearest-neighbor.
-    nan_mask = np.isnan(rendered) | _mask_long_triangles(pts, hh, ii)
-    if nan_mask.any() and not nan_mask.all():
-        nearest = griddata(pts, m_values, (hh, ii), method="nearest")
-        rendered[nan_mask] = nearest[nan_mask]
-    return rendered
-
-
-def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: str = DEFAULT_FIGURE_FORMAT) -> None:
-    if cell_result["status"] != "ok" or not cell_result["grid"]:
+    if cell_result["status"] != "ok" or not cell_result["grid"] or features.get("status") != "ok":
         return
     cell_id = cell_result["cell_id"]
     grid = cell_result["grid"]
-    held = np.array([p["held_nA"] for p in grid.values()])
-    injected = np.array([p["injected_nA"] for p in grid.values()])
-    hh, ii = _fine_grid_coords(cell_result["cell_floor_nA"], cell_result["injected_floor_nA"])
-    extent = (cell_result["cell_floor_nA"], 0, cell_result["injected_floor_nA"], 0)
-    # Same tolerance this cell's own sweep used to decide "two points are
-    # meaningfully distinct" (see _merge_close_points) -- not a separate,
-    # possibly-mismatched constant.
-    merge_tolerance_nA = cell_result["run_args"]["min_edge_nA"]
+    held_levels = list(cell_result["held_levels_nA"])
+    injected_levels = list(cell_result["injected_levels_nA"])
+    # held_levels/injected_levels run 0 -> floor (descending numerically,
+    # since floor < 0) by construction (build_uniform_grid). Using them
+    # directly as (left, right)/(bottom, top) gives a "reversed" extent
+    # (left > right, bottom > top numerically) that matplotlib renders
+    # correctly (0 at the outer edge, floor at the inner edge, matching
+    # every other current-injection figure in this project) with no
+    # separate invert_xaxis()/invert_yaxis() step needed.
+    extent = (held_levels[0], held_levels[-1], injected_levels[0], injected_levels[-1])
 
-    fig, axes = plt.subplots(2, 3, figsize=(15.5, 9))
+    fig, axes = plt.subplots(4, 4, figsize=(19, 16))
+    for ax in (axes[0, 2], axes[0, 3]):
+        ax.axis("off")
 
+    # Row 0 -- classification overview (2 categorical panels).
     pattern_names = list(PATTERN_COLORS.keys())
-    # test_pattern is None for a point whose test window never actually ran
-    # (e.g. hold_blew_up -- see _TEST_RECOVERY_DEFAULTS) -- "silent" is the
-    # nearest available bucket now that "insufficient_data" is gone (there's
-    # no meaningful data to distinguish it from either).
-    pattern_codes = np.array([pattern_names.index(p["test_pattern"] or "silent")
-                              for p in grid.values()], dtype=float)
-    pattern_grid = _render_heatmap(held, injected, pattern_codes, hh, ii, merge_tolerance_nA,
-                                   is_categorical=True)
-    pattern_cmap = ListedColormap(list(PATTERN_COLORS.values()))
-    pattern_norm = BoundaryNorm(np.arange(len(pattern_names) + 1) - 0.5, pattern_cmap.N)
-    # Colormap the category codes to RGBA ourselves, THEN let imshow blend
-    # that RGBA image with bilinear interpolation -- blending already-mapped
-    # colors pixel-to-pixel is a safe, purely visual antialiasing of the
-    # boundary (softens the jagged nearest-neighbor staircase). Letting
-    # imshow interpolate the raw integer CODES instead (interpolation=
-    # "bilinear" on pattern_grid directly) would average category indices
-    # (e.g. "silent"=0 blended with "tonic"=1 could land near 0.5) and get
-    # reassigned to whichever bucket BoundaryNorm puts that fractional value
-    # in -- a fabricated intermediate category, not a real one.
-    pattern_rgba = pattern_cmap(pattern_norm(pattern_grid))
-    axes[0, 0].imshow(pattern_rgba, origin="lower", extent=extent, aspect="auto",
-                      interpolation="bilinear")
-    axes[0, 0].set_title("test-window firing pattern", fontsize=9)
-    handles = [plt.Line2D([0], [0], marker="s", color="w", markerfacecolor=c, markersize=10, label=lbl)
-              for lbl, c in PATTERN_COLORS.items()]
-    axes[0, 0].legend(handles=handles, loc="best", fontsize=6)
+    pattern_map = {(p["held_nA"], p["injected_nA"]): pattern_names.index(p["test_pattern"] or "silent")
+                  for p in grid.values()}
+    _panel_categorical(axes[0, 0], pattern_map, held_levels, injected_levels, extent,
+                       PATTERN_COLORS, "test-window firing pattern")
 
-    # Firing rate is otherwise invisible in the categorical panel above (a
-    # near-rheobase 2 Hz tonic point and a fast 40 Hz one both just read
-    # "tonic") -- shown for every non-silent point regardless of pattern
-    # (bursting included: test_freq_hz is the whole-window spike count over
-    # window duration, still a meaningful rate even when spikes cluster into
-    # bursts) since it's already computed for every point via
-    # count_spikes_and_rate, not just the confidently-classified ones.
-    freq = np.array([p["test_freq_hz"] if p["test_pattern"] != "silent" else np.nan
-                     for p in grid.values()])
-    freq_grid = _render_heatmap(held, injected, freq, hh, ii, merge_tolerance_nA)
-    im = axes[0, 1].imshow(freq_grid, origin="lower", extent=extent, aspect="auto", cmap="viridis",
-                           interpolation="bicubic")
-    fig.colorbar(im, ax=axes[0, 1], label="Hz")
-    axes[0, 1].set_title("test-window firing rate (blank = silent)", fontsize=9)
+    rebound_pattern_map = features.get("rebound_pattern_map") or {}
+    rp_names = list(REBOUND_PATTERN_COLORS.keys())
+    rp_codes = {k: rp_names.index(v) for k, v in rebound_pattern_map.items()}
+    _panel_categorical(axes[0, 1], rp_codes, held_levels, injected_levels, extent,
+                       REBOUND_PATTERN_COLORS, "rebound pattern")
 
-    # spikes_per_burst is only meaningful where test_pattern == "bursting"
-    # (see run_test_and_recovery's test_n_bursts/test_spikes_per_burst,
-    # computed only in that branch) -- exactly the quantity today's
-    # avg_spikes_per_burst >= 1.5 fix (see classify_burst_pattern) now
-    # gates on, so this panel is the direct visual check that the fix
-    # behaves sensibly across a whole cell's grid, not just the handful of
-    # points spot-checked during calibration.
-    spb = np.array([p["test_spikes_per_burst"] if p["test_pattern"] == "bursting" else np.nan
-                    for p in grid.values()])
-    spb_grid = _render_heatmap(held, injected, spb, hh, ii, merge_tolerance_nA)
-    im = axes[0, 2].imshow(spb_grid, origin="lower", extent=extent, aspect="auto", cmap="plasma",
-                           interpolation="bicubic")
-    fig.colorbar(im, ax=axes[0, 2], label="spikes/burst")
-    axes[0, 2].set_title("spikes per burst (bursting points only)", fontsize=9)
+    # Row 1 -- rate/timing (4). firing_rate_map reconciled to the more
+    # permissive definition (see docstring): includes silent points at
+    # their real 0.0 Hz rather than NaN-ing them out.
+    _panel_map(axes[1, 0], features.get("firing_rate_map") or {}, held_levels, injected_levels,
+              extent, "viridis", "Hz", "test-window firing rate")
+    _panel_map(axes[1, 1], features.get("intra_burst_rate_map") or {}, held_levels, injected_levels,
+              extent, "cividis", "Hz", "intra-burst rate")
+    _panel_map(axes[1, 2], features.get("burst_freq_approx_map") or {}, held_levels, injected_levels,
+              extent, "cividis", "Hz", "burst freq, approx")
+    _panel_map(axes[1, 3], features.get("n_bursts_map") or {}, held_levels, injected_levels,
+              extent, "plasma", "count", "n bursts")
 
-    # rebound_spike_count where applicable+occurred (0 where applicable but
-    # didn't occur); NaN (excluded from interpolation) where rebound wasn't
-    # even applicable -- those points' recovery windows were never
-    # meaningfully evaluated for rebound onset (see run_test_and_recovery's
-    # test_suppressed gate), so a count of 0 there would be a different,
-    # misleading claim from "checked and found none".
-    rebound_counts = np.array([float(p["rebound_spike_count"]) if p["rebound_applicable"] else np.nan
-                               for p in grid.values()])
-    rebound_grid = _render_heatmap(held, injected, rebound_counts, hh, ii, merge_tolerance_nA)
-    im = axes[1, 0].imshow(rebound_grid, origin="lower", extent=extent, aspect="auto", cmap="Oranges",
-                           interpolation="bicubic")
-    fig.colorbar(im, ax=axes[1, 0], label="rebound spike count")
-    axes[1, 0].set_title("rebound spike count (blank = not applicable)", fontsize=9)
+    # Row 2 -- rebound (4).
+    _panel_map(axes[2, 0], features.get("rebound_occurred_map") or {}, held_levels, injected_levels,
+              extent, "Oranges", "fraction", "rebound occurred")
+    _panel_map(axes[2, 1], features.get("rebound_count_map") or {}, held_levels, injected_levels,
+              extent, "YlOrBr", "spike count", "rebound spike count")
+    _panel_map(axes[2, 2], features.get("rebound_latency_map") or {}, held_levels, injected_levels,
+              extent, "viridis", "ms", "rebound latency")
+    _panel_map(axes[2, 3], features.get("rebound_peak_mV_map") or {}, held_levels, injected_levels,
+              extent, "magma", "mV", "rebound peak")
 
-    lat = np.array([p["rebound_latency_ms"] if p["rebound_occurred"] else np.nan for p in grid.values()])
-    lat_grid = _render_heatmap(held, injected, lat, hh, ii, merge_tolerance_nA)
-    im = axes[1, 1].imshow(lat_grid, origin="lower", extent=extent, aspect="auto", cmap="viridis",
-                           interpolation="bicubic")
-    fig.colorbar(im, ax=axes[1, 1], label="ms")
-    axes[1, 1].set_title("rebound latency", fontsize=9)
+    # Row 3 -- passive/other (4).
+    _panel_map(axes[3, 0], features.get("sag_depth_map") or {}, held_levels, injected_levels,
+              extent, "YlGnBu", "mV", "sag depth")
+    _panel_map(axes[3, 1], features.get("adaptation_ratio_map") or {}, held_levels, injected_levels,
+              extent, "plasma", "ratio", "adaptation ratio (tonic)")
+
+    spb_map = {(p["held_nA"], p["injected_nA"]): p["test_spikes_per_burst"]
+              for p in grid.values() if p["test_pattern"] == "bursting"}
+    _panel_map(axes[3, 2], spb_map, held_levels, injected_levels, extent, "plasma", "spikes/burst",
+              "spikes per burst (bursting only)")
 
     # trough_idx = argmin(v_rec) (see run_test_and_recovery) is only a
     # genuine post-inhibitory-rebound trough when the cell was actually
@@ -1076,50 +952,37 @@ def plot_cell_grid(cell_result: dict, outdir: Path, command: str, fig_format: st
     # alone isn't strict enough (it allows a still-firing "tonic" test
     # window as long as its rate dropped enough), so for a point that kept
     # firing, argmin(v_rec) can land on an arbitrary ongoing spike's AHP
-    # trough instead, contaminating the value with spike-phase noise. Same
-    # category of issue already found and fixed for sag
-    # (test_v_min_pre_spike_mV) -- confirmed directly here too: one 9GBDEX
-    # point (held=-0.8, inj=-4.71) reports iH=-6.1 nA against a neighbor
-    # median of -2.0 nA, while test_pattern there is "tonic" not "silent".
-    iH = np.array([p["rebound_peak_iH_nA"] if (p["rebound_peak_iH_nA"] is not None
-                                                and p["test_pattern"] == "silent") else np.nan
-                  for p in grid.values()])
-    iH_grid = _render_heatmap(held, injected, iH, hh, ii, merge_tolerance_nA)
-    im = axes[1, 2].imshow(iH_grid, origin="lower", extent=extent, aspect="auto", cmap="magma",
-                           interpolation="bicubic")
-    fig.colorbar(im, ax=axes[1, 2], label="nA")
-    axes[1, 2].set_title("i_H at recovery trough (test window fully silenced only)", fontsize=9)
+    # trough instead, contaminating the value with spike-phase noise.
+    # Confirmed directly on a real 9GBDEX point (held=-0.8, inj=-4.71):
+    # reports iH=-6.1 nA against a neighbor median of -2.0 nA, test_pattern
+    # there is "tonic" not "silent".
+    iH_map = {(p["held_nA"], p["injected_nA"]): p["rebound_peak_iH_nA"]
+             for p in grid.values()
+             if p["rebound_peak_iH_nA"] is not None and p["test_pattern"] == "silent"}
+    _panel_map(axes[3, 3], iH_map, held_levels, injected_levels, extent, "magma", "nA",
+              "i_H at recovery trough (silenced only)")
 
     for ax in axes.flat:
-        ax.set_xlabel("held (nA)")
-        ax.set_ylabel("injected (nA)")
-        ax.invert_xaxis()
-        ax.invert_yaxis()
+        if not ax.axison:
+            continue
+        ax.set_xlabel("held (nA)", fontsize=7)
+        ax.set_ylabel("injected (nA)", fontsize=7)
+        ax.tick_params(labelsize=7)
 
+    burstiness = features.get("burstiness_index")
+    fi_slope = features.get("fi_slope_hz_per_nA")
+    burstiness_str = f"{burstiness:.3f}" if burstiness is not None else "None"
+    fi_slope_str = f"{fi_slope:.3f} Hz/nA" if fi_slope is not None else "None"
     title = (f"{cell_id} — status: {cell_result['status']}, "
             f"cell_floor={cell_result['cell_floor_nA']:.2f} nA, "
             f"n_points={cell_result['n_points_total']}, "
-            f"refine_depth={cell_result['refine_max_depth_reached']}"
-            + (" [TRUNCATED]" if cell_result["refinement_truncated"] else ""))
-    fig.suptitle(title, fontsize=9)
-    fig.tight_layout(rect=(0.0, 0.06, 1.0, 0.96))
-    # Sharp bands in rebound latency/spike-count are usually real, not an
-    # interpolation limit: confirmed directly (4QSWXH) that latency's
-    # nearest-neighbor point-to-point jump is 10x larger relative to its
-    # range at the 90th percentile than at the median -- a bimodal split
-    # between two rebound regimes a few tenths of a nA apart, consistent
-    # with this model's already-documented path-dependent (hysteretic)
-    # settling near dynamical transitions (see module docstring). i_H is
-    # smooth because it's a state-space value at a fixed instant, not a
-    # spike-timing quantity that can flip discretely between regimes.
-    fig.text(0.5, 0.025,
-             "Sharp bands in rebound latency/spike-count typically reflect real hysteretic "
-             "transitions between rebound regimes, not interpolation resolution.",
-             ha="center", va="bottom", fontsize=6.5, style="italic", color="dimgray")
+            f"burstiness={burstiness_str}, F-I slope={fi_slope_str}")
+    fig.suptitle(title, fontsize=10)
+    fig.tight_layout(rect=(0.0, 0.025, 1.0, 0.965))
     fig.text(0.5, 0.005, command, ha="center", va="bottom",
              fontsize=6, family="monospace", color="dimgray", wrap=True)
     outpath = outdir / f"{cell_id}_grid.{fig_format}"
-    fig.savefig(outpath, format=fig_format, dpi=180)
+    fig.savefig(outpath, format=fig_format, dpi=170)
     plt.close(fig)
 
 
@@ -1142,32 +1005,21 @@ def parse_args() -> argparse.Namespace:
                         help="Path to Step 1's cell_silencing_thresholds.pkl (input, read-only; "
                              "used to anchor each cell's grid range).")
     parser.add_argument("--output-cache", default=DEFAULT_OUTPUT_CACHE_PATH)
-    parser.add_argument("--figures-dir", default=DEFAULT_FIGURES_DIR)
-    parser.add_argument("--figure-format", default=DEFAULT_FIGURE_FORMAT, choices=["svg", "png", "pdf"])
-    parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--temp", type=float, default=DEFAULT_TEMP)
     parser.add_argument("--reftemp", type=float, default=DEFAULT_REFTEMP)
     parser.add_argument("--dt", type=float, default=DEFAULT_DT_MS)
     parser.add_argument("--jobs", type=int, default=-1)
 
-    parser.add_argument("--coarse-step-held-nA", type=float, default=0.5,
-                        help="Fixed held-current step size for the coarse grid (0 down to cell_floor_nA), "
-                             "matching Step 1's own coarse_step_nA convention -- gives round, "
-                             "cell-comparable values rather than dividing each cell's own floor into a "
-                             "fixed point count. Point count therefore varies per cell; a 2D grid at a "
-                             "fixed step is quadratically more expensive for deep-threshold cells. Only "
-                             "used as-is for cells deep enough to already clear --min-coarse-points at "
-                             "this step -- shallower cells get an automatically finer, cell-specific step.")
-    parser.add_argument("--coarse-step-injected-nA", type=float, default=0.5,
-                        help="Fixed injected-current step size for the coarse grid.")
-    parser.add_argument("--min-coarse-points", type=int, default=15,
-                        help="Minimum coarse-grid levels guaranteed per axis: the fixed step above "
-                             "is shrunk (never grown) for a cell whose own floor is shallow enough "
-                             "that it would otherwise fall below this count -- confirmed directly a "
-                             "0.5nA step gives a deep cell like ZE23IV (floor=-20.3) 42 held levels "
-                             "but a shallow cell like 4QSWXH (floor=-3.0) only 7, a >5x density gap "
-                             "driven purely by floor depth. Set to 0 or 1 to disable (always use the "
-                             "fixed step).")
+    parser.add_argument("--n-points-held", type=int, default=50,
+                        help="Number of evenly-spaced held-current levels from 0 to cell_floor_nA, "
+                             "the SAME for every cell regardless of floor depth (2026-08-11: replaced "
+                             "the old fixed-nA-step coarse grid + boundary-driven adaptive refinement, "
+                             "which produced wildly uneven point counts per cell -- 7-42 coarse levels/"
+                             "axis alone depending on floor depth, before even counting refinement's "
+                             "own unbounded-by-count additions). Deeper-floor cells are sampled at "
+                             "coarser absolute nA spacing, not simulated more or fewer times.")
+    parser.add_argument("--n-points-injected", type=int, default=50,
+                        help="Same as --n-points-held, for the injected-current axis.")
     parser.add_argument("--cell-floor-margin-nA", type=float, default=1.0,
                         help="Held spans [0, silencing_threshold - margin] (cell_floor_nA). "
                              "Margin gives headroom past the cell's own confirmed quiescent level. "
@@ -1176,18 +1028,6 @@ def parse_args() -> argparse.Namespace:
                         help="Injected spans [0, cell_floor_nA - this], i.e. this much further past "
                              "the cell's confirmed quiescent level than held's own floor (cell_floor_nA) "
                              "-- held stays anchored at cell_floor_nA.")
-
-    parser.add_argument("--max-refine-depth", type=int, default=5,
-                        help="Max edge-bisection depth. 2D refinement cost grows with the number "
-                             "of surviving boundary edges per depth, so this is capped more "
-                             "conservatively than Step 1's 1D fine sweep.")
-    parser.add_argument("--min-edge-nA", type=float, default=0.02,
-                        help="Absolute floor on edge length; stop bisecting an edge once it's this short "
-                             "regardless of --max-refine-depth.")
-    parser.add_argument("--max-boundary-edges-per-depth", type=int, default=500,
-                        help="Safety valve: if a depth level would produce more boundary edges than this "
-                             "(e.g. a pathologically noisy/checkerboarded cell), stop refining and flag "
-                             "refinement_truncated=True rather than exploding compute.")
 
     parser.add_argument("--hold-settle-chunk-s", type=float, default=2.0)
     parser.add_argument("--max-hold-settle-s", type=float, default=20.0)
@@ -1218,6 +1058,13 @@ def parse_args() -> argparse.Namespace:
                              "first. Captures the passive Ih-relaxation sag independent of whether the "
                              "cell goes on to fire tonically/burst -- sag precedes the first spike, so "
                              "it isn't restricted to windows that stay silent throughout.")
+    parser.add_argument("--sag-dead-zone-ms", type=float, default=5.0,
+                        help="A 'spike' within this many ms of test-window onset doesn't count as the "
+                             "first spike for --sag-window-ms truncation purposes. Needed because the "
+                             "test window continues directly from the held level's own state -- if held "
+                             "fires spontaneously, that state can be mid-upstroke of a spike already "
+                             "committed before injected ever took effect, which would otherwise truncate "
+                             "the sag window to ~1ms regardless of injected depth.")
     parser.add_argument("--adaptation-edge-n", type=int, default=3,
                         help="Number of ISIs averaged at each end of a tonic test window to compute "
                              "test_adaptation_ratio (mean of the last N ISIs / mean of the first N "
@@ -1227,6 +1074,22 @@ def parse_args() -> argparse.Namespace:
                              "the default of 3 here guarantees every tonic point qualifies -- raising "
                              "this without also raising --min-isis-for-burst-test will silently make "
                              "many tonic points report None.")
+    parser.add_argument("--min-onset-isis", type=int, default=2,
+                        help="Minimum consecutive short ISIs (i.e. min_onset_isis+1 spikes) required "
+                             "at the very start of the test window, immediately followed by a jump of "
+                             "at least --min-isi-ratio, to report test_onset_n_spikes/test_onset_isi_"
+                             "mean_ms -- a local burst-onset detector that runs independent of "
+                             "test_pattern, for onset bursts the whole-window KDE test misses (see "
+                             "detect_onset_burst docstring).")
+    parser.add_argument("--trailing-silence-ratio", type=float, default=3.0,
+                        help="A test window is flagged test_likely_ceased_firing when the gap between "
+                             "its last spike and window end is at least this many times the most recent "
+                             "ISI -- distinguishes a train that genuinely stopped partway through the "
+                             "window from one still firing (slowly) when the window happened to end. "
+                             "test_adaptation_ratio is only computed for tonic windows that are NOT "
+                             "flagged this way -- a first-k/last-k ISI ratio measures something "
+                             "different for a train that dies out mid-window than for one that keeps "
+                             "firing steadily throughout.")
     parser.add_argument("--max-test-window-s", type=float, default=20.0,
                         help="If a test window comes back 'insufficient_data' (too few ISIs to "
                              "classify at all), it's re-simulated with a longer window (doubled by "
@@ -1245,8 +1108,6 @@ def main() -> None:
     ss_cache_path = Path(args.steady_state_cache)
     silencing_cache_path = Path(args.silencing_cache)
     output_cache_path = Path(args.output_cache)
-    figures_dir = Path(args.figures_dir)
-    figures_dir.mkdir(parents=True, exist_ok=True)
 
     all_cells = load_all_cells(params_dir)
     if args.cells:
@@ -1287,8 +1148,6 @@ def main() -> None:
     for cell_id, result in result_iter:
         output_cache[cell_id] = result
         status_counts[result["status"]] = status_counts.get(result["status"], 0) + 1
-        if not args.no_plot:
-            plot_cell_grid(result, figures_dir, command, fig_format=args.figure_format)
         save_output_cache(output_cache, output_cache_path)
         n_done += 1
         print(f"  [{n_done}/{len(cells)}] {cell_id}: {result['status']}")
@@ -1302,12 +1161,7 @@ def main() -> None:
     print("\nStatus summary:")
     for status, count in sorted(status_counts.items()):
         print(f"  {status}: {count}")
-    truncated = [cid for cid, result in this_run_results if result.get("refinement_truncated")]
-    if truncated:
-        print(f"\n{len(truncated)} cell(s) hit --max-boundary-edges-per-depth and were refinement_truncated: {truncated}")
     print(f"\nCache written to {output_cache_path}")
-    if not args.no_plot:
-        print(f"Figures written to {figures_dir}/")
 
     flagged = [cid for cid, result in this_run_results if result["status"] != "ok"]
     if flagged:

@@ -87,7 +87,12 @@ def plot_correlation_heatmap(df: pd.DataFrame, outpath: Path, cols=CONDUCTANCE_C
                              title: str = "Global conductance correlation matrix") -> None:
     corr = df[cols].corr()
     fig, ax = plt.subplots(figsize=(6.5, 5.5))
-    im = ax.imshow(corr.values, cmap="coolwarm", vmin=-1, vmax=1, interpolation="bicubic")
+    # interpolation="nearest" (2026-08-12, per explicit instruction): this
+    # is a discrete conductance x conductance correlation matrix, not a
+    # spatial grid -- bicubic blending fabricated values between unrelated
+    # conductance pairs, directly contradicting the exact r-values already
+    # printed on each cell below.
+    im = ax.imshow(corr.values, cmap="coolwarm", vmin=-1, vmax=1, interpolation="nearest")
     ax.set_xticks(range(len(cols)))
     ax.set_xticklabels(cols, rotation=90)
     ax.set_yticks(range(len(cols)))
@@ -203,6 +208,56 @@ def search_with_null(df: pd.DataFrame, k: int, cols=CONDUCTANCE_COLS,
     return {"k": k, "labels": labels, "real_score": real_score, "null_scores": null_scores,
            "percentile": percentile,
            "group_sizes": pd.Series(labels).value_counts().sort_index().to_dict()}
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap stability of the winning partition
+# ---------------------------------------------------------------------------
+
+def bootstrap_stability(df: pd.DataFrame, reference_labels: pd.Series, k: int, cols=CONDUCTANCE_COLS,
+                        min_group_size: int = MIN_GROUP_SIZE, n_restarts: int = 3,
+                        n_bootstrap: int = 100, random_state: int = DEFAULT_RANDOM_STATE) -> dict:
+    """Resamples cells with replacement, reruns the from-scratch local
+    search on each resample, and compares the resulting partition to the
+    reference (full, non-resampled) partition via adjusted Rand index.
+    Duplicate rows within a resample (the same cell drawn more than once)
+    are collapsed to one label per cell via majority vote before scoring.
+    A partition that's just a fragile local optimum specific to this one
+    69-cell draw should show low agreement across resamples; a real,
+    robust partition should keep reappearing.
+    """
+    from collections import Counter
+    from sklearn.metrics import adjusted_rand_score
+
+    rng = np.random.default_rng(random_state)
+    cell_ids = df.index.to_numpy()
+    n = len(cell_ids)
+    ari_scores = []
+
+    for b in range(n_bootstrap):
+        sample_idx = rng.integers(0, n, size=n)
+        resampled = df.iloc[sample_idx]
+        labels, _ = local_search_partition(resampled, k, cols, min_group_size, n_restarts,
+                                           seed_labels=None, random_state=random_state + 1000 + b)
+        sampled_ids = cell_ids[sample_idx]
+        per_cell_labels: dict = {}
+        for cid, lbl in zip(sampled_ids, labels):
+            per_cell_labels.setdefault(cid, []).append(int(lbl))
+        collapsed = {cid: Counter(lbls).most_common(1)[0][0] for cid, lbls in per_cell_labels.items()}
+
+        common = [cid for cid in collapsed if cid in reference_labels.index]
+        if len(common) < min_group_size * k:
+            continue
+        boot_lbls = [collapsed[cid] for cid in common]
+        ref_lbls = [reference_labels.loc[cid] for cid in common]
+        ari_scores.append(adjusted_rand_score(ref_lbls, boot_lbls))
+
+    ari_scores = np.array(ari_scores)
+    finite = ari_scores[np.isfinite(ari_scores)]
+    return {"n_bootstrap": n_bootstrap, "n_valid": len(finite), "ari_scores": ari_scores,
+           "ari_mean": float(finite.mean()) if len(finite) else None,
+           "ari_median": float(np.median(finite)) if len(finite) else None,
+           "frac_above_0p5": float(np.mean(finite > 0.5)) if len(finite) else None}
 
 
 # ---------------------------------------------------------------------------

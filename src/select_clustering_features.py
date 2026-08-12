@@ -47,6 +47,9 @@ import argparse
 import sys
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -56,6 +59,9 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from consolidate_features import select_complete_case_matrix, DEFAULT_OUTPUT_CSV_PATH as DEFAULT_MASTER_CSV_PATH
 from cluster_features import CONDUCTANCE_COLS, drop_zero_variance
+
+DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "clustering_search"
+DEFAULT_FIGURE_FORMAT = "svg"
 
 DEFAULT_TARGET_K = 3
 DEFAULT_K_MIN = 2
@@ -434,7 +440,63 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-bootstrap", type=int, default=DEFAULT_N_BOOTSTRAP)
     parser.add_argument("--jobs", type=int, default=-1)
     parser.add_argument("--random-state", type=int, default=DEFAULT_RANDOM_STATE)
+    parser.add_argument("--figures-dir", default=DEFAULT_FIGURES_DIR)
+    parser.add_argument("--figure-format", default=DEFAULT_FIGURE_FORMAT, choices=["svg", "png", "pdf"])
+    parser.add_argument("--no-plot", action="store_true")
     return parser.parse_args()
+
+
+def plot_bic_silhouette_curves(result: dict, outdir: Path, command: str,
+                               fig_format: str = DEFAULT_FIGURE_FORMAT) -> None:
+    """BIC-by-k as the PRIMARY validation panel (larger, on top) with
+    silhouette-by-k as a secondary, supporting panel underneath -- per the
+    user's explicit preference (2026-08-11) to validate the classifier
+    primarily on BIC, with silhouette as secondary justification, not the
+    other way around. Both panels mark target_k the same way so the two
+    criteria's agreement/disagreement is visually direct.
+    """
+    if result["status"] != "ok":
+        return
+    outdir.mkdir(parents=True, exist_ok=True)
+    curves = result["final_result"]["curves"]
+    ks = sorted(curves.keys())
+    bic_vals = [curves[k]["bic"] for k in ks]
+    sil_vals = [curves[k]["silhouette"] for k in ks]
+    target_k = result.get("target_k", DEFAULT_TARGET_K)
+    best_bic_k = ks[int(np.argmin(bic_vals))]
+    best_sil_k = ks[int(np.argmax(sil_vals))]
+
+    fig, (ax_bic, ax_sil) = plt.subplots(2, 1, figsize=(7, 7), gridspec_kw={"height_ratios": [2, 1]})
+
+    ax_bic.plot(ks, bic_vals, "o-", color="firebrick", lw=1.8, ms=6)
+    ax_bic.axvline(target_k, color="black", ls="--", lw=1, alpha=0.6, label=f"target k={target_k}")
+    if best_bic_k == target_k:
+        ax_bic.scatter([target_k], [curves[target_k]["bic"]], s=140, facecolors="none",
+                       edgecolors="mediumseagreen", linewidths=2, zorder=5, label="BIC minimum")
+    ax_bic.set_ylabel("BIC (lower = better)")
+    ax_bic.set_title(f"PRIMARY: GMM BIC by k -- {result['pool']} pool, "
+                     f"{len(result['subset'])}-feature subset", fontsize=10)
+    ax_bic.legend(loc="best", fontsize=7)
+
+    ax_sil.plot(ks, sil_vals, "o-", color="steelblue", lw=1.4, ms=5)
+    ax_sil.axvline(target_k, color="black", ls="--", lw=1, alpha=0.6)
+    if best_sil_k == target_k:
+        ax_sil.scatter([target_k], [curves[target_k]["silhouette"]], s=100, facecolors="none",
+                       edgecolors="mediumseagreen", linewidths=2, zorder=5)
+    ax_sil.set_xlabel("k")
+    ax_sil.set_ylabel("silhouette")
+    ax_sil.set_title("secondary / supporting: silhouette by k", fontsize=9)
+
+    agree = "agree" if (best_bic_k == target_k and best_sil_k == target_k) else \
+           ("BIC supports k, silhouette doesn't" if best_bic_k == target_k else
+            "silhouette supports k, BIC doesn't" if best_sil_k == target_k else
+            "neither criterion's own optimum is k")
+    fig.suptitle(f"subset: {result['subset']}\nBIC optimum: k={best_bic_k}  |  "
+                f"silhouette optimum: k={best_sil_k}  |  {agree}", fontsize=8, y=0.99)
+    fig.tight_layout(rect=(0.0, 0.05, 1.0, 0.94))
+    fig.text(0.5, 0.01, command, ha="center", va="bottom", fontsize=6, color="gray")
+    fig.savefig(outdir / f"bic_silhouette_{result['pool']}.{fig_format}")
+    plt.close(fig)
 
 
 def print_stage_report(result: dict) -> None:
@@ -505,6 +567,10 @@ def main() -> None:
         result["target_k"] = args.target_k
         results[pool] = result
         print_stage_report(result)
+        if not args.no_plot and result["status"] == "ok":
+            plot_bic_silhouette_curves(result, Path(args.figures_dir), "python " + " ".join(sys.argv),
+                                       args.figure_format)
+            print(f"Figure written to {args.figures_dir}/bic_silhouette_{pool}.{args.figure_format}")
 
     if "full" in results and "behavioral" in results:
         print(f"\n{'=' * 70}\nStage comparison\n{'=' * 70}")

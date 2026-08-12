@@ -32,7 +32,6 @@ import argparse
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap, BoundaryNorm
 import numpy as np
 from joblib import Parallel, delayed
 from scipy.interpolate import griddata
@@ -42,7 +41,7 @@ ROOT_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from run_held_injected_grid import DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_GRID_CACHE_PATH
-from run_held_injected_grid import _fine_grid_coords, _render_heatmap
+from run_held_injected_grid import load_output_cache as load_grid_cache, plot_cell_grid_features
 
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_grid_features.pkl"
 DEFAULT_PCA_OUTPUT_PATH = ROOT_DIR / "cell_grid_features_pca.pkl"
@@ -93,23 +92,37 @@ def compute_burstiness(grid: dict) -> dict:
             "n_bursting_points": n_bursting, "n_tonic_points": n_tonic, "n_silent_points": n_silent}
 
 
-def compute_sag_depth_map(grid: dict) -> dict:
-    """Sag depth per point (mV): hold_v_end - test_v_min_pre_spike, i.e. how
-    far V dips below the pre-test baseline before either a fixed early
-    window elapses or the cell's first spike fires, whichever comes first
-    (test_v_min_pre_spike_mV, from run_held_injected_grid.py's
-    compute_pre_spike_sag_trough). Sag is a passive, subthreshold,
-    Ih-mediated relaxation that plays out BEFORE the first spike/burst, so
-    it's assessed here for every test window that has one -- tonic and
-    bursting points included, not just windows that stay silent throughout
-    (sag is not exclusive to fully-quiescent cells).
+def compute_sag_depth_map(grid: dict, min_pre_spike_window_ms: float = 100.0) -> dict:
+    """Sag depth per point (mV): hold_v_trough - test_v_min_pre_spike, i.e.
+    how much FURTHER V dips below the held level's own baseline before
+    either a fixed early window elapses or the cell's first spike fires,
+    whichever comes first (test_v_min_pre_spike_mV, from
+    run_held_injected_grid.py's compute_pre_spike_sag_trough). Sag is a
+    passive, subthreshold, Ih-mediated relaxation that plays out BEFORE the
+    first spike/burst, so it's assessed here for every test window that has
+    one -- tonic and bursting points included, not just windows that stay
+    silent throughout (sag is not exclusive to fully-quiescent cells).
 
-    Only requires hold_is_flatline: hold_v_end_mV is only a meaningful
-    baseline if the held level itself isn't still oscillating (an
-    oscillating hold has no single "resting" voltage to sag away from).
-    test_v_min_pre_spike_mV doesn't have the equivalent problem regardless
-    of the test window's own firing pattern, since it's a windowed minimum
-    that's well-defined whether or not the cell goes on to fire.
+    Baseline is hold_v_trough_mV (the minimum V already reached during the
+    held level's own last settle chunk), not a single endpoint sample. For a
+    flatline hold these are identical (a constant trace's min is its
+    endpoint) -- but for a held level that's itself tonically/burst firing
+    at rest (common: e.g. XB2IQX fires spontaneously even at held=0, and at
+    held=-3nA still fires at 19.5Hz), a single endpoint sample lands at
+    whatever random phase of the oscillation the chunked settle loop
+    happened to stop on (confirmed on a real XB2IQX point: -39.8mV
+    end-of-chunk snapshot mid-cycle, vs. a trace that actually spans spike
+    peak down to ~-70mV AHP) -- not a usable "resting" reference. This used
+    to be handled by skipping every non-flatline-hold point entirely
+    (silently -- NOT stored as a real 0, easy to misread as "no sag" in a
+    heatmap), which dropped sag everywhere a cell fires spontaneously,
+    including a real ~30mV dip at XB2IQX held=-3.00/injected=-5.50 that
+    never got measured. Using the hold's own already-simulated trough
+    instead needs no extra simulation, reduces to the exact old numeric
+    definition when hold_is_flatline, and gives a well-defined value
+    ("does the test window dip below where the cell already goes on its
+    own?") when it isn't -- so every point with a valid test window now
+    gets a sag value, not just the flatline-hold subset.
 
     Reports an absolute depth (mV), not a normalized 0-1 ratio: a proper
     ratio needs a second "relaxed/recovered" reference voltage after the
@@ -120,16 +133,54 @@ def compute_sag_depth_map(grid: dict) -> dict:
     one timestep before it) -- not usable without dedicated spike-onset
     (threshold-crossing) detection, out of scope for a cache-only Phase-1
     feature.
+
+    Two further gates, both confirmed necessary against real XB2IQX data
+    (472/2500 points, up to -17.3mV, before these were added):
+
+    1. min_pre_spike_window_ms: excludes any point whose test_first_spike_ms
+       is under this threshold. test_v_min_pre_spike_mV is a windowed min
+       over WHATEVER time elapses before the first spike (up to
+       sag_window_ms) -- when that window is short (a spike fires quickly,
+       e.g. because injected barely perturbs an already-fast-firing held
+       level), V simply hasn't had time to move far, no matter how much real
+       sag the cell has. That shallow, truncated min then gets compared
+       against hold_v_trough_mV -- which IS measured over a full multi-
+       second, multi-cycle settle chunk and reliably finds the true AHP
+       floor -- so short windows systematically read as spuriously small or
+       negative "sag" purely as a window-length artifact, not a real
+       measurement. Confirmed directly: mean sag by first_spike_ms bucket
+       goes from -3.2mV (0-10ms) up to +18.8mV (no spike within
+       sag_window_ms at all, i.e. the full window) -- window length alone
+       predicts the sign. 100ms keeps ~41% of a real 2500-point XB2IQX grid
+       while cutting the negative-outlier count from 472 to 18 and the worst
+       outlier from -17.3mV to -7.6mV (chosen over stricter thresholds like
+       300ms, which reach zero negative outliers but only by dropping to 6%
+       coverage -- essentially just the fully-silenced points).
+    2. A negative result (baseline - trough < 0, i.e. the test window's
+       measured trough sits ABOVE the held level's own oscillation floor) is
+       physically impossible for a real sag response -- hyperpolarizing
+       injected current cannot make V "sag upward" past where the cell
+       already goes on its own. Explicitly rejected (excluded, not
+       clamped to 0) rather than silently reported as a small negative
+       number, even after gate 1: gate 1 alone still leaves a residual few
+       (18/2500 at the 100ms threshold) points where the window-truncation
+       artifact hasn't fully resolved.
     """
     sag_map = {}
     for key, p in grid.items():
-        if p["blew_up"] or not p["hold_is_flatline"]:
+        if p["blew_up"]:
             continue
         trough = p.get("test_v_min_pre_spike_mV")
-        baseline = p["hold_v_end_mV"]
-        if trough is None or not np.isfinite(trough) or not np.isfinite(baseline):
+        baseline = p.get("hold_v_trough_mV")
+        if trough is None or baseline is None or not np.isfinite(trough) or not np.isfinite(baseline):
             continue
-        sag_map[key] = float(baseline - trough)
+        first_spike_ms = p.get("test_first_spike_ms")
+        if first_spike_ms is not None and first_spike_ms < min_pre_spike_window_ms:
+            continue
+        sag = float(baseline - trough)
+        if sag < 0:
+            continue
+        sag_map[key] = sag
     return sag_map
 
 
@@ -313,8 +364,7 @@ def extract_cell_features(cell_id: str, cell_result: dict) -> dict:
         return {**base, "status": "no_grid_data", "grid_status": "empty"}
 
     features = {**base, "status": "ok", "cell_floor_nA": cell_result["cell_floor_nA"],
-               "injected_floor_nA": cell_result["injected_floor_nA"],
-               "min_edge_nA": cell_result["run_args"]["min_edge_nA"]}
+               "injected_floor_nA": cell_result["injected_floor_nA"]}
     features.update(compute_fi_slope(grid))
     features.update(compute_burstiness(grid))
     features.update(compute_summary_stats(grid))
@@ -429,126 +479,12 @@ def run_pca(pca_input: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Figures
 # ---------------------------------------------------------------------------
-
-REBOUND_PATTERN_COLORS = {"none": "gray", "single_spike": "steelblue",
-                          "tonic_rebound": "seagreen", "bursting_rebound": "mediumpurple",
-                          "not_applicable": "lightgray"}
-
-# (map key, panel title, colormap) for every continuous map feature
-# extract_cell_features returns. rebound_occurred_map's booleans are cast to
-# 0.0/1.0 -- merging near-duplicate points (see _merge_close_points) then
-# naturally reports the local fraction that occurred, not just an on/off flag.
-CONTINUOUS_MAP_PANELS = [
-    # sag_depth_map is an absolute depth (mV below pre-spike baseline), not
-    # a signed quantity with a meaningful zero-crossing -- "coolwarm" (a
-    # diverging map) implied a center point that doesn't exist here and was
-    # a real perceptual-design mistake, not just a style choice. Sequential
-    # like every other magnitude panel below.
-    ("sag_depth_map", "sag depth (mV)", "YlGnBu"),
-    ("adaptation_ratio_map", "adaptation ratio (tonic)", "plasma"),
-    ("firing_rate_map", "firing rate (Hz)", "viridis"),
-    ("rebound_occurred_map", "rebound occurred (fraction)", "Oranges"),
-    ("rebound_count_map", "rebound spike count", "YlOrBr"),
-    ("rebound_latency_map", "rebound latency (ms)", "viridis"),
-    ("rebound_peak_mV_map", "rebound peak (mV)", "magma"),
-    ("intra_burst_rate_map", "intra-burst rate (Hz)", "cividis"),
-    ("burst_freq_approx_map", "burst freq, approx (Hz)", "cividis"),
-    ("n_bursts_map", "n bursts", "plasma"),
-    ("spikes_per_burst_map", "spikes per burst", "plasma"),
-]
-
-
-def _map_to_arrays(feature_map: dict):
-    keys = list(feature_map.keys())
-    held = np.array([k[0] for k in keys], dtype=float)
-    injected = np.array([k[1] for k in keys], dtype=float)
-    values = np.array([float(feature_map[k]) for k in keys], dtype=float)
-    return held, injected, values
-
-
-def plot_cell_features(cell_id: str, features: dict, outdir: Path, command: str, fig_format: str) -> None:
-    """One heat-map panel per map-valued feature extract_cell_features
-    returns (12 total: sag depth, adaptation ratio, firing rate, rebound
-    occurred/count/latency/peak/pattern, intra-burst rate, approx burst
-    freq, n bursts, spikes/burst) -- previously only 2 of these had any
-    panel at all. Reuses run_held_injected_grid.py's merge-then-nearest-
-    neighbor renderer (_fine_grid_coords/_render_heatmap) rather than a
-    second scatter/interpolation implementation, so these panels get the
-    same non-distorting rendering as the grid figures.
-    """
-    if features["status"] != "ok":
-        return
-
-    hh, ii = _fine_grid_coords(features["cell_floor_nA"], features["injected_floor_nA"])
-    extent = (features["cell_floor_nA"], 0, features["injected_floor_nA"], 0)
-    tolerance_nA = features["min_edge_nA"]
-
-    fig, axes = plt.subplots(3, 4, figsize=(19, 13))
-    axes_flat = axes.flat
-
-    any_data = False
-    for map_key, panel_title, cmap in CONTINUOUS_MAP_PANELS:
-        ax = next(axes_flat)
-        feature_map = features.get(map_key) or {}
-        if feature_map:
-            any_data = True
-            held, injected, values = _map_to_arrays(feature_map)
-            grid = _render_heatmap(held, injected, values, hh, ii, tolerance_nA)
-            im = ax.imshow(grid, origin="lower", extent=extent, aspect="auto", cmap=cmap,
-                           interpolation="bicubic")
-            fig.colorbar(im, ax=ax)
-        else:
-            # Blank panel (e.g. no bursting points at all for this cell) --
-            # still show the real axis extent rather than matplotlib's
-            # default [0,1] unit square, so it reads as "genuinely no data"
-            # rather than a mislabeled/confusing scale.
-            ax.set_xlim(extent[0], extent[1])
-            ax.set_ylim(extent[2], extent[3])
-        ax.set_title(panel_title, fontsize=9)
-        ax.set_xlabel("held (nA)")
-        ax.set_ylabel("injected (nA)")
-        ax.invert_xaxis()
-        ax.invert_yaxis()
-
-    # rebound_pattern_map is categorical -- mode-merge, same treatment as
-    # the grid figure's firing-pattern panel.
-    ax = next(axes_flat)
-    pattern_map = features.get("rebound_pattern_map") or {}
-    if pattern_map:
-        any_data = True
-        pattern_names = list(REBOUND_PATTERN_COLORS.keys())
-        held, injected, _ = _map_to_arrays({k: 0.0 for k in pattern_map})
-        codes = np.array([pattern_names.index(v) for v in pattern_map.values()], dtype=float)
-        pattern_grid = _render_heatmap(held, injected, codes, hh, ii, tolerance_nA, is_categorical=True)
-        pattern_cmap = ListedColormap(list(REBOUND_PATTERN_COLORS.values()))
-        pattern_norm = BoundaryNorm(np.arange(len(pattern_names) + 1) - 0.5, pattern_cmap.N)
-        pattern_rgba = pattern_cmap(pattern_norm(pattern_grid))
-        ax.imshow(pattern_rgba, origin="lower", extent=extent, aspect="auto", interpolation="bilinear")
-        handles = [plt.Line2D([0], [0], marker="s", color="w", markerfacecolor=c, markersize=8, label=lbl)
-                  for lbl, c in REBOUND_PATTERN_COLORS.items()]
-        ax.legend(handles=handles, loc="best", fontsize=5)
-    else:
-        ax.set_xlim(extent[0], extent[1])
-        ax.set_ylim(extent[2], extent[3])
-    ax.set_title("rebound pattern", fontsize=9)
-    ax.set_xlabel("held (nA)")
-    ax.set_ylabel("injected (nA)")
-    ax.invert_xaxis()
-    ax.invert_yaxis()
-
-    if not any_data:
-        plt.close(fig)
-        return
-
-    title = (f"{cell_id} — burstiness={features.get('burstiness_index')}, "
-            f"F-I slope={features.get('fi_slope_hz_per_nA')}")
-    fig.suptitle(title, fontsize=11)
-    fig.tight_layout(rect=(0.0, 0.02, 1.0, 0.96))
-    fig.text(0.5, 0.005, command, ha="center", va="bottom",
-             fontsize=6, family="monospace", color="dimgray", wrap=True)
-    outpath = outdir / f"{cell_id}_features.{fig_format}"
-    fig.savefig(outpath, format=fig_format, dpi=180)
-    plt.close(fig)
+#
+# The old plot_cell_features (12-panel) lived here; it's retired as of
+# 2026-08-11 in favor of plot_cell_grid_features (run_held_injected_grid.py),
+# one merged 14-panel figure combining this module's features with the
+# grid-only panels (firing pattern, i_H at recovery trough) that plot_
+# cell_grid used to render separately. See that function's docstring.
 
 
 def plot_pca(pca_result: dict, outdir: Path, command: str, fig_format: str) -> None:
@@ -638,8 +574,7 @@ def main() -> None:
     figures_dir = Path(args.figures_dir)
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(args.grid_cache, "rb") as handle:
-        grid_cache = pickle.load(handle)
+    grid_cache = load_grid_cache(Path(args.grid_cache))
 
     cell_ids = args.cells or sorted(grid_cache.keys())
     print(f"Extracting features for {len(cell_ids)} of {len(grid_cache)} cell(s) from {args.grid_cache}")
@@ -667,7 +602,10 @@ def main() -> None:
         output_cache[cell_id] = features
         status_counts[features["status"]] = status_counts.get(features["status"], 0) + 1
         if not args.no_plot:
-            plot_cell_features(cell_id, features, figures_dir, command, args.figure_format)
+            cell_result = grid_cache.get(cell_id)
+            if cell_result is not None:
+                plot_cell_grid_features(cell_result, features, figures_dir, command,
+                                        fig_format=args.figure_format)
         save_output_cache(output_cache, output_cache_path)
         n_done += 1
         print(f"  [{n_done}/{len(cell_ids)}] {cell_id}: {features['status']}")
