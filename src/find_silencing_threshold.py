@@ -231,20 +231,32 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     even one interval needs 2 spikes). n_peaks=None keeps the old
     "insufficient_data" label for call sites that don't have a spike count
     handy.
+
+    Every return also carries a "diagnostics" key -- None wherever no KDE
+    was ever evaluated (too few ISIs, degenerate/trivial ISI spread, or a
+    failed KDE fit), otherwise a dict of the intermediate log-ISI KDE curve,
+    mode locations, and valley split point behind this call, including for
+    every "tonic" rejection reached after the KDE ran (ratio-test and
+    spikes-per-burst-test rejections included). Purely additive -- existing
+    callers that only read "pattern"/"isi_short_ms"/etc. are unaffected --
+    and exists so a caller (see src/trace_annotations.py) can plot exactly
+    why a borderline point was or wasn't called bursting, including the
+    near-miss rejections (e.g. the VC08B6 case documented below) that are
+    otherwise invisible outside this function.
     """
     n = len(isis_ms)
     if n < min_isis_for_burst_test:
         pattern = "insufficient_data" if not n_peaks else "sparse"
         return {"pattern": pattern, "isi_short_ms": None,
                 "isi_long_ms": None, "n_isis": n, "bimodality_metric": None,
-                "n_long_isis": None}
+                "n_long_isis": None, "diagnostics": None}
 
     log_isi = np.log10(isis_ms)
     if np.ptp(log_isi) < 1e-6:
         # All ISIs effectively identical -- trivially unimodal/tonic.
         return {"pattern": "tonic", "isi_short_ms": float(np.mean(isis_ms)),
                 "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0,
-                "n_long_isis": None}
+                "n_long_isis": None, "diagnostics": None}
 
     # Pad the evaluation grid past [min, max]: a mode sitting at or near a
     # data extreme (very common here -- the short-ISI cluster starts right
@@ -256,33 +268,39 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     except np.linalg.LinAlgError:
         return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
                 "isi_long_ms": None, "n_isis": n, "bimodality_metric": None,
-                "n_long_isis": None}
+                "n_long_isis": None, "diagnostics": None}
 
     pad = 0.15 * np.ptp(log_isi)
     grid = np.linspace(log_isi.min() - pad, log_isi.max() + pad, 200)
     density = kde(grid)
     peaks, _ = find_peaks(density, prominence=density.max() * isi_mode_prominence_frac)
+    diagnostics = {"log_isi_grid": grid, "density": density, "candidate_mode_idx": peaks,
+                  "isi_mode_prominence_frac": isi_mode_prominence_frac}
 
     if len(peaks) < 2:
         return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
                 "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0,
-                "n_long_isis": None}
+                "n_long_isis": None, "diagnostics": diagnostics}
 
     # Keep the two tallest candidate modes; split at the valley between them.
     top2 = peaks[np.argsort(density[peaks])[-2:]]
     mode_lo, mode_hi = sorted(top2)
     valley_idx = mode_lo + int(np.argmin(density[mode_lo:mode_hi + 1]))
     split_log_isi = grid[valley_idx]
+    diagnostics.update({"mode_lo_log_isi": float(grid[mode_lo]), "mode_hi_log_isi": float(grid[mode_hi]),
+                        "split_log_isi": float(split_log_isi)})
 
     short_mask = log_isi <= split_log_isi
     long_mask = ~short_mask
     if not short_mask.any() or not long_mask.any():
         return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
                 "isi_long_ms": None, "n_isis": n, "bimodality_metric": None,
-                "n_long_isis": None}
+                "n_long_isis": None, "diagnostics": diagnostics}
 
     isi_short_ms = float(np.mean(isis_ms[short_mask]))
     isi_long_ms = float(np.mean(isis_ms[long_mask]))
+    diagnostics.update({"isi_short_ms": isi_short_ms, "isi_long_ms": isi_long_ms,
+                        "min_isi_ratio": min_isi_ratio, "short_mask": short_mask})
 
     # A KDE peak count of 2 is not, by itself, reliable evidence of two
     # genuinely distinct timescales -- with a modest, discretized (fixed-dt)
@@ -296,7 +314,7 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     if isi_long_ms / isi_short_ms < min_isi_ratio:
         return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
                 "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0,
-                "n_long_isis": None}
+                "n_long_isis": None, "diagnostics": diagnostics}
 
     # A burst is defined by >=2 spikes in rapid succession, not by ISI
     # timescale alone -- confirmed directly this matters: a real VC08B6
@@ -327,10 +345,11 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     # well above the confirmed-spurious VC08B6 case (~1.29-1.34).
     n_long = int(long_mask.sum())
     avg_spikes_per_burst = (n + 1) / (n_long + 1)
+    diagnostics["avg_spikes_per_burst"] = avg_spikes_per_burst
     if avg_spikes_per_burst < min_spikes_per_burst:
         return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
                 "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0,
-                "n_long_isis": None}
+                "n_long_isis": None, "diagnostics": diagnostics}
 
     # Ashman's D: separation of two Gaussians in units of pooled SD. D > 2 is
     # a common rule of thumb for "cleanly" bimodal -- stored for transparency,
@@ -344,9 +363,10 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     # "burst" is a maximal run of consecutive short ISIs, so there are
     # exactly n_long_isis + 1 bursts, and (n_isis + 1) / (n_long_isis + 1)
     # is the average spikes-per-burst (see run_held_injected_grid.py).
+    diagnostics["ashman_d"] = float(ashman_d)
     return {"pattern": "bursting", "isi_short_ms": isi_short_ms,
             "isi_long_ms": isi_long_ms, "n_isis": n, "bimodality_metric": float(ashman_d),
-            "n_long_isis": int(long_mask.sum())}
+            "n_long_isis": int(long_mask.sum()), "diagnostics": diagnostics}
 
 
 def to_stored_pattern(pattern: str) -> str:
