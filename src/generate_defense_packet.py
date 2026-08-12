@@ -26,7 +26,7 @@ ROOT_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from steady_state_cache import get_cached_state, CACHE_PATH as DEFAULT_STEADY_STATE_CACHE_PATH
-from plot_example_traces import resimulate_point
+from plot_example_traces import resimulate_point, select_exemplar_points
 from find_silencing_threshold import (compute_isis_ms, classify_burst_pattern, count_spikes_and_rate,
                                       PROMINENCE_FRACTION, detect_spikes_dvdt_confirmed, FLATLINE_MV)
 from extract_grid_features import (DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_GRID_FEATURES_CACHE_PATH,
@@ -61,7 +61,20 @@ def _place_caption_below(fig, ax, caption: str, width: int = 60, fontsize: float
              ha="center", va="top", fontsize=fontsize, transform=fig.transFigure)
 
 
-def _save_page(fig, pdf: PdfPages, png_dir: Path, name: str) -> None:
+def _save_page(fig, pdf: PdfPages, png_dir: Path, name: str, command: str, source: str) -> None:
+    """Stamps two provenance lines on every page before saving, matching
+    every other figure-generating script in this repo (run_held_injected_
+    grid.py, extract_grid_features.py, consolidate_features.py, cluster_
+    features.py, plot_example_traces.py all embed the exact command that
+    produced the figure) -- generate_defense_packet.py was the one script
+    in the pipeline that didn't, which matters more here than anywhere
+    else: a PI defense packet whose own figures can't be traced back to
+    the command and cache that produced them undercuts its own point.
+    Bottom-left, not the bottom-center every caption already occupies, so
+    the two never collide regardless of a given page's own layout.
+    """
+    fig.text(0.005, 0.005, f"{command}\nsource: {source}", ha="left", va="bottom",
+             fontsize=5, family="monospace", color="dimgray")
     pdf.savefig(fig)
     fig.savefig(png_dir / f"{name}.png", dpi=150)
     plt.close(fig)
@@ -99,12 +112,81 @@ def make_cover_page(cell_id: str, cell_result: dict, features: dict, sections: l
 
     fig.text(0.08, 0.53, "Contents:", fontsize=11, va="top", weight="bold")
     y = 0.49
-    step = 0.47 / len(sections)
+    # 0.41, not the full 0.47 down to y=0.02: reserves room above the
+    # provenance footer _save_page stamps at y=0.005 on every page
+    # (including this one) -- confirmed directly that the previous 0.47
+    # span let an 11-section list's last entry visually collide with it.
+    step = 0.41 / len(sections)
     for i, (title, desc) in enumerate(sections, start=1):
         fig.text(0.10, y, f"{i}. {title}", fontsize=9.5, va="top", weight="bold")
         fig.text(0.14, y - 0.018, _wrap(desc, width=95), fontsize=7.5, va="top", color="dimgray")
         y -= step
 
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Representative traces
+# ---------------------------------------------------------------------------
+
+def make_representative_traces_page(cell_id, cell_result, resim) -> plt.Figure:
+    """One compact trace per distinct (test_pattern, rebound_pattern)
+    combination actually present in this cell's grid -- the same selection
+    plot_example_traces.py uses for its own standalone per-combination
+    figures (select_exemplar_points, most-prominent point per combination
+    via _prominence_score), just laid out here as a single overview page
+    instead of one file per combination. "Representative" means "actually
+    observed across the full grid," not hand-picked to look illustrative.
+    """
+    exemplars = select_exemplar_points(cell_result["grid"])
+    combos = sorted(exemplars.keys())
+    n = len(combos)
+    ncols = min(5, n) or 1
+    nrows = -(-n // ncols) if n else 1
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.4 * ncols, 3.6 * nrows), squeeze=False)
+    axes_flat = list(axes.flat)
+
+    for ax, combo in zip(axes_flat, combos):
+        test_pattern, rebound_pattern = combo
+        held_nA, injected_nA = exemplars[combo][0]
+        tr = resim(held_nA, injected_nA)
+        if tr.get("blew_up"):
+            ax.text(0.5, 0.5, "resim failed", ha="center", va="center", transform=ax.transAxes, fontsize=8)
+            ax.set_title(f"{test_pattern} / {rebound_pattern}", fontsize=7.5)
+            continue
+
+        t_hold, v_hold = tr["_trace_t_hold_ms"], tr["_trace_v_hold_mV"]
+        t_test, v_test = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
+        t_rec, v_rec = tr["_trace_t_rec_ms"], tr["_trace_v_rec_mV"]
+        dt_ms = t_hold[1] - t_hold[0] if len(t_hold) > 1 else 0.1
+        hold_end = t_hold[-1] + dt_ms if len(t_hold) else 0.0
+        t_test_off = t_test + hold_end
+        test_end = t_test_off[-1] + dt_ms if len(t_test_off) else hold_end
+        t_rec_off = t_rec + test_end
+
+        ax.plot(t_hold, v_hold, color="gray", lw=0.6)
+        ax.plot(t_test_off, v_test, color="firebrick", lw=0.6)
+        ax.plot(t_rec_off, v_rec, color="steelblue", lw=0.6)
+        ax.axvline(hold_end, color="black", ls=":", lw=0.6)
+        ax.axvline(test_end, color="black", ls=":", lw=0.6)
+        ax.set_title(f"{test_pattern} / {rebound_pattern}\nheld={held_nA:.2f} inj={injected_nA:.2f}",
+                    fontsize=7.5)
+        ax.tick_params(labelsize=6)
+
+    for ax in axes_flat[n:]:
+        ax.axis("off")
+
+    caption = _wrap(
+       "One representative trace per distinct (test-window pattern, rebound pattern) combination "
+       f"actually present across this cell's full {cell_result['n_points_total']}-point held x injected "
+       "grid: gray = held baseline, red = test window (injected current), blue = recovery window "
+       "(released back to held). Chosen by the same selection plot_example_traces.py uses for its own "
+       "per-combination figures (most-prominent point, see that script's _prominence_score) -- this is "
+       "what the cell actually does at each combination, not a hand-picked illustration.", width=175)
+    fig.text(0.5, 0.005, caption, ha="center", va="bottom", fontsize=7.5)
+    fig.suptitle("1. Representative traces", fontsize=13, weight="bold")
+    fig.tight_layout(rect=(0, 0.05, 1, 0.93))
     return fig
 
 
@@ -127,7 +209,7 @@ def make_spike_detection_page(cell_id, held_inj_pairs, resim) -> plt.Figure:
         ax.legend(loc="upper right", fontsize=7)
         ax.set_xlabel("time (ms)")
         captions.append((ax, caption))
-    fig.suptitle("1. Spike detection", fontsize=13, weight="bold")
+    fig.suptitle("2. Spike detection", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.02, 1, 0.94))
     fig.subplots_adjust(hspace=0.9)
     for ax, caption in captions:
@@ -166,7 +248,7 @@ def make_prominence_sensitivity_page(cell_id, held_inj_pairs, resim) -> plt.Figu
        "pick.", width=105)
     fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
     fig.tight_layout(rect=(0, 0.14, 1, 1))
-    fig.suptitle("2. Prominence-threshold sensitivity", fontsize=13, weight="bold", y=1.0)
+    fig.suptitle("3. Prominence-threshold sensitivity", fontsize=13, weight="bold", y=1.0)
     return fig
 
 
@@ -219,7 +301,7 @@ def make_dvdt_crossvalidation_page(cell_id, grid, resim, dt_ms, n_sample=20, see
        "pipeline). Agreement close to 100% means the simpler production detector isn't missing a shape "
        "check that changes the answer.", width=115)
     fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
-    fig.suptitle("3. dV/dt cross-validation (unused-in-production detector as a sanity check)",
+    fig.suptitle("4. dV/dt cross-validation (unused-in-production detector as a sanity check)",
                fontsize=12, weight="bold")
     fig.tight_layout(rect=(0, 0.12, 1, 0.93))
     return fig
@@ -247,7 +329,7 @@ def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.F
         ax_isi.set_title(f"{tag}: held={held_nA:.2f} inj={injected_nA:.2f} -> '{result['pattern']}'",
                         fontsize=9)
         captions.append((ax_isi, caption))
-    fig.suptitle("4. Tonic / bursting / silent classification", fontsize=13, weight="bold")
+    fig.suptitle("5. Tonic / bursting / silent classification", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.02, 1, 0.95))
     fig.subplots_adjust(hspace=0.9)
     for ax_isi, caption in captions:
@@ -273,7 +355,7 @@ def make_rebound_page(cell_id, exemplars, resim, rebound_latency_min_ms) -> plt.
         ax.legend(loc="upper right", fontsize=7)
         ax.set_xlabel("time since release (ms)")
         captions.append((ax, caption))
-    fig.suptitle("5. Rebound (post-inhibitory) detection", fontsize=13, weight="bold")
+    fig.suptitle("6. Rebound (post-inhibitory) detection", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.02, 1, 0.94))
     fig.subplots_adjust(hspace=0.9)
     for ax, caption in captions:
@@ -301,7 +383,7 @@ def make_sag_page(cell_id, exemplars, resim, sag_window_ms) -> plt.Figure:
         ax.set_ylabel("V (mV)")
         ax.legend(loc="upper right", fontsize=6.5)
         captions.append((ax, caption))
-    fig.suptitle("6. Sag depth", fontsize=13, weight="bold")
+    fig.suptitle("7. Sag depth", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.22, 1, 0.90))
     for ax, caption in captions:
         _place_caption_below(fig, ax, caption, width=55)
@@ -327,7 +409,7 @@ def make_adaptation_page(cell_id, exemplars, resim, adaptation_edge_n) -> plt.Fi
         ax.set_xlabel("ISI index")
         ax.set_ylabel("ISI (ms)")
         captions.append((ax, caption))
-    fig.suptitle("7. Adaptation ratio", fontsize=13, weight="bold")
+    fig.suptitle("8. Adaptation ratio", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.22, 1, 0.90))
     for ax, caption in captions:
         _place_caption_below(fig, ax, caption, width=55)
@@ -367,7 +449,7 @@ def make_fi_slope_page(cell_id, grid, features) -> plt.Figure:
        "feature table; this is simply the first time it's been plotted against the data it was fit to.",
        width=110)
     fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
-    fig.suptitle("8. Firing rate / F-I slope", fontsize=13, weight="bold")
+    fig.suptitle("9. Firing rate / F-I slope", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.12, 1, 0.93))
     return fig
 
@@ -424,7 +506,7 @@ def make_self_consistency_page(cell_id, cell_result, resim, n_sample=40, seed=11
        "used can land on a different classification near a boundary. Any mismatches here are "
        "consistent with that known property, not a new bug.", width=115)
     fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
-    fig.suptitle("9. Self-consistency check", fontsize=13, weight="bold")
+    fig.suptitle("10. Self-consistency check", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.22, 1, 0.93))
     return fig
 
@@ -466,7 +548,7 @@ def make_onset_burst_page(cell_id, exemplars, resim, run_args) -> plt.Figure:
         ax_v.set_ylabel("V (mV)")
         ax_v.legend(loc="upper right", fontsize=6)
         captions.append((ax_v, caption))
-    fig.suptitle("10. Burst-onset-then-silence detection", fontsize=13, weight="bold")
+    fig.suptitle("11. Burst-onset-then-silence detection", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.02, 1, 0.94))
     fig.subplots_adjust(hspace=1.0)
     for ax_v, caption in captions:
@@ -529,6 +611,8 @@ def build_packet(cell_id: str, args) -> None:
                        (-3.765306, -3.367347, "burst then sustained")]
 
     sections = [
+        ("Representative traces", "One trace per distinct pattern/rebound combination actually "
+         "observed in this cell's grid."),
         ("Spike detection", "Every detected peak overlaid on real traces."),
         ("Prominence-threshold sensitivity", "How stable spike counts are across a range of thresholds."),
         ("dV/dt cross-validation", "Independent detector cross-check across a random sample."),
@@ -548,26 +632,44 @@ def build_packet(cell_id: str, args) -> None:
     png_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = outdir / f"{cell_id}_defense_packet.pdf"
 
+    # Every page's footer names exactly which cache(s) and which production
+    # function(s) its evidence traces back to -- see _save_page's docstring
+    # for why this packet specifically needs it spelled out per page, not
+    # just once in the cover page's prose.
+    command = "python " + " ".join(sys.argv)
+    grid_cache_name = Path(args.grid_cache).name
+    grid_features_cache_name = Path(args.grid_features_cache).name
+
+    def save(fig, name, source):
+        _save_page(fig, pdf, png_dir, name, command, f"{grid_cache_name} -> {source}")
+
     with PdfPages(pdf_path) as pdf:
-        _save_page(make_cover_page(cell_id, cell_result, features, sections), pdf, png_dir, "00_cover")
-        _save_page(make_spike_detection_page(cell_id, spike_pts, resim), pdf, png_dir, "01_spike_detection")
-        _save_page(make_prominence_sensitivity_page(cell_id, spike_pts, resim), pdf, png_dir,
-                  "02_prominence_sensitivity")
-        _save_page(make_dvdt_crossvalidation_page(cell_id, grid, resim, dt_ms), pdf, png_dir,
-                  "03_dvdt_crossvalidation")
-        _save_page(make_burst_classification_page(cell_id, burst_exemplars, resim, run_args), pdf, png_dir,
-                  "04_burst_classification")
-        _save_page(make_rebound_page(cell_id, rebound_exemplars, resim, run_args["rebound_latency_min_ms"]),
-                  pdf, png_dir, "05_rebound_detection")
-        _save_page(make_sag_page(cell_id, sag_exemplars, resim, run_args["sag_window_ms"]), pdf, png_dir,
-                  "06_sag_depth")
-        _save_page(make_adaptation_page(cell_id, adapt_exemplars, resim, run_args["adaptation_edge_n"]),
-                  pdf, png_dir, "07_adaptation_ratio")
-        _save_page(make_fi_slope_page(cell_id, grid, features), pdf, png_dir, "08_fi_slope")
-        _save_page(make_self_consistency_page(cell_id, cell_result, resim), pdf, png_dir,
-                  "09_self_consistency")
-        _save_page(make_onset_burst_page(cell_id, onset_exemplars, resim, run_args), pdf, png_dir,
-                  "10_onset_burst_detection")
+        _save_page(make_cover_page(cell_id, cell_result, features, sections), pdf, png_dir, "00_cover",
+                  command, f"{grid_cache_name} + {grid_features_cache_name}")
+        save(make_representative_traces_page(cell_id, cell_result, resim), "01_representative_traces",
+            "plot_example_traces.select_exemplar_points() + resimulate_point()")
+        save(make_spike_detection_page(cell_id, spike_pts, resim), "02_spike_detection",
+            "resimulate_point() -> trace_annotations.mark_spikes() (scipy.signal.find_peaks, same call "
+            "find_silencing_threshold.compute_isis_ms uses)")
+        save(make_prominence_sensitivity_page(cell_id, spike_pts, resim), "03_prominence_sensitivity",
+            "resimulate_point() -> scipy.signal.find_peaks swept over PROMINENCE_FRACTION")
+        save(make_dvdt_crossvalidation_page(cell_id, grid, resim, dt_ms), "04_dvdt_crossvalidation",
+            "resimulate_point() -> find_silencing_threshold.detect_spikes_dvdt_confirmed()")
+        save(make_burst_classification_page(cell_id, burst_exemplars, resim, run_args),
+            "05_burst_classification", "resimulate_point() -> find_silencing_threshold.classify_burst_pattern()")
+        save(make_rebound_page(cell_id, rebound_exemplars, resim, run_args["rebound_latency_min_ms"]),
+            "06_rebound_detection", "resimulate_point() -> trace_annotations.mark_rebound_window() "
+            "(reproduces run_held_injected_grid.run_test_and_recovery's rebound-peak logic)")
+        save(make_sag_page(cell_id, sag_exemplars, resim, run_args["sag_window_ms"]), "07_sag_depth",
+            "resimulate_point() -> run_held_injected_grid.compute_pre_spike_sag_trough()")
+        save(make_adaptation_page(cell_id, adapt_exemplars, resim, run_args["adaptation_edge_n"]),
+            "08_adaptation_ratio", "resimulate_point() -> run_held_injected_grid.compute_adaptation_ratio()")
+        save(make_fi_slope_page(cell_id, grid, features), "09_fi_slope",
+            f"{grid_features_cache_name} (extract_grid_features.compute_fi_slope())")
+        save(make_self_consistency_page(cell_id, cell_result, resim), "10_self_consistency",
+            "cached test_pattern/rebound_pattern vs. fresh resimulate_point() results")
+        save(make_onset_burst_page(cell_id, onset_exemplars, resim, run_args), "11_onset_burst_detection",
+            "resimulate_point() -> run_held_injected_grid.detect_onset_burst()")
 
     print(f"{cell_id}: wrote {pdf_path} and {len(sections) + 1} section PNGs to {png_dir}/")
 
