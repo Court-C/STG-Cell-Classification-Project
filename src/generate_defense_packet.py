@@ -28,7 +28,8 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from steady_state_cache import get_cached_state, CACHE_PATH as DEFAULT_STEADY_STATE_CACHE_PATH
 from plot_example_traces import resimulate_point, select_exemplar_points
 from find_silencing_threshold import (compute_isis_ms, classify_burst_pattern, count_spikes_and_rate,
-                                      PROMINENCE_FRACTION, detect_spikes_dvdt_confirmed, FLATLINE_MV)
+                                      PROMINENCE_FRACTION, detect_spikes_dvdt_confirmed, FLATLINE_MV,
+                                      MIN_SPIKE_AMPLITUDE_MV)
 from extract_grid_features import (DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_GRID_FEATURES_CACHE_PATH,
                                    compute_fi_slope)
 from run_held_injected_grid import DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_GRID_CACHE_PATH
@@ -230,7 +231,11 @@ def make_prominence_sensitivity_page(cell_id, held_inj_pairs, resim) -> plt.Figu
             if v_range < FLATLINE_MV:
                 counts.append(0)
                 continue
-            peaks, _ = find_peaks(v, prominence=v_range * frac)
+            # max(..., MIN_SPIKE_AMPLITUDE_MV), matching _spike_prominence --
+            # this sweep has to apply the same absolute floor production
+            # does, or it would show the pre-fix, floor-less sensitivity
+            # curve instead of what the pipeline actually computes now.
+            peaks, _ = find_peaks(v, prominence=max(v_range * frac, MIN_SPIKE_AMPLITUDE_MV))
             counts.append(len(peaks))
         ax.plot(fractions, counts, marker="o", markersize=4, label=f"{tag} (held={held_nA:.2f})")
     ax.axvline(PROMINENCE_FRACTION, color="gray", ls="--", lw=1.2,
@@ -242,10 +247,12 @@ def make_prominence_sensitivity_page(cell_id, held_inj_pairs, resim) -> plt.Figu
     caption = _wrap(
        "PROMINENCE_FRACTION=0.3 is the single most load-bearing, least-independently-calibrated "
        "constant in the pipeline -- every spike count, ISI, and burst/tonic call across the codebase "
-       "traces back to one find_peaks(..., prominence=range*0.3) call. This sweeps that threshold from "
-       "0.10 to 0.55 on real traces: a flat plateau around the production value means the spike count "
-       "this pipeline reports is not sensitive to the exact threshold chosen, not an arbitrary cliff-edge "
-       "pick.", width=105)
+       f"traces back to one find_peaks(..., prominence=max(range*0.3, {MIN_SPIKE_AMPLITUDE_MV:.0f}mV)) "
+       "call (the absolute floor added 2026-08-13, see section 1's representative traces for why). This "
+       "sweeps the fraction from 0.10 to 0.55 on real, large-amplitude spiking traces (the floor rarely "
+       "binds here, since these traces' own range x0.3 already exceeds it) -- a flat plateau around the "
+       "production value means the spike count this pipeline reports is not sensitive to the exact "
+       "fraction chosen, not an arbitrary cliff-edge pick.", width=105)
     fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
     fig.tight_layout(rect=(0, 0.14, 1, 1))
     fig.suptitle("3. Prominence-threshold sensitivity", fontsize=13, weight="bold", y=1.0)
@@ -582,7 +589,15 @@ def build_packet(cell_id: str, args) -> None:
 
     spike_pts = [(-2.892861, -2.958704, "near-boundary bursting"), (-3.093754, -3.535713, "tonic")]
     burst_exemplars = [(-3.21429, -3.363838, "clean bursting"), (-2.892861, -2.958704, "near-miss boundary")]
-    rebound_exemplars = [(-3.857148, -3.92857, "single_spike"), (-0.321429, -3.535713, "tonic_rebound")]
+    # -4.040816/-4.377551 replaces the packet's original single_spike
+    # exemplar (-3.857148, -3.92857): confirmed 2026-08-13 that the original
+    # point was ITSELF one of the subthreshold false positives the
+    # MIN_SPIKE_AMPLITUDE_MV fix this packet's section 1/6 now defends was
+    # added to reject -- resimulating it post-fix shows rebound_occurred=
+    # False, not "single_spike". After the fix XB2IQX has exactly one
+    # genuine single_spike rebound point left in its whole grid; this is it
+    # (48.6mV amplitude, confirmed stable under resimulation).
+    rebound_exemplars = [(-4.040816, -4.377551, "single_spike"), (-0.321429, -3.535713, "tonic_rebound")]
     sag_exemplars = [(-3.535719, -5.5, "silent, deep sag")]
     # -3.765306/-3.367347 replaces the packet's original adaptation-ratio
     # exemplar (-3.093754, -3.535713): confirmed 2026-08-13 that the

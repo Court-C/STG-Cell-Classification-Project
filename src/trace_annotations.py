@@ -24,7 +24,8 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from find_silencing_threshold import (count_spikes_and_rate, PROMINENCE_FRACTION, FLATLINE_MV,
                                       detect_spikes_dvdt_confirmed, DEFAULT_DVDT_THRESHOLD_MV_PER_MS,
-                                      DEFAULT_MIN_PRE_SPIKE_MS, compute_isis_ms, classify_burst_pattern)
+                                      DEFAULT_MIN_PRE_SPIKE_MS, compute_isis_ms, classify_burst_pattern,
+                                      MIN_SPIKE_AMPLITUDE_MV, _spike_prominence)
 from run_held_injected_grid import (compute_pre_spike_sag_trough, compute_adaptation_ratio,
                                     detect_onset_burst)
 
@@ -32,10 +33,11 @@ from run_held_injected_grid import (compute_pre_spike_sag_trough, compute_adapta
 def mark_spikes(ax, t_ms: np.ndarray, v_mV: np.ndarray, color: str = "black",
                 marker: str = "v", label: str = "detected spike") -> tuple:
     """Overlays the exact peaks `count_spikes_and_rate`/`compute_isis_ms`
-    detect (scipy.signal.find_peaks with prominence = PROMINENCE_FRACTION
-    of this trace's own V range) as markers just above each spike, so a
-    reader can visually check the detector fired on every real upstroke and
-    nothing else.
+    detect (scipy.signal.find_peaks with prominence = max(PROMINENCE_FRACTION
+    of this trace's own V range, MIN_SPIKE_AMPLITUDE_MV) -- see
+    _spike_prominence) as markers just above each spike, so a reader can
+    visually check the detector fired on every real upstroke and nothing
+    else.
     """
     v_range = v_mV.max() - v_mV.min()
     if v_range < FLATLINE_MV:
@@ -45,16 +47,22 @@ def mark_spikes(ax, t_ms: np.ndarray, v_mV: np.ndarray, color: str = "black",
         return np.array([], dtype=int), caption
 
     from scipy.signal import find_peaks
-    peaks, _ = find_peaks(v_mV, prominence=v_range * PROMINENCE_FRACTION)
+    prominence = _spike_prominence(v_range, PROMINENCE_FRACTION)
+    peaks, _ = find_peaks(v_mV, prominence=prominence)
     if len(peaks) > 0:
         ax.plot(t_ms[peaks], v_mV[peaks] + 0.05 * v_range, linestyle="none",
                marker=marker, color=color, markersize=6, zorder=5, label=label)
 
+    floor_active = prominence > v_range * PROMINENCE_FRACTION
     caption = (f"Markers show every peak scipy.signal.find_peaks detects at "
-              f"prominence = {PROMINENCE_FRACTION:.2f} x this trace's own voltage range "
-              f"({v_range:.1f} mV) -- the exact call count_spikes_and_rate/compute_isis_ms use "
-              f"for every spike count, ISI, and burst/tonic classification in the pipeline. "
-              f"{len(peaks)} spike(s) detected in this window.")
+              f"prominence >= {prominence:.1f} mV ("
+              + (f"the {MIN_SPIKE_AMPLITUDE_MV:.0f}mV absolute floor, since "
+                 f"{PROMINENCE_FRACTION:.2f}x this trace's own {v_range:.1f}mV range would be smaller"
+                 if floor_active else
+                 f"{PROMINENCE_FRACTION:.2f}x this trace's own {v_range:.1f}mV range")
+              + f") -- the exact call count_spikes_and_rate/compute_isis_ms use for every spike count, "
+              f"ISI, and burst/tonic classification in the pipeline. {len(peaks)} spike(s) detected "
+              "in this window.")
     return peaks, caption
 
 
@@ -229,7 +237,7 @@ def mark_rebound_window(ax, t_rec: np.ndarray, v_rec: np.ndarray, rebound_latenc
         caption = f"No peaks in recovery window (range {v_range:.2f} mV, below FLATLINE_MV={FLATLINE_MV})."
         return {"rebound_occurred": False, "rebound_spike_count": 0}, caption
 
-    peaks, _ = find_peaks(v_rec, prominence=v_range * PROMINENCE_FRACTION)
+    peaks, _ = find_peaks(v_rec, prominence=_spike_prominence(v_range, PROMINENCE_FRACTION))
     peak_times_ms = t_rec[peaks] - t_rec[0]
     qualifying = peaks[peak_times_ms >= rebound_latency_min_ms]
     non_qualifying = peaks[peak_times_ms < rebound_latency_min_ms]

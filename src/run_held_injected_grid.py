@@ -79,7 +79,7 @@ from find_silencing_threshold import (constant_iapp_func, count_spikes_and_rate,
                                       compute_isis_ms, classify_burst_pattern,
                                       to_stored_pattern,
                                       settle_at_level, _round_level,
-                                      PROMINENCE_FRACTION, FLATLINE_MV,
+                                      PROMINENCE_FRACTION, FLATLINE_MV, _spike_prominence,
                                       DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_SILENCING_CACHE_PATH)
 
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_held_injected_grid.pkl"
@@ -202,7 +202,7 @@ def compute_pre_spike_sag_trough(v_test, t_test, sag_window_ms: float,
     v_range = v_test.max() - v_test.min()
     first_spike_ms = None
     if v_range >= FLATLINE_MV:
-        peaks, _ = find_peaks(v_test, prominence=v_range * PROMINENCE_FRACTION)
+        peaks, _ = find_peaks(v_test, prominence=_spike_prominence(v_range, PROMINENCE_FRACTION))
         if len(peaks) > 0:
             peak_times_ms = t_test[peaks]
             qualifying = peak_times_ms[peak_times_ms >= spike_dead_zone_ms]
@@ -483,7 +483,8 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
         if v_rec.max() - v_rec.min() < FLATLINE_MV:
             peak_times_ms = np.array([])
         else:
-            peaks, _ = find_peaks(v_rec, prominence=(v_rec.max() - v_rec.min()) * PROMINENCE_FRACTION)
+            peaks, _ = find_peaks(v_rec, prominence=_spike_prominence(v_rec.max() - v_rec.min(),
+                                                                       PROMINENCE_FRACTION))
             peak_times_ms = t_rec[peaks]
 
         qualifying = peak_times_ms[peak_times_ms >= rebound_latency_min_ms]

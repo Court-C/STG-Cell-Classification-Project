@@ -83,6 +83,30 @@ V_INDEX = 0
 PROMINENCE_FRACTION = 0.3
 FLATLINE_MV = 1.0
 
+# A peak's find_peaks prominence must clear this ABSOLUTE floor (mV), not
+# just PROMINENCE_FRACTION of the trace's own min-max range, before counting
+# as a spike. Confirmed necessary (2026-08-13) on a real XB2IQX rebound
+# point (held=-4.50/inj=-4.38): the recovery-window trace only spans 2.68mV
+# total, so a ~1mV subthreshold wobble cleared PROMINENCE_FRACTION*2.68mV
+# =~0.8mV and got counted as a "rebound spike" -- nowhere near this model's
+# real spike amplitude. Checked against every rebound-occurred point in
+# XB2IQX's grid (rebound_peak_mV - recovery_v_min_mV as an amplitude proxy):
+# the distribution is cleanly bimodal, genuine spikes at 48-76mV, false
+# positives at 1-10mV, nothing in between -- 15.0 sits in that gap with wide
+# margin on both sides, so this can't clip a real spike's prominence while
+# still catching the subthreshold false positives.
+MIN_SPIKE_AMPLITUDE_MV = 15.0
+
+
+def _spike_prominence(voltage_range_mV: float, prominence_fraction: float) -> float:
+    """The prominence floor every spike-detection find_peaks call in this
+    project should use: PROMINENCE_FRACTION of the trace's own range, OR
+    MIN_SPIKE_AMPLITUDE_MV, whichever is larger -- so a trace confined to a
+    narrow subthreshold band can no longer have a small wobble read as
+    "prominent" purely because the trace's own range is even smaller.
+    """
+    return max(voltage_range_mV * prominence_fraction, MIN_SPIKE_AMPLITUDE_MV)
+
 
 def constant_iapp_func(level_nA: float):
     return lambda t_ms: level_nA
@@ -114,7 +138,8 @@ def count_spikes_and_rate(voltage: np.ndarray, duration_ms: float,
     """
     if voltage.max() - voltage.min() < FLATLINE_MV:
         return 0.0, 0, True
-    peaks, _ = find_peaks(voltage, prominence=(voltage.max() - voltage.min()) * PROMINENCE_FRACTION)
+    peaks, _ = find_peaks(voltage, prominence=_spike_prominence(voltage.max() - voltage.min(),
+                                                                PROMINENCE_FRACTION))
     if len(peaks) < min_peaks_for_rate:
         return 0.0, len(peaks), False
     freq_hz = 1000.0 * len(peaks) / duration_ms
@@ -133,7 +158,8 @@ def compute_isis_ms(voltage: np.ndarray, t_ms: np.ndarray,
     """
     if voltage.max() - voltage.min() < FLATLINE_MV:
         return np.array([]), 0
-    peaks, _ = find_peaks(voltage, prominence=(voltage.max() - voltage.min()) * prominence_fraction)
+    peaks, _ = find_peaks(voltage, prominence=_spike_prominence(voltage.max() - voltage.min(),
+                                                                prominence_fraction))
     if len(peaks) < 2:
         return np.array([]), len(peaks)
     return np.diff(t_ms[peaks]), len(peaks)
@@ -181,7 +207,7 @@ def detect_spikes_dvdt_confirmed(v: np.ndarray, t_ms: np.ndarray, dt_ms: float,
     """
     if v.max() - v.min() < flatline_mv:
         return np.array([], dtype=int), np.array([], dtype=int)
-    candidates, _ = find_peaks(v, prominence=(v.max() - v.min()) * prominence_fraction)
+    candidates, _ = find_peaks(v, prominence=_spike_prominence(v.max() - v.min(), prominence_fraction))
     if len(candidates) == 0:
         return np.array([], dtype=int), np.array([], dtype=int)
 
