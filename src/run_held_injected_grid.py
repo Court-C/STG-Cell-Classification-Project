@@ -472,7 +472,21 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
     # detects "did the cell fire at all" (confirmed empirically: every
     # non-silenced coarse point showed rebound_occurred=True before this
     # gate was added, including the held=0/injected=0 unperturbed control).
+    #
+    # hold_freq_hz == 0, not just the ratio clause (2026-08-13): a held
+    # level the cell doesn't sustain ANY firing at on its own is exactly
+    # the kind of baseline a genuine rebound burst should be evaluated
+    # against, but the ratio clause requires hold_freq_hz > 0 to even run
+    # -- confirmed as a real, missed case on XB2IQX held=-4.32/inj=-3.26
+    # (hold_freq_hz=0.0, test_pattern="tonic" so not caught by the silent
+    # clause either): releasing back to held produces a genuine 8-spike
+    # decelerating burst, previously discarded entirely as
+    # rebound_applicable=False/"not_applicable" without ever running peak
+    # detection on the already-simulated recovery trace. Checked across
+    # XB2IQX's full grid: 438/2500 points (17.5%) share this exact gap
+    # (hold_freq_hz==0, test_pattern != "silent").
     test_suppressed = (test_pattern == "silent"
+                       or hold_freq_hz == 0
                        or (hold_freq_hz > 0 and test_freq_hz < 0.5 * hold_freq_hz))
 
     if not test_suppressed:
