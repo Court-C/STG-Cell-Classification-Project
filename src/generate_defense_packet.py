@@ -138,6 +138,18 @@ def make_representative_traces_page(cell_id, cell_result, resim) -> plt.Figure:
     via _prominence_score), just laid out here as a single overview page
     instead of one file per combination. "Representative" means "actually
     observed across the full grid," not hand-picked to look illustrative.
+
+    Every panel shares the same V and time axis limits (computed from the
+    actual min/max/duration across all panels, not a fixed guess) --
+    matplotlib's default is to auto-scale each subplot to its own data,
+    which independently zooms a near-flat subthreshold trace to fill the
+    same panel height as a real 90mV action potential. That made every
+    combination look equally "spiky" regardless of real amplitude --
+    exactly backwards for a page whose point is to show what actually
+    differs between combinations. Confirmed necessary directly: before this,
+    the "silent/none" panel (a ~0.35mV wobble) was visually indistinguishable
+    in prominence from "tonic/tonic_rebound" (a real ~90mV spike train) at
+    each panel's own auto-scaled zoom.
     """
     exemplars = select_exemplar_points(cell_result["grid"])
     combos = sorted(exemplars.keys())
@@ -145,16 +157,17 @@ def make_representative_traces_page(cell_id, cell_result, resim) -> plt.Figure:
     ncols = min(5, n) or 1
     nrows = -(-n // ncols) if n else 1
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4.4 * ncols, 3.6 * nrows), squeeze=False)
-    axes_flat = list(axes.flat)
-
-    for ax, combo in zip(axes_flat, combos):
+    # First pass: resimulate every exemplar and collect its offset traces,
+    # so shared axis limits can be computed BEFORE anything is drawn.
+    panels = []
+    v_min, v_max = np.inf, -np.inf
+    duration_max = 0.0
+    for combo in combos:
         test_pattern, rebound_pattern = combo
         held_nA, injected_nA = exemplars[combo][0]
         tr = resim(held_nA, injected_nA)
         if tr.get("blew_up"):
-            ax.text(0.5, 0.5, "resim failed", ha="center", va="center", transform=ax.transAxes, fontsize=8)
-            ax.set_title(f"{test_pattern} / {rebound_pattern}", fontsize=7.5)
+            panels.append((combo, held_nA, injected_nA, None))
             continue
 
         t_hold, v_hold = tr["_trace_t_hold_ms"], tr["_trace_v_hold_mV"]
@@ -165,12 +178,36 @@ def make_representative_traces_page(cell_id, cell_result, resim) -> plt.Figure:
         t_test_off = t_test + hold_end
         test_end = t_test_off[-1] + dt_ms if len(t_test_off) else hold_end
         t_rec_off = t_rec + test_end
+        rec_end = t_rec_off[-1] if len(t_rec_off) else test_end
+
+        v_min = min(v_min, v_hold.min(), v_test.min(), v_rec.min())
+        v_max = max(v_max, v_hold.max(), v_test.max(), v_rec.max())
+        duration_max = max(duration_max, rec_end)
+        panels.append((combo, held_nA, injected_nA,
+                       (t_hold, v_hold, t_test_off, v_test, t_rec_off, v_rec, hold_end, test_end)))
+
+    v_pad = 0.05 * (v_max - v_min) if v_max > v_min else 1.0
+    ylim = (v_min - v_pad, v_max + v_pad)
+    xlim = (0.0, duration_max)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.4 * ncols, 3.6 * nrows), squeeze=False)
+    axes_flat = list(axes.flat)
+
+    for ax, (combo, held_nA, injected_nA, trace_data) in zip(axes_flat, panels):
+        test_pattern, rebound_pattern = combo
+        if trace_data is None:
+            ax.text(0.5, 0.5, "resim failed", ha="center", va="center", transform=ax.transAxes, fontsize=8)
+            ax.set_title(f"{test_pattern} / {rebound_pattern}", fontsize=7.5)
+            continue
+        t_hold, v_hold, t_test_off, v_test, t_rec_off, v_rec, hold_end, test_end = trace_data
 
         ax.plot(t_hold, v_hold, color="gray", lw=0.6)
         ax.plot(t_test_off, v_test, color="firebrick", lw=0.6)
         ax.plot(t_rec_off, v_rec, color="steelblue", lw=0.6)
         ax.axvline(hold_end, color="black", ls=":", lw=0.6)
         ax.axvline(test_end, color="black", ls=":", lw=0.6)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
         ax.set_title(f"{test_pattern} / {rebound_pattern}\nheld={held_nA:.2f} inj={injected_nA:.2f}",
                     fontsize=7.5)
         ax.tick_params(labelsize=6)
@@ -184,10 +221,18 @@ def make_representative_traces_page(cell_id, cell_result, resim) -> plt.Figure:
        "grid: gray = held baseline, red = test window (injected current), blue = recovery window "
        "(released back to held). Chosen by the same selection plot_example_traces.py uses for its own "
        "per-combination figures (most-prominent point, see that script's _prominence_score) -- this is "
-       "what the cell actually does at each combination, not a hand-picked illustration.", width=175)
+       "what the cell actually does at each combination, not a hand-picked illustration. Every panel "
+       f"shares the same V ({ylim[0]:.0f} to {ylim[1]:.0f} mV) and time (0-{xlim[1]:.0f} ms) axes, computed "
+       "from the actual data, so amplitude and duration are directly comparable across panels by eye -- "
+       "not independently auto-scaled, which would make a subthreshold wobble look as prominent as a real "
+       "spike train.", width=175)
     fig.text(0.5, 0.005, caption, ha="center", va="bottom", fontsize=7.5)
     fig.suptitle("1. Representative traces", fontsize=13, weight="bold")
-    fig.tight_layout(rect=(0, 0.05, 1, 0.93))
+    # rect bottom raised to 0.11 (was 0.05): the added axis-standardization
+    # sentence makes this a 4-5 line caption now, not 3 -- confirmed
+    # directly that 0.05 let it overlap the bottom row's own x-axis tick
+    # labels.
+    fig.tight_layout(rect=(0, 0.11, 1, 0.93))
     return fig
 
 
