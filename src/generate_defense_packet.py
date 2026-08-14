@@ -424,8 +424,13 @@ def _shared_log_isi_xlim(isis_list) -> tuple:
 def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.Figure:
     """exemplars: list of (held_nA, injected_nA, tag) -- typically one clean
     bursting example and one boundary/near-miss "correctly rejected" example.
+
+    Includes the raw voltage trace (with detected spikes marked) alongside
+    the ISI/KDE evidence, not just the derived ISI sequence -- a reader
+    shouldn't have to flip back to section 1 to see what trace a given
+    classification call is even about.
     """
-    fig, axes = plt.subplots(len(exemplars), 2, figsize=(13, 5.8 * len(exemplars)))
+    fig, axes = plt.subplots(len(exemplars), 3, figsize=(18, 5.8 * len(exemplars)))
     if len(exemplars) == 1:
         axes = axes[np.newaxis, :]
     traces = [resim(held_nA, injected_nA) for held_nA, injected_nA, _ in exemplars]
@@ -434,14 +439,19 @@ def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.F
     shared_xlim = _shared_log_isi_xlim(isis_list)
     captions = []
     for row, (held_nA, injected_nA, tag), tr in zip(axes, exemplars, traces):
-        ax_isi, ax_kde = row
+        ax_v, ax_isi, ax_kde = row
         t, v = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
+        ax_v.plot(t, v, color="firebrick", lw=0.6, zorder=1)
+        mark_spikes(ax_v, t, v)
+        ax_v.set_xlabel("time (ms)")
+        ax_v.set_ylabel("V (mV)")
+        ax_v.legend(loc="upper right", fontsize=6)
         result, caption = mark_isi_classification(
             ax_isi, ax_kde, t, v, run_args["min_isis_for_burst_test"],
             run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
             min_ashman_d=run_args.get("min_ashman_d", 2.0), log_isi_xlim=shared_xlim)
-        ax_isi.set_title(f"{tag}: held={held_nA:.2f} inj={injected_nA:.2f} -> '{result['pattern']}'",
-                        fontsize=9)
+        ax_v.set_title(f"{tag}: held={held_nA:.2f} inj={injected_nA:.2f} -> '{result['pattern']}'",
+                      fontsize=9)
         captions.append((ax_isi, caption))
     fig.suptitle("5. Tonic / bursting / silent classification", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.02, 1, 0.95))
@@ -613,24 +623,33 @@ def make_sag_page(cell_id, exemplars, resim, sag_window_ms) -> plt.Figure:
 # ---------------------------------------------------------------------------
 
 def make_adaptation_page(cell_id, exemplars, resim, adaptation_edge_n) -> plt.Figure:
-    fig, axes = plt.subplots(1, len(exemplars), figsize=(6.5 * len(exemplars), 5.5))
-    if len(exemplars) == 1:
-        axes = [axes]
+    """Includes the raw voltage trace alongside the derived ISI-vs-index
+    plot -- the ratio is computed from ISIs, but a reader still needs to
+    see the actual spikes it came from, not just the abstract sequence.
+    """
+    fig, axes = plt.subplots(2, len(exemplars), figsize=(6.5 * len(exemplars), 8.5), squeeze=False)
     captions = []
-    for ax, (held_nA, injected_nA, tag) in zip(axes, exemplars):
+    for col, (held_nA, injected_nA, tag) in zip(axes.T, exemplars):
+        ax_v, ax_isi = col
         tr = resim(held_nA, injected_nA)
         t, v = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
+        ax_v.plot(t, v, color="firebrick", lw=0.6, zorder=1)
+        mark_spikes(ax_v, t, v)
+        ax_v.set_title(f"{tag}: held={held_nA:.2f} inj={injected_nA:.2f}", fontsize=9)
+        ax_v.set_xlabel("time (ms)")
+        ax_v.set_ylabel("V (mV)")
+        ax_v.legend(loc="upper right", fontsize=6)
         isis_ms, _ = compute_isis_ms(v, t, PROMINENCE_FRACTION)
-        ax.plot(np.arange(1, len(isis_ms) + 1), isis_ms, marker="o", markersize=3, color="steelblue")
-        ratio, caption = mark_adaptation_window(ax, isis_ms, adaptation_edge_n)
-        ax.set_title(f"{tag}: held={held_nA:.2f} inj={injected_nA:.2f}", fontsize=9)
-        ax.set_xlabel("ISI index")
-        ax.set_ylabel("ISI (ms)")
-        captions.append((ax, caption))
+        ax_isi.plot(np.arange(1, len(isis_ms) + 1), isis_ms, marker="o", markersize=3, color="steelblue")
+        ratio, caption = mark_adaptation_window(ax_isi, isis_ms, adaptation_edge_n)
+        ax_isi.set_xlabel("ISI index")
+        ax_isi.set_ylabel("ISI (ms)")
+        captions.append((ax_isi, caption))
     fig.suptitle("8. Adaptation ratio", fontsize=13, weight="bold")
-    fig.tight_layout(rect=(0, 0.22, 1, 0.90))
-    for ax, caption in captions:
-        _place_caption_below(fig, ax, caption, width=55)
+    fig.tight_layout(rect=(0, 0.14, 1, 0.93))
+    fig.subplots_adjust(hspace=0.6)
+    for ax_isi, caption in captions:
+        _place_caption_below(fig, ax_isi, caption, width=55)
     return fig
 
 
@@ -800,7 +819,17 @@ def build_packet(cell_id: str, args) -> None:
     dt_ms = run_args["dt"]
 
     spike_pts = [(-2.892861, -2.958704, "near-boundary bursting"), (-3.093754, -3.535713, "tonic")]
-    burst_exemplars = [(-3.21429, -3.363838, "clean bursting"), (-2.892861, -2.958704, "near-miss boundary")]
+    # -1.377551/-1.234694 replaces the packet's original near-miss point
+    # (-2.892861, -2.958704): confirmed 2026-08-14 that the original point
+    # is no longer a near-miss at all -- it now scores Ashman's D=7.27 and
+    # classifies confidently "bursting" (rescued by the ratio-override gate
+    # added earlier this session), so a caption calling it a "correctly
+    # rejected" boundary case had gone stale. The replacement genuinely sits
+    # near the D=2.0 gate (D=1.76 resimulated, matches cached D=1.75 --
+    # confirmed stable, unlike several other candidates whose cached D
+    # didn't survive resimulation) and is still classified "tonic".
+    burst_exemplars = [(-3.21429, -3.363838, "clean bursting"),
+                       (-1.377551, -1.234694, "near-miss boundary (correctly rejected as tonic)")]
     # -4.040816/-4.377551 replaces the packet's original single_spike
     # exemplar (-3.857148, -3.92857): confirmed 2026-08-13 that the original
     # point was ITSELF one of the subthreshold false positives the
@@ -811,39 +840,33 @@ def build_packet(cell_id: str, args) -> None:
     # (48.6mV amplitude, confirmed stable under resimulation).
     rebound_exemplars = [(-4.040816, -4.377551, "single_spike"), (-0.321429, -3.535713, "tonic_rebound")]
     sag_exemplars = [(-3.535719, -5.5, "silent, deep sag")]
-    # -3.765306/-3.367347 replaces the packet's original adaptation-ratio
-    # exemplar (-3.093754, -3.535713): confirmed 2026-08-13 that the
-    # original point is itself flagged test_likely_ceased_firing=True under
-    # the current pipeline, so production actually reports
-    # test_adaptation_ratio=None there now -- keeping it would have shown
-    # this section computing a ratio (1.22) the pipeline no longer reports
-    # for that exact point. mark_adaptation_window (unlike production) has
-    # no ceased-firing gate of its own -- it always reports whatever
-    # compute_adaptation_ratio returns given enough ISIs -- so the exemplar
-    # itself has to already be a genuinely sustained point, and confirmed
-    # stable specifically under resim()'s own single-hop warm-start (not
-    # just the cached grid value -- see the onset_exemplars comment below
-    # for a point where those two disagree).
-    adapt_exemplars = [(-3.765306, -3.367347, "tonic, sustained")]
-    # -3.765306/-3.367347, not -2.387755/-3.367347: the latter's CACHED grid
-    # entry shows likely_ceased_firing=False (adaptation_ratio=17.51), but
-    # confirmed 2026-08-13 that resimulate_point's own single-hop warm-start
-    # doesn't reproduce that -- it lands on trailing_silence=571ms and
-    # ceased=True instead, exactly the path-dependent-settling mismatch
-    # section 9 documents. Since this page plots resim()'s own trace/values
-    # (not the cached ones), the exemplar needs to be stable under
-    # resimulation too -- confirmed directly this one is (ratio 9.51
-    # resimulated vs. 9.51 cached).
+    # -4.316327/-3.255102: this cell's classifier logic changed enough times
+    # this session that TWO earlier adaptation-ratio exemplars went stale in
+    # turn (-3.093754/-3.535713 -> flagged test_likely_ceased_firing=True;
+    # its replacement -3.765306/-3.367347 -> later tripped
+    # test_oscillating_burst, a genuine 617/43/537/43/599/37ms alternation,
+    # not smooth adaptation, reclassifying the whole window "bursting").
+    # That second flip also surfaced a real code bug: test_adaptation_ratio
+    # was computed BEFORE the oscillating-burst override ran, so it stayed
+    # populated (9.51) even after test_pattern flipped -- fixed in
+    # run_held_injected_grid.py's run_test_and_recovery to clear it when the
+    # override fires, matching the invariant already enforced for
+    # test_n_bursts/test_spikes_per_burst. This point is confirmed stable
+    # under resim() (adaptation_ratio=9.64 resimulated vs. 9.89 cached,
+    # test_pattern stays "tonic", not ceased, not oscillating) and shows a
+    # real 5-spike onset (mean ISI 15ms) before settling, so it doubles as
+    # the onset_exemplars "burst then sustained" case below.
+    adapt_exemplars = [(-4.316327, -3.255102, "tonic, sustained")]
     onset_exemplars = [(-2.479592, -4.040816, "burst then ceased"),
-                       (-3.765306, -3.367347, "burst then sustained")]
+                       (-4.316327, -3.255102, "burst then sustained")]
     # Reuses burst_exemplars' two real points (confidently bursting, D=6.33;
-    # and the ratio-gate near-miss, correctly rejected as tonic before D is
-    # ever computed) plus a real confidently-tonic point -- picked 2026-08
+    # and the D-gate near-miss, correctly rejected as tonic just below the
+    # D=2.0 threshold) plus a real confidently-tonic point -- picked 2026-08
     # for a clean, non-adapting, high-spike-count train (n_isis=230,
     # adaptation_ratio=1.00) so its single dominant ISI mode is unambiguous.
     bimodality_exemplars = [(-3.21429, -3.363838, "confidently bursting"),
                             (-0.091837, -0.112245, "confidently tonic"),
-                            (-2.892861, -2.958704, "ratio-gate near-miss (rejected as tonic)")]
+                            (-1.377551, -1.234694, "D-gate near-miss (rejected as tonic)")]
 
     sections = [
         ("Representative traces", "One overview page (compact panels), then one full-detail page per "

@@ -370,6 +370,12 @@ def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_
        SHORT, borderline-length trains in item (1) above (the confirmed
        rescue case was 7 ISIs) where the KDE genuinely doesn't have enough
        data to resolve a real bimodal structure it should have found.
+
+       Also rescued (2026-08-14) when the train genuinely CEASES firing
+       well before the recovery window ends (same check as tier 3 below,
+       now also available to long trains) -- a "tonic" KDE verdict implies
+       ongoing/sustained firing, which a train that then definitively
+       stops is not, regardless of its internal ISI shape.
     2. Too few for the KDE test but enough for detect_onset_burst
        (rebound_min_onset_isis defaults to 1, not test-window onset
        detection's 2, so even a 2-ISI train gets a real jump check):
@@ -395,8 +401,21 @@ def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_
                                             ratio_override_min_ratio=ratio_override_min_ratio, n_peaks=n_peaks)
         onset_n, _ = detect_onset_burst(rebound_isis, min_isi_ratio, min_onset_isis)
         onset_rescues = onset_n is not None and n <= onset_rescue_max_isis
-        return "bursting_rebound" if (kde_result["pattern"] == "bursting" or onset_rescues) \
-            else "tonic_rebound"
+        # Cessation rescue (2026-08-14, same principle as run_test_and_
+        # recovery's test_ceased_burst, applied here too -- this tier had
+        # no equivalent, tier 3 below is restricted to n < min_isis_for_
+        # burst_test): a KDE-"tonic" long recovery train that then
+        # genuinely stops well before the recovery window ends is a
+        # bounded, self-terminated episode, not ongoing/sustained firing,
+        # regardless of whether its ISIs alternate or just smoothly
+        # decelerate -- confirmed real case, held=-3.67/inj=-3.14, 20-ISI
+        # recovery train (12ms onset -> 144ms), genuinely stops (trailing
+        # silence far exceeds 3x its last ISI), onset_n=5 found but ignored
+        # since n=20 > onset_rescue_max_isis=15, and until this fix tier 1
+        # had no fallback for that case at all.
+        ceased_rescue = rebound_trailing_silence_ms >= trailing_silence_ratio * rebound_isis[-1]
+        return "bursting_rebound" if (kde_result["pattern"] == "bursting" or onset_rescues
+                                      or ceased_rescue) else "tonic_rebound"
 
     onset_n, _ = detect_onset_burst(rebound_isis, min_isi_ratio, rebound_min_onset_isis)
     if onset_n is not None:
@@ -676,6 +695,12 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
         test_pattern == "tonic" and (test_oscillating_burst or test_ceased_burst))
     if test_adaptation_ratio_extreme:
         test_pattern = "bursting"
+        # test_adaptation_ratio was computed above while test_pattern was
+        # still "tonic" (pre-override) -- clear it now that the window has
+        # been reclassified "bursting", matching the same invariant already
+        # enforced for test_n_bursts/test_spikes_per_burst below (a first-k/
+        # last-k ISI ratio isn't meaningful for a burst window either).
+        test_adaptation_ratio = None
 
     # n_bursts = n_long_isis + 1 (a "burst" is a maximal run of consecutive
     # short ISIs, so each inter-burst gap marks one more burst boundary);
