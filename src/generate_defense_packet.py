@@ -11,6 +11,7 @@ detection logic, so what's drawn is provably what the pipeline computed.
 
 import argparse
 import pickle
+import shutil
 import sys
 import textwrap
 from pathlib import Path
@@ -900,6 +901,16 @@ def build_packet(cell_id: str, args) -> None:
         # directory -- see make_example_trace_detail_pages' docstring for
         # why (a standalone copy of this exact content went stale for over
         # a week through several classification fixes before being caught).
+        # The subfolder is cleared first: the SET of (test_pattern,
+        # rebound_pattern) combinations actually present changes as
+        # classification fixes land (confirmed directly -- Option B alone
+        # dropped 11 combos to 9), so last run's files can't just be
+        # overwritten by name; a stale leftover would otherwise sit next to
+        # the new set indefinitely, exactly the kind of silently-outdated
+        # output this page exists to avoid.
+        detail_dir = png_dir / "representative_traces_detail"
+        if detail_dir.exists():
+            shutil.rmtree(detail_dir)
         for i, (combo_label, detail_fig) in enumerate(
                 make_example_trace_detail_pages(cell_id, cell_result, resim), start=1):
             slug = combo_label.replace("/", "-").replace(" ", "_")

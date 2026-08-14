@@ -320,7 +320,8 @@ def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_
                              min_isi_ratio: float, n_peaks: int, min_onset_isis: int = 2,
                              rebound_min_onset_isis: int = 1, trailing_silence_ratio: float = 3.0,
                              min_ashman_d: float = 2.0, ratio_override_ashman_d: float = 5.0,
-                             ratio_override_min_ratio: float = 1.15) -> str:
+                             ratio_override_min_ratio: float = 1.15,
+                             onset_rescue_max_isis: int = 15) -> str:
     """"bursting_rebound" or "tonic_rebound" for a >=2-spike recovery-window
     train (rebound_spike_count==1/0 are handled by the caller before this is
     reached). classify_burst_pattern's whole-train KDE bimodality test is
@@ -354,6 +355,21 @@ def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_
        genuine onset-burst rebounds validated earlier all had >=3
        consecutive short ISIs and still pass at 2; only tier 2/3's
        genuinely-short trains need the relaxed threshold.
+
+       The onset-detector OR-clause is further restricted to trains no
+       longer than onset_rescue_max_isis (default 15) -- confirmed as a
+       second real bug (2026-08-14, held=-3.49/inj=-5.5): a smoothly,
+       monotonically decelerating 49-ISI tonic rebound (11ms -> 170ms,
+       ordinary spike-frequency adaptation, KDE correctly says "tonic")
+       crosses the 1.5x ratio threshold once, ~1/8 of the way through,
+       purely because that's what a continuously-slowing sequence
+       eventually does -- detect_onset_burst can't tell that apart from a
+       genuine burst-then-different-rhythm jump. This module's own
+       docstring already says the KDE test is right to be authoritative
+       for LONG trains; the onset-rescue was only ever meant for the
+       SHORT, borderline-length trains in item (1) above (the confirmed
+       rescue case was 7 ISIs) where the KDE genuinely doesn't have enough
+       data to resolve a real bimodal structure it should have found.
     2. Too few for the KDE test but enough for detect_onset_burst
        (rebound_min_onset_isis defaults to 1, not test-window onset
        detection's 2, so even a 2-ISI train gets a real jump check):
@@ -378,7 +394,8 @@ def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_
                                             ratio_override_ashman_d=ratio_override_ashman_d,
                                             ratio_override_min_ratio=ratio_override_min_ratio, n_peaks=n_peaks)
         onset_n, _ = detect_onset_burst(rebound_isis, min_isi_ratio, min_onset_isis)
-        return "bursting_rebound" if (kde_result["pattern"] == "bursting" or onset_n is not None) \
+        onset_rescues = onset_n is not None and n <= onset_rescue_max_isis
+        return "bursting_rebound" if (kde_result["pattern"] == "bursting" or onset_rescues) \
             else "tonic_rebound"
 
     onset_n, _ = detect_onset_burst(rebound_isis, min_isi_ratio, rebound_min_onset_isis)
@@ -400,6 +417,7 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
                           min_ashman_d: float = 2.0, ratio_override_ashman_d: float = 5.0,
                           ratio_override_min_ratio: float = 1.15,
                           adaptation_ratio_override_threshold: float = 5.0,
+                          onset_rescue_max_isis: int = 15,
                           return_traces: bool = False) -> dict:
     """Test window at the ABSOLUTE injected current level (held is not added
     on top -- see module docstring) followed by a recovery window (released
@@ -714,42 +732,64 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
                        or test_pattern != hold_pattern
                        or (hold_freq_hz > 0 and test_freq_hz < 0.5 * hold_freq_hz))
 
-    if not test_suppressed:
-        rebound_occurred, rebound_spike_count = False, 0
-        rebound_latency_ms, rebound_peak_mV = None, None
-        rebound_pattern = "not_applicable"
+    # Option B, 2026-08-14: test_suppressed (stored as rebound_applicable)
+    # no longer GATES classification -- it's now a purely descriptive "is
+    # this distinguishable from what this held level does on its own" flag,
+    # kept for exactly the filtering every current feature-extraction
+    # consumer already does with it (extract_grid_features.py's
+    # compute_summary_stats/compute_boundary_slopes/compute_rebound_maps
+    # all independently filter on rebound_applicable -- none of them
+    # depend on rebound_pattern being "not_applicable" as a signal, so this
+    # doesn't change any existing numeric feature). What changes: the
+    # recovery window's peaks are now ALWAYS examined and rebound_pattern
+    # always reports a real classification ("none"/"single_spike"/
+    # "tonic_rebound"/"bursting_rebound"), never the placeholder
+    # "not_applicable" for a genuinely-simulated point (still used for
+    # actually-blown-up points, see make_blew_up_point/_TEST_RECOVERY_
+    # DEFAULTS -- an unrelated case, no data exists there at all).
+    #
+    # The old all-or-nothing suppression was hiding real, describable
+    # recovery-window behavior any time it happened to match what the held
+    # level already does on its own -- confirmed real cases: XB2IQX
+    # held=-3.12/inj=-3.03 genuinely bursts in recovery (a triplet, then
+    # settling into doublets matching hold's own rhythm) and held=-2.85/
+    # inj=-1.23 genuinely fires tonically in recovery, both previously
+    # reported as "not_applicable" with peak detection never even run.
+    # rebound_applicable=False on either now correctly means "matches what
+    # this held level does anyway, not a distinguishable rebound" while
+    # rebound_pattern still tells you what the recovery window actually did.
+    if v_rec.max() - v_rec.min() < FLATLINE_MV:
+        peak_times_ms = np.array([])
     else:
-        if v_rec.max() - v_rec.min() < FLATLINE_MV:
-            peak_times_ms = np.array([])
-        else:
-            peaks, _ = find_peaks(v_rec, prominence=_spike_prominence(v_rec.max() - v_rec.min(),
-                                                                       PROMINENCE_FRACTION))
-            peak_times_ms = t_rec[peaks]
+        peaks, _ = find_peaks(v_rec, prominence=_spike_prominence(v_rec.max() - v_rec.min(),
+                                                                   PROMINENCE_FRACTION))
+        peak_times_ms = t_rec[peaks]
 
-        qualifying = peak_times_ms[peak_times_ms >= rebound_latency_min_ms]
-        rebound_occurred = len(qualifying) > 0
-        rebound_spike_count = int(len(qualifying))
-        rebound_latency_ms = float(qualifying[0]) if rebound_occurred else None
-        if rebound_occurred:
-            first_idx = int(np.argmin(np.abs(t_rec - qualifying[0])))
-            rebound_peak_mV = float(v_rec[first_idx])
-        else:
-            rebound_peak_mV = None
+    qualifying = peak_times_ms[peak_times_ms >= rebound_latency_min_ms]
+    rebound_occurred = len(qualifying) > 0
+    rebound_spike_count = int(len(qualifying))
+    rebound_latency_ms = float(qualifying[0]) if rebound_occurred else None
+    if rebound_occurred:
+        first_idx = int(np.argmin(np.abs(t_rec - qualifying[0])))
+        rebound_peak_mV = float(v_rec[first_idx])
+    else:
+        rebound_peak_mV = None
 
-        if not rebound_occurred:
-            rebound_pattern = "none"
-        elif rebound_spike_count == 1:
-            rebound_pattern = "single_spike"
-        else:
-            rebound_isis = np.diff(qualifying)
-            rebound_trailing_silence_ms = recovery_window_s * 1000.0 - qualifying[-1]
-            rebound_pattern = classify_rebound_pattern(
-                rebound_isis, rebound_trailing_silence_ms, min_isis_for_burst_test,
-                isi_mode_prominence_frac, min_isi_ratio, rebound_spike_count,
-                min_onset_isis=min_onset_isis, rebound_min_onset_isis=rebound_min_onset_isis,
-                trailing_silence_ratio=trailing_silence_ratio, min_ashman_d=min_ashman_d,
-                ratio_override_ashman_d=ratio_override_ashman_d,
-                ratio_override_min_ratio=ratio_override_min_ratio)
+    if not rebound_occurred:
+        rebound_pattern = "none"
+    elif rebound_spike_count == 1:
+        rebound_pattern = "single_spike"
+    else:
+        rebound_isis = np.diff(qualifying)
+        rebound_trailing_silence_ms = recovery_window_s * 1000.0 - qualifying[-1]
+        rebound_pattern = classify_rebound_pattern(
+            rebound_isis, rebound_trailing_silence_ms, min_isis_for_burst_test,
+            isi_mode_prominence_frac, min_isi_ratio, rebound_spike_count,
+            min_onset_isis=min_onset_isis, rebound_min_onset_isis=rebound_min_onset_isis,
+            trailing_silence_ratio=trailing_silence_ratio, min_ashman_d=min_ashman_d,
+            ratio_override_ashman_d=ratio_override_ashman_d,
+            ratio_override_min_ratio=ratio_override_min_ratio,
+            onset_rescue_max_isis=onset_rescue_max_isis)
 
     recovery_result = {
         "rebound_applicable": test_suppressed,
@@ -906,6 +946,7 @@ def build_uniform_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_f
                       ratio_override_ashman_d=args.ratio_override_ashman_d,
                       ratio_override_min_ratio=args.ratio_override_min_ratio,
                       adaptation_ratio_override_threshold=args.adaptation_ratio_override_threshold,
+                      onset_rescue_max_isis=args.onset_rescue_max_isis,
                       rebound_min_onset_isis=args.rebound_min_onset_isis,
                       sag_window_ms=args.sag_window_ms,
                       sag_dead_zone_ms=args.sag_dead_zone_ms,
@@ -1359,6 +1400,19 @@ def parse_args() -> argparse.Namespace:
                              "and is confirmed unstable across resimulation on the exact case this "
                              "was added for. Confirmed real case: XB2IQX held=-2.39/inj=-3.37, ISIs "
                              "spanning 15-617ms (~41x spread).")
+    parser.add_argument("--onset-rescue-max-isis", type=int, default=15,
+                        help="classify_rebound_pattern's tier-1 (n >= --min-isis-for-burst-test) onset-"
+                             "detector OR-clause only rescues a whole-window KDE 'tonic' verdict for "
+                             "trains no longer than this -- a smoothly, monotonically decelerating long "
+                             "train (ordinary spike-frequency adaptation) will eventually cross the "
+                             "ratio-jump threshold once just from continuous slowing, which "
+                             "detect_onset_burst can't tell apart from a genuine burst-then-different-"
+                             "rhythm jump. The KDE test is authoritative for genuinely long trains (see "
+                             "this function's own docstring); the onset-rescue exists for short, "
+                             "borderline-length trains where the KDE doesn't have enough data yet. "
+                             "Confirmed real case: XB2IQX held=-3.49/inj=-5.5 recovery, 49 ISIs "
+                             "11ms->170ms, KDE correctly says 'tonic', onset-detector spuriously fires "
+                             "at ISI #6 (ratio 1.506, barely over 1.5x) purely from ordinary adaptation.")
     parser.add_argument("--sag-window-ms", type=float, default=500.0,
                         help="Window (from test-window onset) over which the pre-spike sag trough "
                              "(test_v_min_pre_spike_mV) is measured, truncated early if a spike occurs "
