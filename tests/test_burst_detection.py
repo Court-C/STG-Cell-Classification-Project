@@ -20,7 +20,8 @@ sys.path.insert(0, str(SRC_DIR))
 
 from find_silencing_threshold import (classify_burst_pattern, count_spikes_and_rate,
                                       compute_isis_ms, PROMINENCE_FRACTION, FLATLINE_MV)
-from run_held_injected_grid import compute_pre_spike_sag_trough, compute_adaptation_ratio
+from run_held_injected_grid import (compute_pre_spike_sag_trough, compute_adaptation_ratio,
+                                    classify_rebound_pattern, cessation_reference_isi_ms)
 
 DEFAULT_KWARGS = dict(min_isis_for_burst_test=6, isi_mode_prominence_frac=0.05, min_isi_ratio=1.5)
 
@@ -282,3 +283,62 @@ def test_low_ashman_d_ratio_failure_stays_tonic():
     diag = result["diagnostics"]
     assert diag["ashman_d"] < 5.0, "sanity: this case's D should be well under the override bar"
     assert result["pattern"] == "tonic"
+
+
+REBOUND_KWARGS = dict(min_isis_for_burst_test=6, isi_mode_prominence_frac=0.05, min_isi_ratio=1.5)
+
+# Real XB2IQX held=-3.489796/inj=-2.132653 recovery-window ISIs (user-flagged
+# 2026-08-14): a smooth 12.9ms->96.3ms deceleration, then one 442.9ms outlier
+# gap, then one final isolated spike, then genuine trailing silence.
+_PANEL9_ISIS_MS = np.array([12.9, 13.5, 16.4, 29.0, 63.6, 24.0, 44.7, 44.6, 44.4, 47.7,
+                            47.7, 51.9, 51.7, 57.9, 56.4, 68.4, 60.1, 96.3, 53.2, 442.9])
+_PANEL9_TRAILING_SILENCE_MS = 672.6
+
+
+def test_cessation_reference_isi_robust_to_outlier_last_isi():
+    """The reference scale for "how much trailing silence counts as genuine
+    cessation" must not be inflated by an anomalously large final ISI --
+    that gap is itself often the first sign of the train winding down, not
+    a "normal" interval to measure against.
+    """
+    ref = cessation_reference_isi_ms(_PANEL9_ISIS_MS)
+    assert ref < 100.0, "reference should track the ~60-90ms recent trend, not the 442.9ms outlier"
+    # Sanity: the naive last-ISI-only version would have missed this case
+    # entirely -- confirms the fix changes real behavior, not a no-op.
+    assert _PANEL9_TRAILING_SILENCE_MS < 3.0 * _PANEL9_ISIS_MS[-1]
+    assert _PANEL9_TRAILING_SILENCE_MS >= 3.0 * ref
+
+
+def test_cessation_reference_isi_matches_last_isi_when_representative():
+    """Non-regression: when the last ISI IS representative of the recent
+    trend (the ordinary case), the new reference must equal the old
+    last-ISI-only behavior exactly -- this only adds sensitivity for
+    outlier-last-ISI cases, it must not perturb the common case.
+    """
+    isis_ms = np.array([20.0, 21.0, 22.0, 21.5, 22.5, 21.0])
+    assert cessation_reference_isi_ms(isis_ms) == pytest.approx(isis_ms[-1])
+
+
+def test_rebound_pattern_ceased_despite_outlier_last_isi():
+    """classify_rebound_pattern tier 1 (real XB2IQX case, user-flagged
+    2026-08-14): a smoothly-decelerating recovery train that then takes an
+    anomalously long pause, fires one final isolated spike, and genuinely
+    stops should read as "bursting_rebound" -- the user's framing: that
+    final spike is "an extra spike not part of the burst" but the episode
+    as a whole is still a burst.
+    """
+    pattern = classify_rebound_pattern(_PANEL9_ISIS_MS, _PANEL9_TRAILING_SILENCE_MS,
+                                       n_peaks=len(_PANEL9_ISIS_MS) + 1, **REBOUND_KWARGS)
+    assert pattern == "bursting_rebound"
+
+
+def test_rebound_pattern_stays_tonic_when_not_ceased():
+    """Non-regression: a long recovery train still firing steadily right up
+    to the end of the window (small trailing silence, no outlier gap) must
+    stay "tonic_rebound" -- the cessation rescue must not fire just because
+    a train is long and KDE-tonic.
+    """
+    rng = np.random.default_rng(3)
+    isis_ms = np.full(20, 30.0) + rng.normal(0, 1.0, 20)
+    pattern = classify_rebound_pattern(isis_ms, 10.0, n_peaks=len(isis_ms) + 1, **REBOUND_KWARGS)
+    assert pattern == "tonic_rebound"

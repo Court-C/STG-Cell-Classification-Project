@@ -315,6 +315,32 @@ def detect_onset_burst(isis_ms: np.ndarray, min_isi_ratio: float, min_onset_isis
     return None, None
 
 
+def cessation_reference_isi_ms(isis_ms: np.ndarray, recent_n: int = 5) -> float:
+    """Reference ISI scale for judging whether trailing silence after the
+    last spike is genuine cessation vs. ordinary jitter -- used everywhere
+    a "trailing_silence >= trailing_silence_ratio * <reference>" check is
+    made. min(last ISI, median of the last recent_n ISIs) rather than the
+    last ISI alone: when a train is winding down, the last ISI itself can
+    already be an outlier gap (a symptom of stopping, not a "normal"
+    interval), which inflates the cessation bar and can mask a real stop.
+    Taking the min never LOOSENS an already-triggered cessation call (it
+    only ever shrinks the reference), so this adds sensitivity without
+    causing any prior true "ceased" case to flip false. Confirmed real case
+    (user-flagged, 2026-08-14), XB2IQX held=-3.489796/inj=-2.132653: a
+    smooth 12.9ms->96.3ms deceleration (19 ISIs), then one 442.9ms outlier
+    gap, one final isolated spike, then 673ms of genuine trailing silence --
+    673ms clears 3x the ~60-90ms recent trend but not 3x the 442.9ms outlier
+    gap itself, so the last-ISI-only version missed it. User's framing: the
+    final spike is "an extra spike not part of the burst" but the episode
+    as a whole should still read as bursting, i.e. the same "genuine
+    cessation implies burst" principle, just applied with a reference scale
+    that isn't itself corrupted by the anomaly it's supposed to detect.
+    """
+    last = float(isis_ms[-1])
+    recent = isis_ms[-recent_n:] if len(isis_ms) > 0 else isis_ms
+    return min(last, float(np.median(recent)))
+
+
 def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_ms: float,
                              min_isis_for_burst_test: int, isi_mode_prominence_frac: float,
                              min_isi_ratio: float, n_peaks: int, min_onset_isis: int = 2,
@@ -382,8 +408,9 @@ def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_
        use detect_onset_burst alone.
     3. No internal jump found anywhere (uniform ISIs, or too short to
        compare at all): if the train then definitively ENDED within the
-       window (trailing silence >= trailing_silence_ratio times the last
-       ISI, the same reasoning test_likely_ceased_firing already uses),
+       window (trailing silence >= trailing_silence_ratio times
+       cessation_reference_isi_ms's reference scale, the same reasoning
+       test_likely_ceased_firing already uses),
        treat the whole short train as one completed burst -- a handful of
        spikes that fire in a consistent rhythm and then genuinely stop is
        closer to a bounded burst than to "tonic" firing, which implies
@@ -413,7 +440,8 @@ def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_
         # silence far exceeds 3x its last ISI), onset_n=5 found but ignored
         # since n=20 > onset_rescue_max_isis=15, and until this fix tier 1
         # had no fallback for that case at all.
-        ceased_rescue = rebound_trailing_silence_ms >= trailing_silence_ratio * rebound_isis[-1]
+        ceased_rescue = (rebound_trailing_silence_ms
+                         >= trailing_silence_ratio * cessation_reference_isi_ms(rebound_isis))
         return "bursting_rebound" if (kde_result["pattern"] == "bursting" or onset_rescues
                                       or ceased_rescue) else "tonic_rebound"
 
@@ -421,7 +449,8 @@ def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_
     if onset_n is not None:
         return "bursting_rebound"
 
-    ceased = rebound_trailing_silence_ms >= trailing_silence_ratio * rebound_isis[-1]
+    ceased = (rebound_trailing_silence_ms
+             >= trailing_silence_ratio * cessation_reference_isi_ms(rebound_isis))
     return "bursting_rebound" if ceased else "tonic_rebound"
 
 
@@ -556,7 +585,8 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
         test_trailing_silence_ms = window_s * 1000.0 - last_spike_ms
         if isis_test is not None and len(isis_test) > 0:
             test_likely_ceased_firing = bool(
-                test_trailing_silence_ms >= trailing_silence_ratio * isis_test[-1])
+                test_trailing_silence_ms
+                >= trailing_silence_ratio * cessation_reference_isi_ms(isis_test))
 
     # test_pattern override, 2026-08-13: too few total ISIs for the whole-
     # window KDE test to even attempt classification (_raw_test_pattern was
