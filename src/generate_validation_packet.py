@@ -442,35 +442,40 @@ def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.F
     the ISI/KDE evidence, not just the derived ISI sequence -- a reader
     shouldn't have to flip back to section 1 to see what trace a given
     classification call is even about.
+
+    Each row's log-ISI panel is scaled to its OWN data range, not a range
+    shared across rows (unlike make_bimodality_teaching_page, where a shared
+    range is the point -- comparing separation magnitudes side by side).
+    Here a shared range actively hides evidence: the near-miss/tonic
+    example's intervals cluster in a ~0.7ms band, which a range wide enough
+    to also fit the bursting example's 500ms+ between-burst gaps compresses
+    into an unreadable sliver (confirmed user-reported 2026-08-14).
     """
-    fig, axes = plt.subplots(len(exemplars), 3, figsize=(18, 7.4 * len(exemplars)))
+    fig, axes = plt.subplots(len(exemplars), 3, figsize=(19, 7.0 * len(exemplars)))
     if len(exemplars) == 1:
         axes = axes[np.newaxis, :]
     traces = [resim(held_nA, injected_nA) for held_nA, injected_nA, _ in exemplars]
-    isis_list = [compute_isis_ms(tr["_trace_v_test_mV"], tr["_trace_t_test_ms"], PROMINENCE_FRACTION)[0]
-                for tr in traces]
-    shared_xlim = _shared_log_isi_xlim(isis_list)
     captions = []
     for row, (held_nA, injected_nA, tag), tr in zip(axes, exemplars, traces):
         ax_v, ax_isi, ax_kde = row
         t, v = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
-        ax_v.plot(t, v, color="firebrick", lw=0.6, zorder=1)
+        ax_v.plot(t, v, color="firebrick", lw=0.8, zorder=1)
         mark_spikes(ax_v, t, v)
         ax_v.set_xlabel("time (ms)")
         ax_v.set_ylabel("V (mV)")
-        ax_v.legend(loc="upper right", fontsize=6)
+        ax_v.legend(loc="upper right", fontsize=7)
         result, caption = mark_isi_classification(
             ax_isi, ax_kde, t, v, run_args["min_isis_for_burst_test"],
             run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
-            min_ashman_d=run_args.get("min_ashman_d", 2.0), log_isi_xlim=shared_xlim)
+            min_ashman_d=run_args.get("min_ashman_d", 2.0))
         ax_v.set_title(f"{tag} (held={held_nA:.2f} nA, injected={injected_nA:.2f} nA): "
-                      f"classified as {_describe_pattern(result['pattern'])}", fontsize=8, wrap=True)
+                      f"classified as {_describe_pattern(result['pattern'])}", fontsize=9, wrap=True)
         captions.append((ax_isi, caption))
     fig.suptitle("5. Tonic / bursting / silent classification", fontsize=13, weight="bold")
-    fig.tight_layout(rect=(0, 0.02, 1, 0.96))
-    fig.subplots_adjust(hspace=1.5)
+    fig.tight_layout(rect=(0, 0.15, 1, 0.96))
+    fig.subplots_adjust(hspace=0.85)
     for ax_isi, caption in captions:
-        _place_caption_below(fig, ax_isi, caption, width=62, fontsize=6.5, gap=0.06)
+        _place_caption_below(fig, ax_isi, caption, width=78, fontsize=8.5, gap=0.055)
     return fig
 
 
@@ -570,7 +575,7 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
                     "case this cell's own data has not been observed to produce. "
                     f"{caption}"))
 
-    fig.suptitle("12. Bimodality test: within-burst vs. between-burst ISIs", fontsize=13, weight="bold")
+    fig.suptitle("6. Bimodality test: within-burst vs. between-burst ISIs", fontsize=13, weight="bold")
     # Both hspace and _place_caption_below's gap are figure-fraction
     # quantities, not per-row -- a gap tuned for a 2-row page (see
     # make_burst_classification_page) eats a much bigger slice of a single
@@ -601,7 +606,7 @@ def make_rebound_page(cell_id, exemplars, resim, rebound_latency_min_ms) -> plt.
         ax.legend(loc="upper right", fontsize=7)
         ax.set_xlabel("time since release (ms)")
         captions.append((ax, caption))
-    fig.suptitle("6. Post-inhibitory rebound detection", fontsize=13, weight="bold")
+    fig.suptitle("8. Post-inhibitory rebound detection", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.02, 1, 0.94))
     fig.subplots_adjust(hspace=0.9)
     for ax, caption in captions:
@@ -629,7 +634,7 @@ def make_sag_page(cell_id, exemplars, resim, sag_window_ms) -> plt.Figure:
         ax.set_ylabel("V (mV)")
         ax.legend(loc="upper right", fontsize=6.5)
         captions.append((ax, caption))
-    fig.suptitle("7. Sag depth", fontsize=13, weight="bold")
+    fig.suptitle("9. Sag depth", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.22, 1, 0.90))
     for ax, caption in captions:
         _place_caption_below(fig, ax, caption, width=55)
@@ -667,7 +672,7 @@ def make_adaptation_page(cell_id, exemplars, resim, adaptation_edge_n) -> plt.Fi
         ax_isi.set_xlabel("interval index (spike-to-spike)")
         ax_isi.set_ylabel("interspike interval (ms)")
         captions.append((ax_isi, caption))
-    fig.suptitle("8. Spike-frequency adaptation", fontsize=13, weight="bold")
+    fig.suptitle("10. Spike-frequency adaptation", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.14, 1, 0.93))
     fig.subplots_adjust(hspace=0.6)
     for ax_isi, caption in captions:
@@ -708,7 +713,7 @@ def make_fi_slope_page(cell_id, grid, features) -> plt.Figure:
        "is one of the features used to characterize this cell in the cross-cell comparison; here it is "
        "plotted directly against the data it was fit to.", width=110)
     fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
-    fig.suptitle("9. Firing rate vs. injected current", fontsize=13, weight="bold")
+    fig.suptitle("11. Firing rate vs. injected current", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.12, 1, 0.93))
     return fig
 
@@ -765,7 +770,7 @@ def make_self_consistency_page(cell_id, cell_result, resim, n_sample=40, seed=11
        "known property of the model rather than indicating an error in the classification code.",
        width=115)
     fig.text(0.5, 0.03, caption, ha="center", va="bottom", fontsize=7.5)
-    fig.suptitle("10. Reproducibility check", fontsize=13, weight="bold")
+    fig.suptitle("12. Reproducibility check", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.22, 1, 0.88))
     return fig
 
@@ -807,7 +812,7 @@ def make_onset_burst_page(cell_id, exemplars, resim, run_args) -> plt.Figure:
         ax_v.set_ylabel("V (mV)")
         ax_v.legend(loc="upper right", fontsize=6)
         captions.append((ax_v, caption))
-    fig.suptitle("11. Burst-onset-then-silence detection", fontsize=13, weight="bold")
+    fig.suptitle("7. Burst-onset-then-silence detection", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.02, 1, 0.94))
     fig.subplots_adjust(hspace=1.0)
     for ax_v, caption in captions:
@@ -891,6 +896,16 @@ def build_packet(cell_id: str, args) -> None:
                             (-0.091837, -0.112245, "confidently tonic"),
                             (-1.377551, -1.234694, "separation-score near-miss (rejected as tonic)")]
 
+    # Ordered as a narrative, not by whatever order each page was originally
+    # implemented in (user-flagged 2026-08-14: the old order interleaved
+    # unrelated topics and split the tonic/bursting classification test
+    # (section 5) from its own deep-dive and edge-case follow-ups (sections
+    # 11-12), separating them with five pages on unrelated features):
+    # foundation (spike detection, validated three ways) -> the
+    # classification built on top of it (whole-window test, its statistical
+    # basis, then its short-train edge case) -> other independent per-point
+    # features -> population-level summary -> end-to-end reproducibility as
+    # a capstone check.
     sections = [
         ("Representative traces", "Every distinct response pattern this cell produces, then one "
          "full-detail trace per pattern."),
@@ -901,6 +916,10 @@ def build_packet(cell_id: str, args) -> None:
          "primary one."),
         ("Tonic / bursting / silent classification", "Interspike intervals and the statistical test for "
          "two separate interval populations."),
+        ("Bimodality test", "The full statistical-separation evidence behind the tonic/bursting "
+         "distinction."),
+        ("Burst-onset-then-silence detection", "A leading onset burst followed by genuine cessation, vs. "
+         "one that sustains."),
         ("Post-inhibitory rebound detection", "Rebound spikes after release from hyperpolarization, and "
          "the latency cutoff used."),
         ("Sag depth", "The baseline voltage, search window, and trough behind the sag measurement."),
@@ -909,15 +928,21 @@ def build_packet(cell_id: str, args) -> None:
         ("Firing rate vs. injected current", "Firing rate vs. current, with the linear fit used to "
          "summarize it."),
         ("Reproducibility check", "How often re-simulation reproduces the original classification."),
-        ("Burst-onset-then-silence detection", "A leading onset burst followed by genuine cessation, vs. "
-         "one that sustains."),
-        ("Bimodality test", "The full statistical-separation evidence behind the tonic/bursting "
-         "distinction."),
     ]
 
     outdir = Path(args.figures_dir)
     outdir.mkdir(parents=True, exist_ok=True)
     png_dir = outdir / cell_id
+    # Cleared, not just overwritten by name: page numbering/filenames have
+    # changed across sessions as sections were added, removed, or reordered
+    # (most recently 2026-08-14, regrouping into a logical narrative order --
+    # see the `sections` comment above), and a stale leftover from an old
+    # numbering would otherwise sit next to the new set indefinitely. Same
+    # reasoning already applied to just the representative_traces_detail
+    # subfolder below; extended to the whole directory since this reordering
+    # is exactly the scenario that logic didn't cover.
+    if png_dir.exists():
+        shutil.rmtree(png_dir)
     png_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = outdir / f"{cell_id}_validation_packet.pdf"
 
@@ -951,16 +976,12 @@ def build_packet(cell_id: str, args) -> None:
         # directory -- see make_example_trace_detail_pages' docstring for
         # why (a standalone copy of this exact content went stale for over
         # a week through several classification fixes before being caught).
-        # The subfolder is cleared first: the SET of (test_pattern,
-        # rebound_pattern) combinations actually present changes as
-        # classification fixes land (confirmed directly -- Option B alone
-        # dropped 11 combos to 9), so last run's files can't just be
-        # overwritten by name; a stale leftover would otherwise sit next to
-        # the new set indefinitely, exactly the kind of silently-outdated
-        # output this page exists to avoid.
-        detail_dir = png_dir / "representative_traces_detail"
-        if detail_dir.exists():
-            shutil.rmtree(detail_dir)
+        # The SET of (test_pattern, rebound_pattern) combinations actually
+        # present changes as classification fixes land (confirmed directly
+        # -- Option B alone dropped 11 combos to 9), which is exactly why
+        # png_dir as a whole is cleared above rather than just this
+        # subfolder -- a stale leftover combination would otherwise sit next
+        # to the new set indefinitely.
         for i, (combo_label, detail_fig) in enumerate(
                 make_example_trace_detail_pages(cell_id, cell_result, resim), start=1):
             slug = combo_label.replace("/", "-").replace(" ", "_")
@@ -976,22 +997,22 @@ def build_packet(cell_id: str, args) -> None:
             "resimulate_point() -> find_silencing_threshold.detect_spikes_dvdt_confirmed()")
         save(make_burst_classification_page(cell_id, burst_exemplars, resim, run_args),
             "05_burst_classification", "resimulate_point() -> find_silencing_threshold.classify_burst_pattern()")
+        save(make_bimodality_teaching_page(cell_id, bimodality_exemplars, resim, run_args),
+            "06_bimodality_test", "resimulate_point() -> find_silencing_threshold.classify_burst_pattern() "
+            "(4th row: constructed synthetic ISIs, no resimulation)")
+        save(make_onset_burst_page(cell_id, onset_exemplars, resim, run_args), "07_onset_burst_detection",
+            "resimulate_point() -> run_held_injected_grid.detect_onset_burst()")
         save(make_rebound_page(cell_id, rebound_exemplars, resim, run_args["rebound_latency_min_ms"]),
-            "06_rebound_detection", "resimulate_point() -> trace_annotations.mark_rebound_window() "
+            "08_rebound_detection", "resimulate_point() -> trace_annotations.mark_rebound_window() "
             "(reproduces run_held_injected_grid.run_test_and_recovery's rebound-peak logic)")
-        save(make_sag_page(cell_id, sag_exemplars, resim, run_args["sag_window_ms"]), "07_sag_depth",
+        save(make_sag_page(cell_id, sag_exemplars, resim, run_args["sag_window_ms"]), "09_sag_depth",
             "resimulate_point() -> run_held_injected_grid.compute_pre_spike_sag_trough()")
         save(make_adaptation_page(cell_id, adapt_exemplars, resim, run_args["adaptation_edge_n"]),
-            "08_adaptation_ratio", "resimulate_point() -> run_held_injected_grid.compute_adaptation_ratio()")
-        save(make_fi_slope_page(cell_id, grid, features), "09_fi_slope",
+            "10_adaptation_ratio", "resimulate_point() -> run_held_injected_grid.compute_adaptation_ratio()")
+        save(make_fi_slope_page(cell_id, grid, features), "11_fi_slope",
             f"{grid_features_cache_name} (extract_grid_features.compute_fi_slope())")
-        save(make_self_consistency_page(cell_id, cell_result, resim), "10_self_consistency",
+        save(make_self_consistency_page(cell_id, cell_result, resim), "12_self_consistency",
             "cached test_pattern/rebound_pattern vs. fresh resimulate_point() results")
-        save(make_onset_burst_page(cell_id, onset_exemplars, resim, run_args), "11_onset_burst_detection",
-            "resimulate_point() -> run_held_injected_grid.detect_onset_burst()")
-        save(make_bimodality_teaching_page(cell_id, bimodality_exemplars, resim, run_args),
-            "12_bimodality_test", "resimulate_point() -> find_silencing_threshold.classify_burst_pattern() "
-            "(4th row: constructed synthetic ISIs, no resimulation)")
 
     print(f"{cell_id}: wrote {pdf_path} and {page_count} section PNGs to {png_dir}/")
 
