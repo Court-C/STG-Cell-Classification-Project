@@ -36,6 +36,7 @@ from find_silencing_threshold import (compute_isis_ms, classify_burst_pattern, c
 from extract_grid_features import (DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_GRID_FEATURES_CACHE_PATH,
                                    compute_fi_slope)
 from run_held_injected_grid import DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_GRID_CACHE_PATH
+from run_held_injected_grid import build_cell_grid_features_fig
 from trace_annotations import (mark_spikes, mark_confirmed_vs_rejected, mark_isi_classification,
                                mark_sag_trough, mark_adaptation_window, mark_rebound_window,
                                mark_onset_and_trailing_silence)
@@ -176,6 +177,41 @@ def make_cover_page(cell_id: str, cell_result: dict, features: dict, sections: l
     return fig
 
 
+def make_feature_overview_page(cell_id, cell_result, features) -> plt.Figure:
+    """The actual result being validated: every panel of extracted features
+    across this cell's full current grid, laid out exactly as extract_grid_
+    features.py's own standalone figure (same helper, same no-interpolation
+    exact-matrix rendering -- see build_cell_grid_features_fig). Every page
+    after this one drills into one piece of evidence behind one of these
+    panels; without this page first, a reader has no way to see what the
+    rest of the packet is actually building a case for (user-flagged
+    2026-08-14: "hard to show what we've proved something if we don't know
+    what's being proved").
+
+    No resimulation -- built entirely from the cached grid and features
+    dicts already on disk, the same cached data every other panel in this
+    row of pipeline scripts reads.
+    """
+    fig = build_cell_grid_features_fig(cell_result, features, bottom_margin=0.16)
+    burstiness = features.get("burstiness_index")
+    fi_slope = features.get("fi_slope_hz_per_nA")
+    fi_r2 = features.get("fi_slope_r2")
+    fig.suptitle(f"1. Feature overview: {cell_id}'s full current grid", fontsize=13, weight="bold", y=0.995)
+    caption = _wrap(
+       f"Every panel below is computed from the same {cell_result['n_points_total']}-point grid of held "
+       "and injected current levels: which pattern each point fires in and whether it rebounds after "
+       "release from hyperpolarization (top row), firing rate and burst structure (second row), rebound "
+       "spike count, latency, and peak voltage (third row), and sag depth, adaptation, and burst size "
+       f"(bottom row). Two single-number summaries condense the whole grid: a burstiness index of "
+       f"{burstiness:.3f} (the fraction of points classified bursting) and a firing-rate-vs-current slope "
+       f"of {fi_slope:.2f} Hz/nA (R^2={fi_r2:.3f}). The rest of this packet does not add new results -- it "
+       "re-derives individual pieces of this same grid from real simulated traces so each one can be "
+       "checked by eye against the panel it feeds.",
+       width=155)
+    fig.text(0.5, 0.012, caption, ha="center", va="bottom", fontsize=8.5)
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Representative traces
 # ---------------------------------------------------------------------------
@@ -282,7 +318,7 @@ def make_representative_traces_page(cell_id, cell_result, resim) -> plt.Figure:
        "so amplitude and duration are directly comparable by eye -- without this, a small subthreshold "
        "wobble and a full-amplitude spike train would each be independently rescaled to fill the same "
        "panel and look equally prominent.")
-    fig.suptitle("1. Representative traces", fontsize=13, weight="bold")
+    fig.suptitle("2. Representative traces", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.18, 1, 0.93))
     bottom_left = axes_flat[(nrows - 1) * ncols]
     bottom_right = axes_flat[-1]
@@ -333,7 +369,7 @@ def make_spike_detection_page(cell_id, held_inj_pairs, resim) -> plt.Figure:
         ax.legend(loc="upper right", fontsize=7)
         ax.set_xlabel("time (ms)")
         captions.append((ax, caption))
-    fig.suptitle("2. Spike detection", fontsize=13, weight="bold")
+    fig.suptitle("3. Spike detection", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.02, 1, 0.94))
     fig.subplots_adjust(hspace=0.9)
     for ax, caption in captions:
@@ -389,7 +425,7 @@ def make_prominence_sensitivity_page(cell_id, held_inj_pairs, resim) -> plt.Figu
        width=105)
     fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
     fig.tight_layout(rect=(0, 0.20, 1, 0.90))
-    fig.suptitle("3. Spike-detection threshold sensitivity", fontsize=13, weight="bold", y=0.99)
+    fig.suptitle("4. Spike-detection threshold sensitivity", fontsize=13, weight="bold", y=0.99)
     return fig
 
 
@@ -448,7 +484,7 @@ def make_dvdt_crossvalidation_page(cell_id, grid, resim, dt_ms, n_sample=20, see
        "100% shows that the simpler amplitude-based detector used throughout is not missing any spikes "
        "that a shape-based check would catch.", width=115)
     fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
-    fig.suptitle("4. Independent cross-check of spike detection by upstroke shape",
+    fig.suptitle("5. Independent cross-check of spike detection by upstroke shape",
                fontsize=12, weight="bold")
     fig.tight_layout(rect=(0, 0.12, 1, 0.93))
     return fig
@@ -507,7 +543,7 @@ def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.F
         ax_v.set_title(f"{tag} (held={held_nA:.2f} nA, injected={injected_nA:.2f} nA): "
                       f"classified as {_describe_pattern(result['pattern'])}", fontsize=9, wrap=True)
         captions.append((ax_v, ax_kde, caption))
-    fig.suptitle("5. Tonic / bursting / silent classification", fontsize=13, weight="bold")
+    fig.suptitle("6. Tonic / bursting / silent classification", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.12, 1, 0.96))
     fig.subplots_adjust(hspace=0.85)
     for ax_v, ax_kde, caption in captions:
@@ -626,7 +662,7 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
                     "case this cell's own data has not been observed to produce. "
                     f"{caption}"))
 
-    fig.suptitle("6. Bimodality test: within-burst vs. between-burst ISIs", fontsize=13, weight="bold")
+    fig.suptitle("7. Bimodality test: within-burst vs. between-burst ISIs", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.11, 1, 0.96))
     fig.subplots_adjust(hspace=1.3)
     for ax_v, ax_kde, caption in captions:
@@ -652,7 +688,7 @@ def make_rebound_page(cell_id, exemplars, resim, rebound_latency_min_ms) -> plt.
         ax.legend(loc="upper right", fontsize=7)
         ax.set_xlabel("time since release (ms)")
         captions.append((ax, caption))
-    fig.suptitle("8. Post-inhibitory rebound detection", fontsize=13, weight="bold")
+    fig.suptitle("9. Post-inhibitory rebound detection", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.02, 1, 0.94))
     fig.subplots_adjust(hspace=0.9)
     for ax, caption in captions:
@@ -680,7 +716,7 @@ def make_sag_page(cell_id, exemplars, resim, sag_window_ms) -> plt.Figure:
         ax.set_ylabel("V (mV)")
         ax.legend(loc="upper right", fontsize=6.5)
         captions.append((ax, caption))
-    fig.suptitle("9. Sag depth", fontsize=13, weight="bold")
+    fig.suptitle("10. Sag depth", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.22, 1, 0.90))
     for ax, caption in captions:
         _place_caption_below(fig, ax, caption, width=55)
@@ -718,7 +754,7 @@ def make_adaptation_page(cell_id, exemplars, resim, adaptation_edge_n) -> plt.Fi
         ax_isi.set_xlabel("interval index (spike-to-spike)")
         ax_isi.set_ylabel("interspike interval (ms)")
         captions.append((ax_isi, caption))
-    fig.suptitle("10. Spike-frequency adaptation", fontsize=13, weight="bold")
+    fig.suptitle("11. Spike-frequency adaptation", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.14, 1, 0.93))
     fig.subplots_adjust(hspace=0.6)
     for ax_isi, caption in captions:
@@ -759,7 +795,7 @@ def make_fi_slope_page(cell_id, grid, features) -> plt.Figure:
        "is one of the features used to characterize this cell in the cross-cell comparison; here it is "
        "plotted directly against the data it was fit to.", width=110)
     fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
-    fig.suptitle("11. Firing rate vs. injected current", fontsize=13, weight="bold")
+    fig.suptitle("12. Firing rate vs. injected current", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.12, 1, 0.93))
     return fig
 
@@ -815,7 +851,7 @@ def make_self_consistency_page(cell_id, cell_result, resim, n_sample=40, seed=11
        "different classification right at that boundary.",
        width=115)
     fig.text(0.5, 0.03, caption, ha="center", va="bottom", fontsize=7.5)
-    fig.suptitle("12. Reproducibility check", fontsize=13, weight="bold")
+    fig.suptitle("13. Reproducibility check", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.22, 1, 0.88))
     return fig
 
@@ -857,7 +893,7 @@ def make_onset_burst_page(cell_id, exemplars, resim, run_args) -> plt.Figure:
         ax_v.set_ylabel("V (mV)")
         ax_v.legend(loc="upper right", fontsize=6)
         captions.append((ax_v, caption))
-    fig.suptitle("7. Burst-onset-then-silence detection", fontsize=13, weight="bold")
+    fig.suptitle("8. Burst-onset-then-silence detection", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.02, 1, 0.94))
     fig.subplots_adjust(hspace=1.0)
     for ax_v, caption in captions:
@@ -946,12 +982,16 @@ def build_packet(cell_id: str, args) -> None:
     # unrelated topics and split the tonic/bursting classification test
     # (section 5) from its own deep-dive and edge-case follow-ups (sections
     # 11-12), separating them with five pages on unrelated features):
-    # foundation (spike detection, validated three ways) -> the
-    # classification built on top of it (whole-window test, its statistical
-    # basis, then its short-train edge case) -> other independent per-point
-    # features -> population-level summary -> end-to-end reproducibility as
-    # a capstone check.
+    # the actual result first (every extracted-feature panel across the
+    # whole grid, user-flagged 2026-08-14: "hard to show what we've proved
+    # something if we don't know what's being proved") -> foundation (spike
+    # detection, validated three ways) -> the classification built on top of
+    # it (whole-window test, its statistical basis, then its short-train
+    # edge case) -> other independent per-point features -> population-level
+    # summary -> end-to-end reproducibility as a capstone check.
     sections = [
+        ("Feature overview", "Every extracted-feature panel across the full current grid -- what the rest "
+         "of this packet verifies."),
         ("Representative traces", "Every distinct response pattern this cell produces, then one "
          "full-detail trace per pattern."),
         ("Spike detection", "Every spike the automated detector found, marked on real traces."),
@@ -1014,7 +1054,10 @@ def build_packet(cell_id: str, args) -> None:
         _save_page(make_cover_page(cell_id, cell_result, features, sections), pdf, png_dir, "00_cover",
                   command, f"{grid_cache_name} + {grid_features_cache_name}")
         page_count += 1
-        save(make_representative_traces_page(cell_id, cell_result, resim), "01_representative_traces",
+        save(make_feature_overview_page(cell_id, cell_result, features), "01_feature_overview",
+            f"{grid_features_cache_name} (run_held_injected_grid.build_cell_grid_features_fig(), no "
+            "resimulation)")
+        save(make_representative_traces_page(cell_id, cell_result, resim), "02_representative_traces",
             "plot_example_traces.select_exemplar_points() + resimulate_point()")
         # One full-detail page per combination, folded into the packet
         # instead of a standalone figures/example_traces/{cell_id}/
@@ -1033,30 +1076,30 @@ def build_packet(cell_id: str, args) -> None:
             save(detail_fig, f"representative_traces_detail/{i:02d}__{slug}",
                 "plot_example_traces.select_exemplar_points() + resimulate_point() -> "
                 "plot_example_traces.build_example_trace_figure()")
-        save(make_spike_detection_page(cell_id, spike_pts, resim), "02_spike_detection",
+        save(make_spike_detection_page(cell_id, spike_pts, resim), "03_spike_detection",
             "resimulate_point() -> trace_annotations.mark_spikes() (scipy.signal.find_peaks, same call "
             "find_silencing_threshold.compute_isis_ms uses)")
-        save(make_prominence_sensitivity_page(cell_id, spike_pts, resim), "03_prominence_sensitivity",
+        save(make_prominence_sensitivity_page(cell_id, spike_pts, resim), "04_prominence_sensitivity",
             "resimulate_point() -> scipy.signal.find_peaks swept over PROMINENCE_FRACTION")
-        save(make_dvdt_crossvalidation_page(cell_id, grid, resim, dt_ms), "04_dvdt_crossvalidation",
+        save(make_dvdt_crossvalidation_page(cell_id, grid, resim, dt_ms), "05_dvdt_crossvalidation",
             "resimulate_point() -> find_silencing_threshold.detect_spikes_dvdt_confirmed()")
         save(make_burst_classification_page(cell_id, burst_exemplars, resim, run_args),
-            "05_burst_classification", "resimulate_point() -> find_silencing_threshold.classify_burst_pattern()")
+            "06_burst_classification", "resimulate_point() -> find_silencing_threshold.classify_burst_pattern()")
         save(make_bimodality_teaching_page(cell_id, bimodality_exemplars, resim, run_args),
-            "06_bimodality_test", "resimulate_point() -> find_silencing_threshold.classify_burst_pattern() "
+            "07_bimodality_test", "resimulate_point() -> find_silencing_threshold.classify_burst_pattern() "
             "(4th row: constructed synthetic ISIs, no resimulation)")
-        save(make_onset_burst_page(cell_id, onset_exemplars, resim, run_args), "07_onset_burst_detection",
+        save(make_onset_burst_page(cell_id, onset_exemplars, resim, run_args), "08_onset_burst_detection",
             "resimulate_point() -> run_held_injected_grid.detect_onset_burst()")
         save(make_rebound_page(cell_id, rebound_exemplars, resim, run_args["rebound_latency_min_ms"]),
-            "08_rebound_detection", "resimulate_point() -> trace_annotations.mark_rebound_window() "
+            "09_rebound_detection", "resimulate_point() -> trace_annotations.mark_rebound_window() "
             "(reproduces run_held_injected_grid.run_test_and_recovery's rebound-peak logic)")
-        save(make_sag_page(cell_id, sag_exemplars, resim, run_args["sag_window_ms"]), "09_sag_depth",
+        save(make_sag_page(cell_id, sag_exemplars, resim, run_args["sag_window_ms"]), "10_sag_depth",
             "resimulate_point() -> run_held_injected_grid.compute_pre_spike_sag_trough()")
         save(make_adaptation_page(cell_id, adapt_exemplars, resim, run_args["adaptation_edge_n"]),
-            "10_adaptation_ratio", "resimulate_point() -> run_held_injected_grid.compute_adaptation_ratio()")
-        save(make_fi_slope_page(cell_id, grid, features), "11_fi_slope",
+            "11_adaptation_ratio", "resimulate_point() -> run_held_injected_grid.compute_adaptation_ratio()")
+        save(make_fi_slope_page(cell_id, grid, features), "12_fi_slope",
             f"{grid_features_cache_name} (extract_grid_features.compute_fi_slope())")
-        save(make_self_consistency_page(cell_id, cell_result, resim), "12_self_consistency",
+        save(make_self_consistency_page(cell_id, cell_result, resim), "13_self_consistency",
             "cached test_pattern/rebound_pattern vs. fresh resimulate_point() results")
 
     print(f"{cell_id}: wrote {pdf_path} and {page_count} section PNGs to {png_dir}/")

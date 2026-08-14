@@ -1279,9 +1279,17 @@ def _panel_categorical(ax, value_map, held_levels, injected_levels, extent, colo
     ax.legend(handles=handles, loc="best", fontsize=6)
 
 
-def plot_cell_grid_features(cell_result: dict, features: dict, outdir: Path, command: str,
-                            fig_format: str = DEFAULT_FIGURE_FORMAT) -> None:
-    """Merged replacement for the old plot_cell_grid (6 panels, this module)
+def build_cell_grid_features_fig(cell_result: dict, features: dict, bottom_margin: float = 0.025):
+    """Builds the 14-panel grid-features figure and returns it WITHOUT a
+    suptitle, footer, or save/close -- split out of plot_cell_grid_features
+    (below) so a second caller (generate_validation_packet.py's feature-
+    overview page) can reuse the exact same panel-drawing code, including
+    the no-interpolation exact-matrix rendering, instead of maintaining a
+    second copy that could drift out of sync. Returns None under the same
+    conditions plot_cell_grid_features used to skip silently (not ok /
+    empty grid / features not ok).
+
+    Merged replacement for the old plot_cell_grid (6 panels, this module)
     + plot_cell_features (12 panels, extract_grid_features.py) -- 4 of the
     6/12 were exact duplicates (firing rate, rebound count, rebound
     latency, spikes/burst); this shows the 14 genuinely distinct panels
@@ -1299,7 +1307,7 @@ def plot_cell_grid_features(cell_result: dict, features: dict, outdir: Path, com
     undefined one.
     """
     if cell_result["status"] != "ok" or not cell_result["grid"] or features.get("status") != "ok":
-        return
+        return None
     cell_id = cell_result["cell_id"]
     grid = cell_result["grid"]
     held_levels = list(cell_result["held_levels_nA"])
@@ -1386,6 +1394,26 @@ def plot_cell_grid_features(cell_result: dict, features: dict, outdir: Path, com
         ax.set_ylabel("injected (nA)", fontsize=7)
         ax.tick_params(labelsize=7)
 
+    # Left title-less: tight_layout's rect still reserves the same top/
+    # bottom margin whether or not a suptitle/footer is added yet, so each
+    # caller can add its own afterward without triggering a re-layout.
+    # bottom_margin is a parameter (not always 0.025) because the
+    # validation packet's feature-overview page adds a multi-line prose
+    # caption below the panels that the standalone figure doesn't have --
+    # it needs much more reserved space than a one-line command footer does.
+    fig.tight_layout(rect=(0.0, bottom_margin, 1.0, 0.965))
+    return fig
+
+
+def plot_cell_grid_features(cell_result: dict, features: dict, outdir: Path, command: str,
+                            fig_format: str = DEFAULT_FIGURE_FORMAT) -> None:
+    """Thin save-to-disk wrapper around build_cell_grid_features_fig -- see
+    that function's docstring for what the figure itself contains.
+    """
+    fig = build_cell_grid_features_fig(cell_result, features)
+    if fig is None:
+        return
+    cell_id = cell_result["cell_id"]
     burstiness = features.get("burstiness_index")
     fi_slope = features.get("fi_slope_hz_per_nA")
     burstiness_str = f"{burstiness:.3f}" if burstiness is not None else "None"
@@ -1395,7 +1423,6 @@ def plot_cell_grid_features(cell_result: dict, features: dict, outdir: Path, com
             f"n_points={cell_result['n_points_total']}, "
             f"burstiness={burstiness_str}, F-I slope={fi_slope_str}")
     fig.suptitle(title, fontsize=10)
-    fig.tight_layout(rect=(0.0, 0.025, 1.0, 0.965))
     fig.text(0.5, 0.005, command, ha="center", va="bottom",
              fontsize=6, family="monospace", color="dimgray", wrap=True)
     outpath = outdir / f"{cell_id}_grid.{fig_format}"
