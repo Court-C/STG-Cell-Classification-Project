@@ -141,7 +141,7 @@ from find_silencing_threshold import (settle_at_level, _round_level,
 
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_chirp_protocol.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "chirp_protocol"
-DEFAULT_FIGURE_FORMAT = "svg"
+DEFAULT_FIGURE_FORMAT = "png"
 # temp == reftemp -- see run_held_injected_grid.py's DEFAULT_TEMP comment
 # (at dtemp=0 every q10 factor collapses to 1, so every cell runs at its
 # literal reference-temperature values; this keeps Step 4 consistent with

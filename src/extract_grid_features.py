@@ -46,7 +46,7 @@ from run_held_injected_grid import load_output_cache as load_grid_cache, plot_ce
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_grid_features.pkl"
 DEFAULT_PCA_OUTPUT_PATH = ROOT_DIR / "cell_grid_features_pca.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "grid_features"
-DEFAULT_FIGURE_FORMAT = "svg"
+DEFAULT_FIGURE_FORMAT = "png"
 
 
 # ---------------------------------------------------------------------------

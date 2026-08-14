@@ -47,7 +47,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 DEFAULT_TRACK_A_PATH = ROOT_DIR / "track_a_features.csv"
 DEFAULT_MASTER_CSV_PATH = ROOT_DIR / "master_features.csv"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "conductance_correlation_structure"
-DEFAULT_FIGURE_FORMAT = "svg"
+DEFAULT_FIGURE_FORMAT = "png"
 
 CONDUCTANCE_COLS = ["gNa", "gKCa", "gKd", "gCaT", "gA", "gL", "gH", "gImi", "gCaS"]
 MIN_GROUP_SIZE = 5

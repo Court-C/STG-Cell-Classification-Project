@@ -88,7 +88,7 @@ DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_held_injected_grid.pkl"
 # features.py's features dict, so it's built and called from there. Kept
 # here (not moved) since plot_cell_grid_features itself still lives in
 # this module, alongside _fine_grid_coords/_render_heatmap.
-DEFAULT_FIGURE_FORMAT = "svg"
+DEFAULT_FIGURE_FORMAT = "png"
 # temp == reftemp: at dtemp=0, every q10^(dtemp/10) factor in
 # singlecell_model_v1.py's _derivatives_core collapses to 1 regardless of a
 # cell's own q10 parameters, so every cell's conductances/kinetics run at
@@ -1195,7 +1195,14 @@ PATTERN_COLORS = {"silent": "gray", "tonic": "steelblue", "bursting": "mediumpur
 REBOUND_PATTERN_COLORS = {"none": "gray", "single_spike": "steelblue",
                           "tonic_rebound": "seagreen", "bursting_rebound": "mediumpurple",
                           "not_applicable": "lightgray"}
-NO_DATA_COLOR = (0.88, 0.88, 0.88, 1.0)  # light gray, distinct from every real category color
+# "none" and "not_applicable" both mean "no rebound to report here" -- they're
+# rendered as BLANK_COLOR (see _panel_categorical's blank_labels), not their
+# nominal colors above, so this dict's colors for them are unused in practice.
+REBOUND_BLANK_LABELS = {"none", "not_applicable"}
+NO_DATA_COLOR = (1.0, 1.0, 1.0, 1.0)  # plain white: a pixel with nothing to report,
+# whether that's a genuinely missing grid coordinate or a blank_labels category --
+# a reader doesn't need three shades of gray individually justified to read
+# "nothing happened here" (user-flagged 2026-08-14).
 
 
 def _exact_grid_matrix(value_map: dict, held_levels, injected_levels) -> np.ndarray:
@@ -1252,30 +1259,35 @@ def _panel_map(ax, value_map, held_levels, injected_levels, extent, cmap, label,
     ax.set_title(title, fontsize=9)
 
 
-def _panel_categorical(ax, value_map, held_levels, injected_levels, extent, colors, title):
+def _panel_categorical(ax, value_map, held_levels, injected_levels, extent, colors, title,
+                       blank_labels=frozenset()):
     """Shared categorical-panel renderer -- colormaps category codes to RGBA
     (never blends raw integer codes: "silent"=0 blended with "tonic"=1
     could land near 0.5, a fabricated intermediate category that doesn't
-    exist), then imshow's with interpolation="nearest". Missing coordinates
-    (see _exact_grid_matrix) are painted a fixed NO_DATA_COLOR, distinct
-    from every real category color and explicitly labeled in the legend --
-    never silently absorbed into whichever real category happens to render
-    nearby.
+    exist), then imshow's with interpolation="nearest".
+
+    A pixel is painted NO_DATA_COLOR (plain white, no legend entry) when its
+    grid coordinate is genuinely missing (see _exact_grid_matrix) OR its
+    category is listed in blank_labels -- categories that themselves just
+    mean "nothing to report here" (e.g. rebound pattern's "none"/
+    "not_applicable"). Both cases read identically to a reader: don't give
+    "no data" its own gray shade and legend line distinct from "none"'s,
+    when the point of the pixel is that there's nothing there either way
+    (user-flagged 2026-08-14 -- three near-identical grays each individually
+    explained in the legend, to say "nothing happened").
     """
     names = list(colors.keys())
     matrix = _exact_grid_matrix(value_map, held_levels, injected_levels)
     cmap = ListedColormap(list(colors.values()))
     norm = BoundaryNorm(np.arange(len(names) + 1) - 0.5, cmap.N)
-    no_data = np.isnan(matrix)
-    rgba = cmap(norm(np.where(no_data, 0, matrix)))
-    rgba[no_data] = NO_DATA_COLOR
+    blank_codes = [names.index(lbl) for lbl in blank_labels if lbl in names]
+    blank = np.isnan(matrix) | np.isin(matrix, blank_codes)
+    rgba = cmap(norm(np.where(blank, 0, matrix)))
+    rgba[blank] = NO_DATA_COLOR
     ax.imshow(rgba, origin="lower", extent=extent, aspect="auto", interpolation="nearest")
     ax.set_title(title, fontsize=9)
     handles = [plt.Line2D([0], [0], marker="s", color="w", markerfacecolor=c, markersize=8, label=lbl)
-              for lbl, c in colors.items()]
-    if no_data.any():
-        handles.append(plt.Line2D([0], [0], marker="s", color="w", markerfacecolor=NO_DATA_COLOR,
-                                  markersize=8, label="no data"))
+              for lbl, c in colors.items() if lbl not in blank_labels]
     ax.legend(handles=handles, loc="best", fontsize=6)
 
 
@@ -1336,7 +1348,7 @@ def build_cell_grid_features_fig(cell_result: dict, features: dict, bottom_margi
     rp_names = list(REBOUND_PATTERN_COLORS.keys())
     rp_codes = {k: rp_names.index(v) for k, v in rebound_pattern_map.items()}
     _panel_categorical(axes[0, 1], rp_codes, held_levels, injected_levels, extent,
-                       REBOUND_PATTERN_COLORS, "rebound pattern")
+                       REBOUND_PATTERN_COLORS, "rebound pattern", blank_labels=REBOUND_BLANK_LABELS)
 
     # Row 1 -- rate/timing (4). firing_rate_map reconciled to the more
     # permissive definition (see docstring): includes silent points at

@@ -64,7 +64,7 @@ from consolidate_features import select_complete_case_matrix, DEFAULT_OUTPUT_CSV
 DEFAULT_OUTPUT_CSV_PATH = ROOT_DIR / "cell_clusters.csv"
 DEFAULT_OUTPUT_PICKLE_PATH = ROOT_DIR / "cell_clusters.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "clustering"
-DEFAULT_FIGURE_FORMAT = "svg"
+DEFAULT_FIGURE_FORMAT = "png"
 
 CONDUCTANCE_COLS = ["gNa", "gKCa", "gKd", "gCaT", "gA", "gL", "gH", "gImi", "gCaS"]
 CATEGORICAL_ANNOTATION_COLS = ["silencing_status", "any_bursting_before_silence"]

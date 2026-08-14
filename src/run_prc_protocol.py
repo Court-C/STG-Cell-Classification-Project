@@ -85,7 +85,7 @@ from find_silencing_threshold import (constant_iapp_func, classify_burst_pattern
 
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_prc.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "prc"
-DEFAULT_FIGURE_FORMAT = "svg"
+DEFAULT_FIGURE_FORMAT = "png"
 # Read-only cross-check input -- see module docstring. Never written by this
 # script.
 DEFAULT_GRID_FEATURES_CACHE_PATH = ROOT_DIR / "cell_grid_features.pkl"

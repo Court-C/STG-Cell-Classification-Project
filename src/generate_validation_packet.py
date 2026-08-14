@@ -149,11 +149,15 @@ def make_cover_page(cell_id: str, cell_result: dict, features: dict, sections: l
         "it found directly on the trace.", width=95)
     fig.text(0.08, 0.87, intro, fontsize=10, va="top", wrap=True)
 
+    burstiness = features.get("burstiness_index")
+    fi_slope = features.get("fi_slope_hz_per_nA")
+    fi_slope_r2 = features.get("fi_slope_r2")
     summary_line1 = (f"Silencing threshold: {cell_result['cell_floor_nA']:.2f} nA   |   "
                      f"{cell_result['n_points_total']} points sampled across the current grid")
-    summary_line2 = f"Burstiness index: {features.get('burstiness_index'):.3f}"
-    summary_line3 = (f"Firing-rate/current slope: {features.get('fi_slope_hz_per_nA'):.2f} Hz/nA "
-                     f"(R^2={features.get('fi_slope_r2'):.3f})")
+    summary_line2 = f"Burstiness index: {burstiness:.3f}" if burstiness is not None else "Burstiness index: None"
+    summary_line3 = (f"Firing-rate/current slope: {fi_slope:.2f} Hz/nA (R^2={fi_slope_r2:.3f})"
+                     if fi_slope is not None and fi_slope_r2 is not None
+                     else "Firing-rate/current slope: not available (no tonic points to fit)")
     fig.text(0.08, 0.60, summary_line1, fontsize=9, va="top", family="monospace")
     fig.text(0.08, 0.575, summary_line2, fontsize=9, va="top", family="monospace")
     fig.text(0.08, 0.55, summary_line3, fontsize=9, va="top", family="monospace")
@@ -197,14 +201,17 @@ def make_feature_overview_page(cell_id, cell_result, features) -> plt.Figure:
     fi_slope = features.get("fi_slope_hz_per_nA")
     fi_r2 = features.get("fi_slope_r2")
     fig.suptitle(f"1. Feature overview: {cell_id}'s full current grid", fontsize=13, weight="bold", y=0.995)
+    burstiness_str = f"{burstiness:.3f}" if burstiness is not None else "None"
+    fi_slope_str = (f"of {fi_slope:.2f} Hz/nA (R^2={fi_r2:.3f})" if fi_slope is not None and fi_r2 is not None
+                    else "that is not available (no tonic points to fit)")
     caption = _wrap(
        f"Every panel below is computed from the same {cell_result['n_points_total']}-point grid of held "
        "and injected current levels: which pattern each point fires in and whether it rebounds after "
        "release from hyperpolarization (top row), firing rate and burst structure (second row), rebound "
        "spike count, latency, and peak voltage (third row), and sag depth, adaptation, and burst size "
        f"(bottom row). Two single-number summaries condense the whole grid: a burstiness index of "
-       f"{burstiness:.3f} (the fraction of points classified bursting) and a firing-rate-vs-current slope "
-       f"of {fi_slope:.2f} Hz/nA (R^2={fi_r2:.3f}). The rest of this packet does not add new results -- it "
+       f"{burstiness_str} (the fraction of points classified bursting) and a firing-rate-vs-current slope "
+       f"{fi_slope_str}. The rest of this packet does not add new results -- it "
        "re-derives individual pieces of this same grid from real simulated traces so each one can be "
        "checked by eye against the panel it feeds.",
        width=155)

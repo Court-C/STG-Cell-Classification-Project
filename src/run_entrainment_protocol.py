@@ -62,7 +62,7 @@ from predict_entrainment import DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_PREDICTION_
 
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_entrainment_validation.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "entrainment_validation"
-DEFAULT_FIGURE_FORMAT = "svg"
+DEFAULT_FIGURE_FORMAT = "png"
 DEFAULT_PRC_CACHE_PATH = ROOT_DIR / "cell_prc.pkl"
 
 # Same Q10-inert convention as every other protocol in this project.

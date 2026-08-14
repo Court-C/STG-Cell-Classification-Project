@@ -97,7 +97,7 @@ from run_held_injected_grid import (get_cell_floor_nA,
 
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_ramp_protocol.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "ramp_protocol"
-DEFAULT_FIGURE_FORMAT = "svg"
+DEFAULT_FIGURE_FORMAT = "png"
 # temp == reftemp -- matches find_silencing_threshold.py / run_held_injected_grid.py's
 # already-corrected convention (q10 scaling collapses to 1 at dtemp=0).
 DEFAULT_TEMP = 10.0

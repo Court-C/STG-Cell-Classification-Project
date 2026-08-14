@@ -61,7 +61,7 @@ from consolidate_features import select_complete_case_matrix, DEFAULT_OUTPUT_CSV
 from cluster_features import CONDUCTANCE_COLS, drop_zero_variance
 
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "clustering_search"
-DEFAULT_FIGURE_FORMAT = "svg"
+DEFAULT_FIGURE_FORMAT = "png"
 
 DEFAULT_TARGET_K = 3
 DEFAULT_K_MIN = 2

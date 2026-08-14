@@ -81,7 +81,7 @@ from find_silencing_threshold import (constant_iapp_func, settle_at_level, PROMI
 
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_intrinsic_properties.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "intrinsic_properties"
-DEFAULT_FIGURE_FORMAT = "svg"
+DEFAULT_FIGURE_FORMAT = "png"
 # Matches find_silencing_threshold.py / run_held_injected_grid.py: temp ==
 # reftemp so every cell's q10 factors collapse to 1 and conductances run at
 # their literal reference-temperature values (both of those scripts were

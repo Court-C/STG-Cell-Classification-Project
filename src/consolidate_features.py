@@ -41,7 +41,7 @@ DEFAULT_OUTPUT_CSV_PATH = ROOT_DIR / "master_features.csv"
 DEFAULT_PCA_OUTPUT_PATH = ROOT_DIR / "master_features_pca.pkl"
 DEFAULT_PCA_LOADINGS_CSV_PATH = ROOT_DIR / "master_features_pca_loadings.csv"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "master_features"
-DEFAULT_FIGURE_FORMAT = "svg"
+DEFAULT_FIGURE_FORMAT = "png"
 
 
 # ---------------------------------------------------------------------------

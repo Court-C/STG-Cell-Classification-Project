@@ -43,7 +43,7 @@ from run_held_injected_grid import (constant_iapp_func, settle_hold_level, run_t
                                     DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_GRID_CACHE_PATH)
 
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "example_traces"
-DEFAULT_FIGURE_FORMAT = "svg"
+DEFAULT_FIGURE_FORMAT = "png"
 
 # Curated to span the range of behaviors seen in the real 69-cell grid
 # (see the session that built this: richest classification diversity,
