@@ -130,7 +130,9 @@ def get_cell_floor_nA(silencing_entry: dict, margin_nA: float):
 # ---------------------------------------------------------------------------
 
 def classify_hold_pattern(chunk_v, chunk_t, min_isis_for_burst_test, isi_mode_prominence_frac,
-                          min_isi_ratio, min_ashman_d: float = 2.0) -> str:
+                          min_isi_ratio, min_ashman_d: float = 2.0,
+                          ratio_override_ashman_d: float = 5.0,
+                          ratio_override_min_ratio: float = 1.15) -> str:
     """tonic/bursting/silent for a held level's OWN steady-state firing,
     from whichever settle chunk is already being simulated anyway (the
     last hold-settle chunk for held!=0, the cached Iapp=0 burn-in trace for
@@ -145,14 +147,17 @@ def classify_hold_pattern(chunk_v, chunk_t, min_isis_for_burst_test, isi_mode_pr
         return "silent"
     isis_ms, n_peaks = compute_isis_ms(chunk_v, chunk_t, PROMINENCE_FRACTION)
     burst = classify_burst_pattern(isis_ms, min_isis_for_burst_test, isi_mode_prominence_frac,
-                                   min_isi_ratio, min_ashman_d=min_ashman_d, n_peaks=n_peaks)
+                                   min_isi_ratio, min_ashman_d=min_ashman_d,
+                                   ratio_override_ashman_d=ratio_override_ashman_d,
+                                   ratio_override_min_ratio=ratio_override_min_ratio, n_peaks=n_peaks)
     return to_stored_pattern(burst["pattern"])
 
 
 def settle_hold_level(params, held_nA, warm_start_state, dt, temp, reftemp,
                       chunk_s, max_settle_s, settle_rtol, min_peaks_for_rate,
                       min_isis_for_burst_test, isi_mode_prominence_frac, min_isi_ratio,
-                      min_ashman_d: float = 2.0) -> dict:
+                      min_ashman_d: float = 2.0, ratio_override_ashman_d: float = 5.0,
+                      ratio_override_min_ratio: float = 1.15) -> dict:
     """Settle at a constant held current, reusing Step 1's settle_at_level
     engine unchanged, plus the end-of-settle voltage (the pre-test baseline
     compute_pre_spike_sag_trough's sag depth is measured against) and this
@@ -166,7 +171,8 @@ def settle_hold_level(params, held_nA, warm_start_state, dt, temp, reftemp,
     r["hold_v_end_mV"] = float(r["last_chunk_v"][-1]) if r["last_chunk_v"] is not None else float("nan")
     r["hold_pattern"] = classify_hold_pattern(r["last_chunk_v"], r["last_chunk_t"],
                                               min_isis_for_burst_test, isi_mode_prominence_frac,
-                                              min_isi_ratio, min_ashman_d)
+                                              min_isi_ratio, min_ashman_d, ratio_override_ashman_d,
+                                              ratio_override_min_ratio)
     # Trough of the held level's OWN last settle chunk -- for a flatline hold
     # this equals hold_v_end_mV (a constant trace's min is its endpoint), but
     # for a hold that's itself tonically/burst firing at rest (e.g. XB2IQX at
@@ -313,7 +319,8 @@ def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_
                              min_isis_for_burst_test: int, isi_mode_prominence_frac: float,
                              min_isi_ratio: float, n_peaks: int, min_onset_isis: int = 2,
                              rebound_min_onset_isis: int = 1, trailing_silence_ratio: float = 3.0,
-                             min_ashman_d: float = 2.0) -> str:
+                             min_ashman_d: float = 2.0, ratio_override_ashman_d: float = 5.0,
+                             ratio_override_min_ratio: float = 1.15) -> str:
     """"bursting_rebound" or "tonic_rebound" for a >=2-spike recovery-window
     train (rebound_spike_count==1/0 are handled by the caller before this is
     reached). classify_burst_pattern's whole-train KDE bimodality test is
@@ -367,7 +374,9 @@ def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_
     if n >= min_isis_for_burst_test:
         kde_result = classify_burst_pattern(rebound_isis, min_isis_for_burst_test,
                                             isi_mode_prominence_frac, min_isi_ratio,
-                                            min_ashman_d=min_ashman_d, n_peaks=n_peaks)
+                                            min_ashman_d=min_ashman_d,
+                                            ratio_override_ashman_d=ratio_override_ashman_d,
+                                            ratio_override_min_ratio=ratio_override_min_ratio, n_peaks=n_peaks)
         onset_n, _ = detect_onset_burst(rebound_isis, min_isi_ratio, min_onset_isis)
         return "bursting_rebound" if (kde_result["pattern"] == "bursting" or onset_n is not None) \
             else "tonic_rebound"
@@ -388,7 +397,10 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
                           adaptation_edge_n: int = 3, min_onset_isis: int = 2,
                           trailing_silence_ratio: float = 3.0, rebound_min_onset_isis: int = 1,
                           max_test_window_s: float = None, test_window_extend_factor: float = 2.0,
-                          min_ashman_d: float = 2.0, return_traces: bool = False) -> dict:
+                          min_ashman_d: float = 2.0, ratio_override_ashman_d: float = 5.0,
+                          ratio_override_min_ratio: float = 1.15,
+                          adaptation_ratio_override_threshold: float = 5.0,
+                          return_traces: bool = False) -> dict:
     """Test window at the ABSOLUTE injected current level (held is not added
     on top -- see module docstring) followed by a recovery window (released
     back to held) watched for post-inhibitory rebound.
@@ -441,7 +453,10 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
             isis_test, test_n_spikes = compute_isis_ms(v_test, t_test, PROMINENCE_FRACTION)
             burst_test = classify_burst_pattern(isis_test, min_isis_for_burst_test,
                                                 isi_mode_prominence_frac, min_isi_ratio,
-                                                min_ashman_d=min_ashman_d, n_peaks=test_n_spikes)
+                                                min_ashman_d=min_ashman_d,
+                                                ratio_override_ashman_d=ratio_override_ashman_d,
+                                                ratio_override_min_ratio=ratio_override_min_ratio,
+                                                n_peaks=test_n_spikes)
             test_pattern = burst_test["pattern"]
             test_isi_short_ms = burst_test["isi_short_ms"]
             test_isi_long_ms = burst_test["isi_long_ms"]
@@ -482,6 +497,29 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
         detect_onset_burst(isis_test, min_isi_ratio, min_onset_isis)
         if isis_test is not None and len(isis_test) > 0 else (None, None))
 
+    # test_trailing_silence_ms: gap between the last detected spike and the
+    # end of the (possibly window-extended) test window -- invisible to any
+    # ISI-based statistic, since ISIs only exist between spikes. Needed to
+    # tell "still firing, window just cut off" apart from "genuinely
+    # stopped partway through" -- compute_adaptation_ratio's first-k/last-k
+    # ratio silently assumes the former. test_likely_ceased_firing flags the
+    # latter: trailing silence at least trailing_silence_ratio times the
+    # most recent ISI is no longer ordinary inter-spike jitter. Left None
+    # (rather than False) when there isn't at least one ISI to set a scale
+    # from, e.g. 0-1 total spikes -- "ceased" isn't a meaningful question
+    # for a window that barely started firing in the first place. Computed
+    # here (moved ahead of the onset-override block below, 2026-08-14) so
+    # the tiny-train override can use it.
+    test_trailing_silence_ms = None
+    test_likely_ceased_firing = None
+    if test_n_spikes >= 1 and test_first_spike_ms is not None:
+        last_spike_ms = test_first_spike_ms + (float(np.sum(isis_test))
+                                                if isis_test is not None and len(isis_test) > 0 else 0.0)
+        test_trailing_silence_ms = window_s * 1000.0 - last_spike_ms
+        if isis_test is not None and len(isis_test) > 0:
+            test_likely_ceased_firing = bool(
+                test_trailing_silence_ms >= trailing_silence_ratio * isis_test[-1])
+
     # test_pattern override, 2026-08-13: too few total ISIs for the whole-
     # window KDE test to even attempt classification (_raw_test_pattern was
     # "insufficient_data"/"sparse", collapsed to "silent" above) -- but
@@ -494,39 +532,36 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
     # onset burst, then genuine silence, reported "silent" even though the
     # cell plainly burst. Deliberately narrower than "onset found ->
     # bursting" unconditionally: a LONG train with a small onset
-    # (confirmed contrast: held=-2.39/inj=-3.37, 19 spikes, 3-spike onset,
-    # 16 more spikes of ordinary tonic firing after) legitimately IS tonic
-    # overall and stays that way here -- classify_burst_pattern already ran
-    # its KDE test successfully there, so _raw_test_pattern is "tonic", not
-    # "sparse"/"insufficient_data", and this override never triggers.
+    # (confirmed contrast: held=-2.39/inj=-3.37) legitimately runs its KDE
+    # test successfully (_raw_test_pattern == "tonic" there, not "sparse"/
+    # "insufficient_data"), so this override never triggers for it -- see
+    # the separate adaptation-ratio override below for that case instead.
     # test_n_bursts/test_spikes_per_burst are set directly from the onset
     # run below (burst_test's own n_long_isis doesn't apply -- classify_
     # burst_pattern never reached its "bursting" branch here).
     test_onset_dominates_sparse_window = (
         _raw_test_pattern in ("insufficient_data", "sparse") and test_onset_n_spikes is not None)
-    if test_onset_dominates_sparse_window:
-        test_pattern = "bursting"
 
-    # test_trailing_silence_ms: gap between the last detected spike and the
-    # end of the (possibly window-extended) test window -- invisible to any
-    # ISI-based statistic, since ISIs only exist between spikes. Needed to
-    # tell "still firing, window just cut off" apart from "genuinely
-    # stopped partway through" -- compute_adaptation_ratio's first-k/last-k
-    # ratio silently assumes the former. test_likely_ceased_firing flags the
-    # latter: trailing silence at least trailing_silence_ratio times the
-    # most recent ISI is no longer ordinary inter-spike jitter. Left None
-    # (rather than False) when there isn't at least one ISI to set a scale
-    # from, e.g. 0-1 total spikes -- "ceased" isn't a meaningful question
-    # for a window that barely started firing in the first place.
-    test_trailing_silence_ms = None
-    test_likely_ceased_firing = None
-    if test_n_spikes >= 1 and test_first_spike_ms is not None:
-        last_spike_ms = test_first_spike_ms + (float(np.sum(isis_test))
-                                                if isis_test is not None and len(isis_test) > 0 else 0.0)
-        test_trailing_silence_ms = window_s * 1000.0 - last_spike_ms
-        if isis_test is not None and len(isis_test) > 0:
-            test_likely_ceased_firing = bool(
-                test_trailing_silence_ms >= trailing_silence_ratio * isis_test[-1])
+    # test_pattern override, 2026-08-14: a train too short even for
+    # detect_onset_burst to attempt (needs >= min_onset_isis+1 ISIs; this
+    # has fewer), but with at least 1 ISI (2 spikes) that then definitively
+    # ended (test_likely_ceased_firing) -- the tiny-train analogue of
+    # classify_rebound_pattern's tier-3 "doublet burst" rule, extended here
+    # to the test window for the same reason: at this low a spike count, a
+    # burst-then-silence shape IS the entire observed train, and there's no
+    # meaningful "wait for more ISIs" option. Confirmed case: XB2IQX
+    # held=-4.50/inj=-4.04, ISIs [20.1, 36.6] (3 spikes) then 19.85s of
+    # silence in a 20s window -- reported "silent" even though the cell
+    # plainly fired a short burst and stopped. Does not overlap with
+    # test_onset_dominates_sparse_window above (that one requires
+    # test_onset_n_spikes is not None, only possible with >= min_onset_isis+1
+    # ISIs -- this covers what's too short even for that).
+    test_tiny_burst_then_silence = (
+        _raw_test_pattern in ("insufficient_data", "sparse") and test_onset_n_spikes is None
+        and isis_test is not None and len(isis_test) >= 1 and bool(test_likely_ceased_firing))
+
+    if test_onset_dominates_sparse_window or test_tiny_burst_then_silence:
+        test_pattern = "bursting"
 
     # Restricted to "tonic" AND not likely-ceased: a bursting train's
     # first-k/last-k ISIs would mix intra-/inter-burst intervals (see
@@ -539,18 +574,57 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
     # thing it measures for a train that keeps firing steadily to the end.
     test_adaptation_ratio = (compute_adaptation_ratio(isis_test, adaptation_edge_n)
                              if test_pattern == "tonic" and not test_likely_ceased_firing else None)
+
+    # test_pattern override, 2026-08-14: classify_burst_pattern's whole-
+    # window KDE test can resolve only 1 mode (-> "tonic") for a train whose
+    # "long" ISIs are themselves spread across a wide range -- the spread
+    # smears what would otherwise be a second peak into a low plateau
+    # instead of a resolvable mode, which is a KDE resolution failure, not
+    # evidence the train is actually tonic. Confirmed case: XB2IQX
+    # held=-2.39/inj=-3.37, 19 ISIs ranging 15ms to 617ms (~41x spread),
+    # KDE finds only 1 mode.
+    #
+    # Deliberately NOT gated on test_adaptation_ratio (first-3/last-3 ISI
+    # ratio) despite that being the more obviously "adaptation-shaped"
+    # signal: test_adaptation_ratio is itself only computed when NOT
+    # test_likely_ceased_firing, and this exact confirmed case is already
+    # documented (see generate_defense_packet.py's adapt_exemplars comment)
+    # to be unstable across resimulation runs on that specific flag --
+    # sometimes ceased=True (adaptation_ratio never computed, None), other
+    # times ceased=False (adaptation_ratio=17.5). A max/min spread ratio on
+    # the raw ISIs measures the same underlying non-stationarity but doesn't
+    # depend on where the window happened to cut off, so it stays available
+    # either way. test_n_bursts/test_spikes_per_burst are deliberately left
+    # None below for this case: unlike the onset-dominated overrides, there
+    # is no well-defined "one burst" or clean n_long_isis count for a train
+    # shaped like this, and reporting a fabricated number would be worse
+    # than reporting none.
+    test_isi_spread_ratio = (float(isis_test.max() / isis_test.min())
+                             if isis_test is not None and len(isis_test) > 0 and isis_test.min() > 0
+                             else None)
+    test_adaptation_ratio_extreme = (
+        test_pattern == "tonic" and test_isi_spread_ratio is not None
+        and test_isi_spread_ratio >= adaptation_ratio_override_threshold)
+    if test_adaptation_ratio_extreme:
+        test_pattern = "bursting"
+
     # n_bursts = n_long_isis + 1 (a "burst" is a maximal run of consecutive
     # short ISIs, so each inter-burst gap marks one more burst boundary);
     # spikes_per_burst is the average over the whole test window, not a
     # per-burst array -- see classify_burst_pattern's n_long_isis docstring.
-    # test_onset_dominates_sparse_window is checked FIRST: classify_burst_
-    # pattern never reached its "bursting" branch for this window (it
-    # returned "sparse"/"insufficient_data", overridden above), so
-    # burst_test["n_long_isis"] is None there -- the one detected onset
-    # run IS the whole observed train, i.e. exactly one burst.
+    # Checked in order: the two onset-based overrides supply their own
+    # count (the onset run IS the whole observed train in both cases); the
+    # adaptation-ratio override supplies no count (see its comment above);
+    # otherwise fall back to classify_burst_pattern's own n_long_isis.
     if test_onset_dominates_sparse_window:
         test_n_bursts = 1
         test_spikes_per_burst = float(test_onset_n_spikes)
+    elif test_tiny_burst_then_silence:
+        test_n_bursts = 1
+        test_spikes_per_burst = float(test_n_spikes)
+    elif test_adaptation_ratio_extreme:
+        test_n_bursts = None
+        test_spikes_per_burst = None
     else:
         test_n_bursts = (burst_test["n_long_isis"] + 1
                          if test_pattern == "bursting" and burst_test is not None else None)
@@ -673,7 +747,9 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
                 rebound_isis, rebound_trailing_silence_ms, min_isis_for_burst_test,
                 isi_mode_prominence_frac, min_isi_ratio, rebound_spike_count,
                 min_onset_isis=min_onset_isis, rebound_min_onset_isis=rebound_min_onset_isis,
-                trailing_silence_ratio=trailing_silence_ratio, min_ashman_d=min_ashman_d)
+                trailing_silence_ratio=trailing_silence_ratio, min_ashman_d=min_ashman_d,
+                ratio_override_ashman_d=ratio_override_ashman_d,
+                ratio_override_min_ratio=ratio_override_min_ratio)
 
     recovery_result = {
         "rebound_applicable": test_suppressed,
@@ -820,11 +896,16 @@ def build_uniform_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_f
                          settle_rtol=args.hold_settle_rtol, min_peaks_for_rate=args.min_peaks_for_rate,
                          min_isis_for_burst_test=args.min_isis_for_burst_test,
                          isi_mode_prominence_frac=args.isi_mode_prominence_frac,
-                         min_isi_ratio=args.min_isi_ratio, min_ashman_d=args.min_ashman_d)
+                         min_isi_ratio=args.min_isi_ratio, min_ashman_d=args.min_ashman_d,
+                         ratio_override_ashman_d=args.ratio_override_ashman_d,
+                         ratio_override_min_ratio=args.ratio_override_min_ratio)
     isi_kwargs = dict(min_isis_for_burst_test=args.min_isis_for_burst_test,
                       isi_mode_prominence_frac=args.isi_mode_prominence_frac,
                       min_isi_ratio=args.min_isi_ratio,
                       min_ashman_d=args.min_ashman_d,
+                      ratio_override_ashman_d=args.ratio_override_ashman_d,
+                      ratio_override_min_ratio=args.ratio_override_min_ratio,
+                      adaptation_ratio_override_threshold=args.adaptation_ratio_override_threshold,
                       rebound_min_onset_isis=args.rebound_min_onset_isis,
                       sag_window_ms=args.sag_window_ms,
                       sag_dead_zone_ms=args.sag_dead_zone_ms,
@@ -884,7 +965,8 @@ def run_cell_grid(cell_id: str, params: np.ndarray, ss_entry, silencing_entry, a
     y_ss_trough_mV = float(np.min(burnin_v)) if burnin_v is not None else None
     y_ss_hold_pattern = classify_hold_pattern(burnin_v, burnin_t, args.min_isis_for_burst_test,
                                               args.isi_mode_prominence_frac, args.min_isi_ratio,
-                                              args.min_ashman_d)
+                                              args.min_ashman_d, args.ratio_override_ashman_d,
+                                              args.ratio_override_min_ratio)
 
     try:
         grid, hold_settle_cache, held_levels, injected_levels, test_window_s, recovery_window_s = \
@@ -1244,6 +1326,39 @@ def parse_args() -> argparse.Namespace:
                              "'bursting'. D>=2 is the classical mixture-modeling threshold for "
                              "cleanly separated components (Ashman, Bird & Zepf 1994); exposed as "
                              "a flag (unlike min-spikes-per-burst) so it can be swept during audits.")
+    parser.add_argument("--ratio-override-ashman-d", type=float, default=5.0,
+                        help="A short/long ISI split that fails the ratio gate (--min-isi-ratio) is "
+                             "still accepted as 'bursting' if Ashman's D reaches this threshold -- "
+                             "a tight, low-variance alternation can be decisively separated (high D) "
+                             "even with a modest absolute ratio, which the ratio gate alone can't "
+                             "tell apart from noise. Set comfortably above --min-ashman-d so only "
+                             "decisively-separated cases use the override, not ordinary borderline "
+                             "ones. Confirmed real case: XB2IQX recovery-window 39.35/51.6ms "
+                             "alternation, ratio 1.31x (fails 1.5x) but D=30.2.")
+    parser.add_argument("--ratio-override-min-ratio", type=float, default=1.15,
+                        help="Minimum ratio still required for --ratio-override-ashman-d to apply at "
+                             "all -- without this floor, Ashman's D alone is fooled by two KDE-split "
+                             "clusters that are almost numerically IDENTICAL (ratio ~1.0-1.05) but "
+                             "happen to also have near-zero internal spread, which inflates D even "
+                             "though there's no real second timescale -- confirmed directly on a "
+                             "rock-steady XB2IQX hold level (ISIs ~45.7-45.8ms) that the KDE still "
+                             "quantization-splits into 45.78/45.90ms (ratio 1.0025) with D=4.4, just "
+                             "under the default override bar. 1.15 sits with margin above confirmed "
+                             "quantization cases (~1.0025-1.006) and margin below the confirmed "
+                             "genuine override case (1.31).")
+    parser.add_argument("--adaptation-ratio-override-threshold", type=float, default=5.0,
+                        help="A test window classify_burst_pattern calls 'tonic' (KDE resolves only "
+                             "1 mode) is reclassified 'bursting' if its raw ISI max/min spread ratio "
+                             "reaches this threshold -- ordinary tonic firing has a roughly consistent "
+                             "ISI by definition, so a spread this extreme on a 'tonic'-labeled train "
+                             "means the KDE failed to resolve real structure (typically: the 'long' "
+                             "ISI population's own internal spread smeared what would be a second mode "
+                             "into a plateau), not that the train is actually tonic. Uses the raw "
+                             "spread rather than test_adaptation_ratio specifically since the latter "
+                             "is only computed when the window isn't flagged likely-ceased-firing, "
+                             "and is confirmed unstable across resimulation on the exact case this "
+                             "was added for. Confirmed real case: XB2IQX held=-2.39/inj=-3.37, ISIs "
+                             "spanning 15-617ms (~41x spread).")
     parser.add_argument("--sag-window-ms", type=float, default=500.0,
                         help="Window (from test-window onset) over which the pre-spike sag trough "
                              "(test_v_min_pre_spike_mV) is measured, truncated early if a spike occurs "

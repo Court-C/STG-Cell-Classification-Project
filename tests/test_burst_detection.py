@@ -246,3 +246,39 @@ def test_adaptation_ratio_none_below_minimum_isis():
     isis_ms = np.array([20.0, 25.0, 30.0])
     ratio = compute_adaptation_ratio(isis_ms, edge_n=3)
     assert ratio is None
+
+
+def test_tight_low_ratio_alternation_rescued_by_ashman_d():
+    """Real case, 2026-08-14: XB2IQX held=-2.94/inj=-3.03 recovery window,
+    a clean, low-variance 39.35ms/51.6ms alternation -- ratio 1.31x, under
+    the 1.5x min_isi_ratio bar, but Ashman's D=30.2 (real value, computed
+    from this exact data). The ratio gate alone would reject this as
+    "tonic"; ratio_override_ashman_d (default 5.0) must rescue it, since a
+    tight, low-noise separation this decisive isn't the quantization-noise
+    scenario the ratio gate exists to catch.
+    """
+    isis_ms = np.array([
+        40.9, 52.0, 38.2, 51.8, 38.6, 51.5, 39.0, 51.3, 39.3, 51.2, 39.3, 51.2, 39.5, 51.1,
+        39.6, 51.2, 39.5, 51.3, 39.6, 51.3, 39.5, 51.4, 39.5, 51.5, 39.5, 51.5, 39.5, 51.6,
+        39.5, 51.7, 39.4, 51.8, 39.3, 51.9, 39.3, 51.9, 39.3, 52.0, 39.2, 52.1, 39.1, 52.2, 39.1])
+    result = classify_burst_pattern(isis_ms, n_peaks=len(isis_ms) + 1, **DEFAULT_KWARGS)
+    diag = result["diagnostics"]
+    ratio = diag["isi_long_ms"] / diag["isi_short_ms"]
+    assert ratio < 1.5, "this case should fail the plain ratio gate"
+    assert diag["ashman_d"] > 20.0
+    assert result["pattern"] == "bursting"
+
+
+def test_low_ashman_d_ratio_failure_stays_tonic():
+    """Non-regression companion to the D-override test above: a modest-
+    ratio split with genuinely high variance (the existing high-variance
+    synthetic case, D~1.75) must NOT be rescued just because it also fails
+    the ratio gate -- the override is reserved for decisively-separated (D
+    far above min_ashman_d) cases, not an escape hatch for every ratio
+    failure.
+    """
+    isis_ms = _make_burst_train_with_long_tail(np.random.default_rng(11), n_bursts=60, tail_frac=0.1)
+    result = classify_burst_pattern(isis_ms, n_peaks=len(isis_ms) + 1, **DEFAULT_KWARGS)
+    diag = result["diagnostics"]
+    assert diag["ashman_d"] < 5.0, "sanity: this case's D should be well under the override bar"
+    assert result["pattern"] == "tonic"

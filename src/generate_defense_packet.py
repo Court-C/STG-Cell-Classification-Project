@@ -77,7 +77,11 @@ def _save_page(fig, pdf: PdfPages, png_dir: Path, name: str, command: str, sourc
     fig.text(0.005, 0.005, f"{command}\nsource: {source}", ha="left", va="bottom",
              fontsize=5, family="monospace", color="dimgray")
     pdf.savefig(fig)
-    fig.savefig(png_dir / f"{name}.png", dpi=150)
+    # name may include a subfolder (e.g. "representative_traces_detail/foo")
+    # -- create it if this is the first page landing there.
+    png_path = png_dir / f"{name}.png"
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png_path, dpi=150)
     plt.close(fig)
 
 
@@ -896,9 +900,10 @@ def build_packet(cell_id: str, args) -> None:
         # directory -- see make_example_trace_detail_pages' docstring for
         # why (a standalone copy of this exact content went stale for over
         # a week through several classification fixes before being caught).
-        for combo_label, detail_fig in make_example_trace_detail_pages(cell_id, cell_result, resim):
+        for i, (combo_label, detail_fig) in enumerate(
+                make_example_trace_detail_pages(cell_id, cell_result, resim), start=1):
             slug = combo_label.replace("/", "-").replace(" ", "_")
-            save(detail_fig, f"01_representative_traces_detail__{slug}",
+            save(detail_fig, f"representative_traces_detail/{i:02d}__{slug}",
                 "plot_example_traces.select_exemplar_points() + resimulate_point() -> "
                 "plot_example_traces.build_example_trace_figure()")
         save(make_spike_detection_page(cell_id, spike_pts, resim), "02_spike_detection",

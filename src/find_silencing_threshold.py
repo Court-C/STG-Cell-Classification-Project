@@ -241,6 +241,7 @@ def detect_spikes_dvdt_confirmed(v: np.ndarray, t_ms: np.ndarray, dt_ms: float,
 def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
                           isi_mode_prominence_frac: float, min_isi_ratio: float = 1.5,
                           min_spikes_per_burst: float = 1.5, min_ashman_d: float = 2.0,
+                          ratio_override_ashman_d: float = 5.0, ratio_override_min_ratio: float = 1.15,
                           n_peaks: int = None) -> dict:
     """Log-ISI bimodality test. A tonically firing cell has one dominant
     inter-spike interval (log(ISI) density is unimodal); a burster has two
@@ -261,10 +262,11 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
 
     Four gates must all pass before a candidate short/long ISI split is
     accepted as "bursting": enough ISIs to run the test at all, the ratio
-    gate (min_isi_ratio), the spikes-per-burst gate (min_spikes_per_burst),
-    and finally the Ashman's D gate (min_ashman_d) -- see the comment at its
-    computation below for why a fourth, purely statistical separation check
-    is needed on top of the first three.
+    gate (min_isi_ratio) -- overridable when Ashman's D is decisively high
+    (ratio_override_ashman_d) -- the spikes-per-burst gate
+    (min_spikes_per_burst), and finally the Ashman's D gate (min_ashman_d)
+    itself -- see the comments at each gate for why every one of them is
+    needed on top of the others.
 
     Every return also carries a "diagnostics" key -- None wherever no KDE
     was ever evaluated (too few ISIs, degenerate/trivial ISI spread, or a
@@ -342,6 +344,22 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     diagnostics.update({"isi_short_ms": isi_short_ms, "isi_long_ms": isi_long_ms,
                         "min_isi_ratio": min_isi_ratio, "short_mask": short_mask})
 
+    # Ashman's D computed HERE (moved ahead of the ratio gate, 2026-08-14) --
+    # see its own comment below for the full definition/citation. Needed
+    # this early so a very strong separation can rescue a case the ratio
+    # gate alone would reject: confirmed real case, XB2IQX held=-2.94/
+    # inj=-3.03 recovery window, a clean, low-variance 39.35ms/51.6ms
+    # alternation (ratio 1.31x, under the 1.5x bar) that nonetheless scores
+    # D=30.2 -- about as cleanly separated as any case in this dataset. The
+    # ratio gate's own justification (intra-/inter-burst gaps "differ by
+    # 10x or more" in genuine cases) was calibrated against noisy/high-
+    # variance examples; it was never meant to veto a tight, low-noise
+    # alternation just because the two means happen to be numerically close.
+    s_short, s_long = np.std(isis_ms[short_mask]), np.std(isis_ms[long_mask])
+    pooled = np.sqrt((s_short ** 2 + s_long ** 2) / 2.0)
+    ashman_d = abs(isi_long_ms - isi_short_ms) / pooled if pooled > 0 else float("inf")
+    diagnostics["ashman_d"] = float(ashman_d)
+
     # A KDE peak count of 2 is not, by itself, reliable evidence of two
     # genuinely distinct timescales -- with a modest, discretized (fixed-dt)
     # sample, quantization/sampling noise can split an essentially unimodal
@@ -351,9 +369,28 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     # different timescale, not just a different KDE bin, before calling it
     # bursting -- intra-burst vs inter-burst gaps in this model differ by
     # 10x or more, so this threshold has a lot of room below genuine cases.
-    if isi_long_ms / isi_short_ms < min_isi_ratio:
+    # Overridable when ashman_d clears ratio_override_ashman_d (default 5.0,
+    # well above the normal min_ashman_d=2.0 "cleanly separated" bar, so an
+    # ordinary borderline case still can't sneak through a weak ratio just
+    # because it's non-noisy -- this is reserved for cases as decisively
+    # separated as the 39.35/51.6ms example above) AND ratio clears
+    # ratio_override_min_ratio (default 1.15). The min-ratio floor matters
+    # a great deal: D is a RATIO of separation to spread, so it explodes
+    # for two clusters that are almost numerically identical but happen to
+    # also have near-zero internal spread -- confirmed directly on a
+    # rock-steady XB2IQX hold level (isis essentially constant at
+    # 45.7-45.8ms): the KDE still quantization-splits it into two adjacent
+    # pseudo-modes at 45.78/45.90ms (ratio 1.0025, obviously not two real
+    # timescales) and D reaches 4.4 purely because each pseudo-mode's own
+    # spread is nearly zero -- almost enough to clear a D-only override.
+    # 1.15 sits with real margin above confirmed quantization cases (this
+    # one and the ratio gate's own original 17.0/17.1ms example, ~1.006-
+    # 1.0025) and real margin below the confirmed genuine case (1.31).
+    ratio = isi_long_ms / isi_short_ms
+    ratio_rescued = ratio >= ratio_override_min_ratio and ashman_d >= ratio_override_ashman_d
+    if ratio < min_isi_ratio and not ratio_rescued:
         return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
-                "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0,
+                "isi_long_ms": None, "n_isis": n, "bimodality_metric": float(ashman_d),
                 "n_long_isis": None, "diagnostics": diagnostics}
 
     # A burst is defined by >=2 spikes in rapid succession, not by ISI
@@ -388,7 +425,7 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     diagnostics["avg_spikes_per_burst"] = avg_spikes_per_burst
     if avg_spikes_per_burst < min_spikes_per_burst:
         return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
-                "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0,
+                "isi_long_ms": None, "n_isis": n, "bimodality_metric": float(ashman_d),
                 "n_long_isis": None, "diagnostics": diagnostics}
 
     # Ashman's D: separation of two Gaussians in units of pooled SD --
@@ -399,20 +436,16 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     # field-standard substrate for burst/tonic classification, e.g. Selinger
     # et al. 2007's void parameter / Pasquale et al. 2010's LogISI method,
     # ranked #2 of 8 methods in Cotterill et al. 2016's ground-truth
-    # comparison). The three gates above catch specific known false-positive
+    # comparison). The other gates catch specific known false-positive
     # SHAPES (quantization-noise pseudo-modes a timestep apart; a minority of
     # stray short ISIs scattered through an otherwise-uniform train, e.g.
     # VC08B6) but none of them measure whether the two candidate clusters
     # are actually well-separated POPULATIONS rather than overlapping ones --
     # a short cluster with heavy internal spread can pass both the ratio and
-    # count checks while still bleeding into the long cluster's range. This
-    # gate was inert (computed but never compared to anything) until
-    # 2026-08-13; see tests/test_burst_detection.py for the synthetic
-    # high-variance case it's specifically meant to catch.
-    s_short, s_long = np.std(isis_ms[short_mask]), np.std(isis_ms[long_mask])
-    pooled = np.sqrt((s_short ** 2 + s_long ** 2) / 2.0)
-    ashman_d = abs(isi_long_ms - isi_short_ms) / pooled if pooled > 0 else float("inf")
-    diagnostics["ashman_d"] = float(ashman_d)
+    # count checks while still bleeding into the long cluster's range. D
+    # itself is computed earlier now (see above, 2026-08-14) so it can also
+    # rescue a modest-ratio case; this final check is the ordinary "reject
+    # if not cleanly separated" gate for everything that already passed.
     if ashman_d < min_ashman_d:
         return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
                 "isi_long_ms": None, "n_isis": n, "bimodality_metric": float(ashman_d),
