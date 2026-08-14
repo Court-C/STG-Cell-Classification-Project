@@ -150,14 +150,22 @@ def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
     if len(isis_ms) > 0:
         ax_isi.plot(np.arange(1, len(isis_ms) + 1), isis_ms, marker="o", markersize=3,
                    color="steelblue", lw=1)
-        # Always include zero: auto-scaling tightly around the data (e.g. a
-        # clean tonic train whose intervals span only 12.9-13.0ms) blows a
-        # sub-millisecond wobble up to fill the whole panel height, making
-        # negligible jitter look like a dramatic zigzag -- user-flagged
-        # 2026-08-14, page 12 rows 2-3. A real axis anchored at zero keeps
-        # the panel's visual scale honest about how small that variation
-        # actually is relative to the interval itself.
-        ax_isi.set_ylim(bottom=0)
+        if result["pattern"] == "tonic" and isis_override is None:
+            # A clean tonic train's intervals (e.g. this cell's ~16-17ms)
+            # sit close enough to the top of a zero-anchored panel that the
+            # data looks crowded against the frame -- user-flagged
+            # 2026-08-14, page 5. Center the real (non-constructed) tonic
+            # band in a fixed 10-20ms window instead of anchoring at zero.
+            ax_isi.set_ylim(10, 20)
+        else:
+            # Always include zero: auto-scaling tightly around the data (e.g. a
+            # clean tonic train whose intervals span only 12.9-13.0ms) blows a
+            # sub-millisecond wobble up to fill the whole panel height, making
+            # negligible jitter look like a dramatic zigzag -- user-flagged
+            # 2026-08-14, page 12 rows 2-3. A real axis anchored at zero keeps
+            # the panel's visual scale honest about how small that variation
+            # actually is relative to the interval itself.
+            ax_isi.set_ylim(bottom=0)
     ax_isi.set_xlabel("interval index (spike-to-spike)")
     ax_isi.set_ylabel("interspike interval (ms)")
     ax_isi.set_title(f"Interspike intervals -- classified as '{result['pattern']}'", fontsize=9)

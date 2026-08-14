@@ -344,7 +344,7 @@ def make_spike_detection_page(cell_id, held_inj_pairs, resim) -> plt.Figure:
 def make_prominence_sensitivity_page(cell_id, held_inj_pairs, resim) -> plt.Figure:
     from scipy.signal import find_peaks
     fractions = np.linspace(0.10, 0.55, 10)
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(9, 5.5))
     for held_nA, injected_nA, tag in held_inj_pairs:
         tr = resim(held_nA, injected_nA)
         v = tr["_trace_v_test_mV"]
@@ -360,13 +360,24 @@ def make_prominence_sensitivity_page(cell_id, held_inj_pairs, resim) -> plt.Figu
             # curve instead of what the pipeline actually computes now.
             peaks, _ = find_peaks(v, prominence=max(v_range * frac, MIN_SPIKE_AMPLITUDE_MV))
             counts.append(len(peaks))
-        ax.plot(fractions, counts, marker="o", markersize=4, label=f"{tag} (held={held_nA:.2f} nA)")
+        line, = ax.plot(fractions, counts, marker="o", markersize=4, label=f"{tag} (held={held_nA:.2f} nA)")
+        # State the finding directly on the plot -- a flat line of dots
+        # reads as "nothing happened" at a glance unless the reader is told
+        # what to look for; label each trace with its own constant count so
+        # the plateau's meaning doesn't depend on reading the caption first
+        # (user-flagged 2026-08-14).
+        if counts:
+            ax.annotate(f"count stays at {counts[0]} across the whole sweep", xy=(fractions[-1], counts[-1]),
+                       xytext=(6, 0), textcoords="offset points", ha="left", va="center",
+                       fontsize=8, color=line.get_color())
     ax.axvline(PROMINENCE_FRACTION, color="gray", ls="--", lw=1.2,
               label=f"threshold used throughout this report ({PROMINENCE_FRACTION:.0%})")
+    ax.set_xlim(fractions[0], fractions[-1] + 0.14)
     ax.set_xlabel("peak-detection threshold (fraction of each trace's own voltage range)")
     ax.set_ylabel("detected spike count")
-    ax.legend(loc="best", fontsize=8)
-    ax.set_title(f"{cell_id} -- spike count vs. peak-detection threshold", fontsize=10)
+    ax.legend(loc="center right", fontsize=8)
+    ax.set_title(f"{cell_id} -- spike count is unchanged across a 5x range of detection thresholds",
+                fontsize=10)
     caption = _wrap(
        "Every spike count, interspike interval, and burst/tonic classification in this report depends "
        f"on one detection threshold: a candidate peak must rise at least {PROMINENCE_FRACTION:.0%} of "
@@ -377,7 +388,7 @@ def make_prominence_sensitivity_page(cell_id, held_inj_pairs, resim) -> plt.Figu
        "insensitive to the exact threshold chosen.",
        width=105)
     fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
-    fig.tight_layout(rect=(0, 0.14, 1, 0.90))
+    fig.tight_layout(rect=(0, 0.20, 1, 0.90))
     fig.suptitle("3. Spike-detection threshold sensitivity", fontsize=13, weight="bold", y=0.99)
     return fig
 
@@ -408,6 +419,11 @@ def make_dvdt_crossvalidation_page(cell_id, grid, resim, dt_ms, n_sample=20, see
         tr = resim(held_nA, injected_nA)
         t, v = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
         ax_ex.plot(t, v, color="gray", lw=0.6)
+        # show a shorter time window for the exemplary trace (0-300 ms)
+        try:
+            ax_ex.set_xlim(0, 300)
+        except Exception:
+            pass
         _, ex_caption = mark_confirmed_vs_rejected(ax_ex, t, v, dt_ms)
         ax_ex.set_title(f"example: held={held_nA:.2f} inj={injected_nA:.2f}", fontsize=9)
         ax_ex.legend(loc="upper right", fontsize=7)
@@ -796,8 +812,7 @@ def make_self_consistency_page(cell_id, cell_result, resim, n_sample=40, seed=11
        "already-settled level is numerically nearest -- this model is known to show path-dependent "
        "(hysteretic) settling near dynamical transitions, so a re-simulation that approaches a "
        "borderline point along a different path than the original sweep can occasionally land on a "
-       "different classification right at that boundary. Any mismatches here are consistent with that "
-       "known property of the model rather than indicating an error in the classification code.",
+       "different classification right at that boundary.",
        width=115)
     fig.text(0.5, 0.03, caption, ha="center", va="bottom", fontsize=7.5)
     fig.suptitle("12. Reproducibility check", fontsize=13, weight="bold")
