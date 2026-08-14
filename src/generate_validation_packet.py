@@ -42,6 +42,14 @@ from trace_annotations import (mark_spikes, mark_confirmed_vs_rejected, mark_isi
 
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "validation_packet"
 
+# A train with far more spikes than this renders its raw trace/ISI panels as
+# a solid block of color / an unreadable dense line rather than
+# distinguishable spikes -- shared by every page that plots a raw voltage
+# trace or ISI-vs-index sequence next to a classification (sections 5 and 6,
+# user-flagged 2026-08-14). Crops what's DISPLAYED to the first N spikes;
+# the classification itself is always computed from the full train.
+MAX_DISPLAYED_SPIKES = 25
+
 
 def _wrap(text: str, width: int = 100) -> str:
     return textwrap.fill(text, width=width)
@@ -49,7 +57,8 @@ def _wrap(text: str, width: int = 100) -> str:
 
 
 
-def _place_caption_below(fig, ax, caption: str, width: int = 60, fontsize: float = 7, gap: float = 0.10) -> None:
+def _place_caption_below(fig, ax, caption: str, width: int = 60, fontsize: float = 7, gap: float = 0.10,
+                         right_ax=None) -> None:
     """Places a caption under `ax` using its REAL post-layout bounding box
     (fig.transFigure, computed from ax.get_position() after tight_layout has
     already run) rather than a fixed ax.transAxes fraction. A fraction-based
@@ -61,9 +70,19 @@ def _place_caption_below(fig, ax, caption: str, width: int = 60, fontsize: float
     xlabel's gap is a fixed point size regardless. Anchoring to the actual
     figure-coordinate bbox bottom instead sidesteps that entirely -- must be
     called AFTER fig.tight_layout()/subplots_adjust(), not before.
+
+    right_ax: when the caption is only really "about" one column (e.g. the
+    ISI panel) but there are neighboring columns with nothing of their own
+    printed underneath, pass the rightmost axes of the span to center the
+    caption under -- gives a much wider wrap width for the same font size
+    instead of cramming into one column while the rest of the row sits
+    empty (user-flagged 2026-08-14, page 5).
     """
     bbox = ax.get_position()
-    fig.text(bbox.x0 + bbox.width / 2, bbox.y0 - gap, _wrap(caption, width),
+    x0, x1 = bbox.x0, bbox.x1
+    if right_ax is not None:
+        x1 = right_ax.get_position().x1
+    fig.text((x0 + x1) / 2, bbox.y0 - gap, _wrap(caption, width),
              ha="center", va="top", fontsize=fontsize, transform=fig.transFigure)
 
 
@@ -236,7 +255,7 @@ def make_representative_traces_page(cell_id, cell_result, resim) -> plt.Figure:
 
     caption = _wrap(
        "One representative trace for each distinct combination of response-to-current-step pattern "
-       f"and rebound pattern actually observed across this cell's full {cell_result['n_points_total']}-"
+       f"and rebound pattern observed across this cell's full {cell_result['n_points_total']}-"
        "point grid of held and injected current levels: gray is the held baseline before the current "
        "step, red is the response during the current step, and blue is the recovery period after "
        "release back to the held level. Each combination is represented by its most clearly-expressed "
@@ -391,7 +410,7 @@ def make_dvdt_crossvalidation_page(cell_id, grid, resim, dt_ms, n_sample=20, see
 
     caption = _wrap(
        f"As an independent check on a random sample of {len(per_point)} grid points from this cell, "
-       "every spike detected by amplitude alone was additionally required to show a genuine fast "
+       "every spike detected by amplitude alone was additionally required to show a fast "
        "upstroke in voltage (rather than amplitude alone) before being counted, an independent "
        "detection criterion not used for classification elsewhere in this report. Agreement close to "
        "100% shows that the simpler amplitude-based detector used throughout is not missing any spikes "
@@ -407,33 +426,6 @@ def make_dvdt_crossvalidation_page(cell_id, grid, resim, dt_ms, n_sample=20, see
 # Burst/tonic classification
 # ---------------------------------------------------------------------------
 
-def _shared_log_isi_xlim(isis_list) -> tuple:
-    """Union, not intersection: when several log-ISI KDE panels are shown
-    side by side for direct comparison, scaling each to its OWN data range
-    makes them visually incomparable -- a confidently-tonic point's ISIs
-    might span a fraction of a log10-unit while a confidently-bursting
-    point's span two full units, and both would render as similarly-sized
-    curves if each panel optimizes its own axis. Computes the same padded
-    range classify_burst_pattern's own grid uses (0.15x the data's own
-    span) per array, then takes the union across every array being
-    compared, so the shared range is exactly what the union of the panels'
-    own individual ranges would have been, not a fixed/arbitrary window.
-    """
-    los, his = [], []
-    for isis_ms in isis_list:
-        if len(isis_ms) < 2:
-            continue
-        log_isi = np.log10(isis_ms)
-        if np.ptp(log_isi) < 1e-6:
-            los.append(log_isi.min() - 0.5)
-            his.append(log_isi.max() + 0.5)
-            continue
-        pad = 0.15 * np.ptp(log_isi)
-        los.append(log_isi.min() - pad)
-        his.append(log_isi.max() + pad)
-    return (min(los), max(his))
-
-
 def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.Figure:
     """exemplars: list of (held_nA, injected_nA, tag) -- typically one clean
     bursting example and one boundary/near-miss "correctly rejected" example.
@@ -444,14 +436,13 @@ def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.F
     classification call is even about.
 
     Each row's log-ISI panel is scaled to its OWN data range, not a range
-    shared across rows (unlike make_bimodality_teaching_page, where a shared
-    range is the point -- comparing separation magnitudes side by side).
-    Here a shared range actively hides evidence: the near-miss/tonic
-    example's intervals cluster in a ~0.7ms band, which a range wide enough
-    to also fit the bursting example's 500ms+ between-burst gaps compresses
-    into an unreadable sliver (confirmed user-reported 2026-08-14).
+    shared across rows: the near-miss/tonic example's intervals cluster in a
+    ~0.7ms band, which a range wide enough to also fit the bursting
+    example's 500ms+ between-burst gaps compresses into an unreadable
+    sliver (user-flagged 2026-08-14; the same fix is applied in
+    make_bimodality_teaching_page for the same reason).
     """
-    fig, axes = plt.subplots(len(exemplars), 3, figsize=(19, 7.0 * len(exemplars)))
+    fig, axes = plt.subplots(len(exemplars), 3, figsize=(19, 6.6 * len(exemplars)))
     if len(exemplars) == 1:
         axes = axes[np.newaxis, :]
     traces = [resim(held_nA, injected_nA) for held_nA, injected_nA, _ in exemplars]
@@ -460,7 +451,7 @@ def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.F
         ax_v, ax_isi, ax_kde = row
         t, v = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
         ax_v.plot(t, v, color="firebrick", lw=0.8, zorder=1)
-        mark_spikes(ax_v, t, v)
+        peaks, _ = mark_spikes(ax_v, t, v)
         ax_v.set_xlabel("time (ms)")
         ax_v.set_ylabel("V (mV)")
         ax_v.legend(loc="upper right", fontsize=7)
@@ -468,14 +459,27 @@ def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.F
             ax_isi, ax_kde, t, v, run_args["min_isis_for_burst_test"],
             run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
             min_ashman_d=run_args.get("min_ashman_d", 2.0))
+        # A train with far more spikes than this renders as a solid block
+        # of color rather than distinguishable spikes -- crop the DISPLAYED
+        # window to its first MAX_DISPLAYED_SPIKES only (user-flagged
+        # 2026-08-14: the near-miss/tonic example fires 179 times in the
+        # same window the bursting example fires 11, so the two rows won't
+        # share a time axis here even though they happen to share a window
+        # length). The classification itself -- caption text, KDE curve,
+        # separation score -- is still computed from the full train; this
+        # only narrows what's drawn, not what's measured.
+        if len(peaks) > MAX_DISPLAYED_SPIKES:
+            crop_end_ms = t[peaks[MAX_DISPLAYED_SPIKES - 1]] + 0.05 * (t[-1] - t[0])
+            ax_v.set_xlim(t[0], crop_end_ms)
+            ax_isi.set_xlim(0.5, MAX_DISPLAYED_SPIKES - 0.5)
         ax_v.set_title(f"{tag} (held={held_nA:.2f} nA, injected={injected_nA:.2f} nA): "
                       f"classified as {_describe_pattern(result['pattern'])}", fontsize=9, wrap=True)
-        captions.append((ax_isi, caption))
+        captions.append((ax_v, ax_kde, caption))
     fig.suptitle("5. Tonic / bursting / silent classification", fontsize=13, weight="bold")
-    fig.tight_layout(rect=(0, 0.15, 1, 0.96))
+    fig.tight_layout(rect=(0, 0.12, 1, 0.96))
     fig.subplots_adjust(hspace=0.85)
-    for ax_isi, caption in captions:
-        _place_caption_below(fig, ax_isi, caption, width=78, fontsize=8.5, gap=0.055)
+    for ax_v, ax_kde, caption in captions:
+        _place_caption_below(fig, ax_v, caption, width=140, fontsize=10, gap=0.05, right_ax=ax_kde)
     return fig
 
 
@@ -525,26 +529,27 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
     to reject it (confirmed by direct audit, 2026-08) -- shown clearly
     labeled as synthetic rather than omitted, so the gate's purpose is still
     demonstrated even though it has been inert on real data so far.
+
+    Each row's log-ISI panel scales to its OWN data range, and each row's
+    raw trace/ISI-index panels crop to at most MAX_DISPLAYED_SPIKES, for the
+    same reasons as make_burst_classification_page (user-flagged 2026-08-14
+    for section 5, extended here to section 6): a shared x-axis across rows
+    this different in scale and firing rate hides the tight examples'
+    structure rather than showing it.
     """
     n_rows = len(real_exemplars) + 1
-    fig, axes = plt.subplots(n_rows, 3, figsize=(16, 6.8 * n_rows))
+    fig, axes = plt.subplots(n_rows, 3, figsize=(19, 6.6 * n_rows))
     if n_rows == 1:
         axes = axes[np.newaxis, :]
 
-    # First pass: gather every row's ISIs (resimulating the real points, no
-    # plotting yet) so the shared log-ISI range can be computed as the union
-    # across ALL rows before any panel is drawn -- see _shared_log_isi_xlim.
     traces = [resim(held_nA, injected_nA) for held_nA, injected_nA, _ in real_exemplars]
-    real_isis = [compute_isis_ms(tr["_trace_v_test_mV"], tr["_trace_t_test_ms"], PROMINENCE_FRACTION)[0]
-                for tr in traces]
     synthetic_isis, synthetic_n_peaks = _synthetic_ashman_d_near_miss()
-    shared_xlim = _shared_log_isi_xlim(real_isis + [synthetic_isis])
 
     captions = []
     for row, (held_nA, injected_nA, tag), tr in zip(axes, real_exemplars, traces):
         ax_v, ax_isi, ax_kde = row
         t, v = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
-        mark_spikes(ax_v, t, v)
+        peaks, _ = mark_spikes(ax_v, t, v)
         ax_v.plot(t, v, color="black", lw=0.6)
         ax_v.set_title(f"{tag}: held={held_nA:.2f} inj={injected_nA:.2f}", fontsize=9)
         ax_v.set_xlabel("time (ms)")
@@ -552,10 +557,14 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
         result, caption = mark_isi_classification(
             ax_isi, ax_kde, t, v, run_args["min_isis_for_burst_test"],
             run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
-            min_ashman_d=run_args.get("min_ashman_d", 2.0), log_isi_xlim=shared_xlim)
+            min_ashman_d=run_args.get("min_ashman_d", 2.0))
+        if len(peaks) > MAX_DISPLAYED_SPIKES:
+            crop_end_ms = t[peaks[MAX_DISPLAYED_SPIKES - 1]] + 0.05 * (t[-1] - t[0])
+            ax_v.set_xlim(t[0], crop_end_ms)
+            ax_isi.set_xlim(0.5, MAX_DISPLAYED_SPIKES - 0.5)
         ax_isi.set_title(f"Interspike intervals -- classified as {_describe_pattern(result['pattern'])}",
                         fontsize=9)
-        captions.append((ax_isi, f"Simulated {cell_id} trace. {caption}"))
+        captions.append((ax_v, ax_kde, f"Simulated {cell_id} trace. {caption}"))
 
     ax_v, ax_isi, ax_kde = axes[-1]
     ax_v.axis("off")
@@ -566,25 +575,22 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
         ax_isi, ax_kde, None, None, run_args["min_isis_for_burst_test"],
         run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
         min_ashman_d=run_args.get("min_ashman_d", 2.0), isis_override=synthetic_isis,
-        n_peaks_override=synthetic_n_peaks, log_isi_xlim=shared_xlim)
+        n_peaks_override=synthetic_n_peaks)
+    if synthetic_n_peaks > MAX_DISPLAYED_SPIKES:
+        ax_isi.set_xlim(0.5, MAX_DISPLAYED_SPIKES - 0.5)
     ax_isi.set_title(f"Interspike intervals -- classified as {_describe_pattern(result['pattern'])}",
                     fontsize=9)
-    captions.append((ax_isi, f"This example is constructed, not an observed point from {cell_id}: it "
+    captions.append((ax_v, ax_kde, f"This example is constructed, not an observed point from {cell_id}: it "
                     "illustrates a case where the short and long interval populations pass the simpler "
-                    "gates but remain too statistically overlapping to count as genuinely separate, a "
+                    "gates but remain too statistically overlapping to count as separate, a "
                     "case this cell's own data has not been observed to produce. "
                     f"{caption}"))
 
     fig.suptitle("6. Bimodality test: within-burst vs. between-burst ISIs", fontsize=13, weight="bold")
-    # Both hspace and _place_caption_below's gap are figure-fraction
-    # quantities, not per-row -- a gap tuned for a 2-row page (see
-    # make_burst_classification_page) eats a much bigger slice of a single
-    # row's vertical budget here with 4 rows, which is what caused captions
-    # to collide with the NEXT row's title before this was tuned down.
     fig.tight_layout(rect=(0, 0.11, 1, 0.96))
-    fig.subplots_adjust(hspace=1.9)
-    for ax_isi, caption in captions:
-        _place_caption_below(fig, ax_isi, caption, width=95, fontsize=6.5, gap=0.032)
+    fig.subplots_adjust(hspace=1.3)
+    for ax_v, ax_kde, caption in captions:
+        _place_caption_below(fig, ax_v, caption, width=140, fontsize=9, gap=0.028, right_ax=ax_kde)
     return fig
 
 
@@ -918,7 +924,7 @@ def build_packet(cell_id: str, args) -> None:
          "two separate interval populations."),
         ("Bimodality test", "The full statistical-separation evidence behind the tonic/bursting "
          "distinction."),
-        ("Burst-onset-then-silence detection", "A leading onset burst followed by genuine cessation, vs. "
+        ("Burst-onset-then-silence detection", "A leading onset burst followed by cessation, vs. "
          "one that sustains."),
         ("Post-inhibitory rebound detection", "Rebound spikes after release from hyperpolarization, and "
          "the latency cutoff used."),

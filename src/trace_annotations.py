@@ -97,7 +97,7 @@ def mark_confirmed_vs_rejected(ax, t_ms: np.ndarray, v_mV: np.ndarray, dt_ms: fl
                label=f"rejected on upstroke shape (n={len(rejected)})")
 
     agree = len(rejected) == 0
-    caption = (f"As an independent check, each candidate spike was also required to show a genuine "
+    caption = (f"As an independent check, each candidate spike was also required to show a "
               f"fast upstroke -- a rate of voltage rise of at least {DEFAULT_DVDT_THRESHOLD_MV_PER_MS:.0f} "
               f"mV/ms within {DEFAULT_MIN_PRE_SPIKE_MS:.0f} ms before the peak (the convention used by "
               f"Bean, 2007) -- rather than amplitude alone. {len(confirmed)} of "
@@ -412,9 +412,9 @@ def mark_onset_and_trailing_silence(ax_v, ax_isi, t_ms: np.ndarray, v_mV: np.nda
         if ceased is not None:
             pieces.append(
                 (f"This silence is at least {trailing_silence_ratio:.0f} times the most recent interspike "
-                 "interval, indicating firing had genuinely ended rather than merely being cut off by the "
-                 "window boundary; an adaptation ratio is not reported for this window, since comparing "
-                 "early and late intervals is not meaningful once firing has stopped partway through.")
+                 "interval, indicating firing had ended rather than being cut off by the window boundary; "
+                 "an adaptation ratio is not reported for this window, since comparing early and late "
+                 "intervals is not meaningful once firing has stopped partway through.")
                 if ceased else
                 ("Firing continued close enough to the end of the window that it was not cut off "
                  "partway through, so an adaptation ratio is still computed normally from this interval "
