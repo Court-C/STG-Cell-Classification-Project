@@ -310,7 +310,7 @@ def detect_onset_burst(isis_ms: np.ndarray, min_isi_ratio: float, min_onset_isis
 
 def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_ms: float,
                              min_isis_for_burst_test: int, isi_mode_prominence_frac: float,
-                             min_isi_ratio: float, n_peaks: int,
+                             min_isi_ratio: float, n_peaks: int, min_onset_isis: int = 2,
                              rebound_min_onset_isis: int = 1, trailing_silence_ratio: float = 3.0) -> str:
     """"bursting_rebound" or "tonic_rebound" for a >=2-spike recovery-window
     train (rebound_spike_count==1/0 are handled by the caller before this is
@@ -332,7 +332,19 @@ def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_
        it, OR detect_onset_burst's local leading-run finding -- either
        "bursting" wins. Gated to this tier only (not applied to shorter
        trains) so a confident KDE "tonic" verdict on a long train is never
-       second-guessed by the shorter-train fallbacks below.
+       second-guessed by the shorter-train fallbacks below. Uses the
+       STANDARD min_onset_isis (2, same as test-window onset detection),
+       not the relaxed rebound_min_onset_isis -- confirmed as a real
+       regression (2026-08-13, held=-2.94/inj=-3.03): a long (44-ISI),
+       genuinely unimodal 40-48ms alternating train (KDE correctly says
+       "tonic", ratio ~1.15-1.2x, nowhere near the 1.5x bar) got forced to
+       "bursting_rebound" by detect_onset_burst(min_onset_isis=1) firing
+       on a single anomalously-short LEADING isi[0] (likely a release
+       transient, not a real burst) -- exactly the single-ISI-vs-noise
+       ambiguity min_onset_isis=2 exists to rule out. The 4 confirmed
+       genuine onset-burst rebounds validated earlier all had >=3
+       consecutive short ISIs and still pass at 2; only tier 2/3's
+       genuinely-short trains need the relaxed threshold.
     2. Too few for the KDE test but enough for detect_onset_burst
        (rebound_min_onset_isis defaults to 1, not test-window onset
        detection's 2, so even a 2-ISI train gets a real jump check):
@@ -353,7 +365,7 @@ def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_
     if n >= min_isis_for_burst_test:
         kde_result = classify_burst_pattern(rebound_isis, min_isis_for_burst_test,
                                             isi_mode_prominence_frac, min_isi_ratio, n_peaks=n_peaks)
-        onset_n, _ = detect_onset_burst(rebound_isis, min_isi_ratio, rebound_min_onset_isis)
+        onset_n, _ = detect_onset_burst(rebound_isis, min_isi_ratio, min_onset_isis)
         return "bursting_rebound" if (kde_result["pattern"] == "bursting" or onset_n is not None) \
             else "tonic_rebound"
 
@@ -618,7 +630,7 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
             rebound_pattern = classify_rebound_pattern(
                 rebound_isis, rebound_trailing_silence_ms, min_isis_for_burst_test,
                 isi_mode_prominence_frac, min_isi_ratio, rebound_spike_count,
-                rebound_min_onset_isis=rebound_min_onset_isis,
+                min_onset_isis=min_onset_isis, rebound_min_onset_isis=rebound_min_onset_isis,
                 trailing_silence_ratio=trailing_silence_ratio)
 
     recovery_result = {
