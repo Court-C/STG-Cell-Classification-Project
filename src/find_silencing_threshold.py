@@ -70,11 +70,25 @@ from steady_state_cache import (CACHE_PATH as DEFAULT_STEADY_STATE_CACHE_PATH,
 
 DEFAULT_OUTPUT_CACHE_PATH = ROOT_DIR / "cell_silencing_thresholds.pkl"
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "silencing"
-DEFAULT_FIGURE_FORMAT = "svg"  # matches generate_steady_state.py's figures/cache convention
+DEFAULT_FIGURE_FORMAT = "png"  # matches generate_steady_state.py's figures/cache convention
 # temp == reftemp -- see run_held_injected_grid.py's DEFAULT_TEMP comment.
 DEFAULT_TEMP = 10.0
 DEFAULT_REFTEMP = 10.0
 DEFAULT_DT_MS = 0.1
+
+# Numerical noise floor for Ashman's D's pooled-SD denominator. A near-
+# perfectly periodic tonic train's two KDE-split "clusters" can each have
+# floating-point-noise-scale internal spread (~1e-13ms) rather than zero,
+# which blows D up to an astronomically large, meaningless number (confirmed
+# real: D=1635814553716.23 on a rock-steady XB2IQX tonic train, held=-0.09/
+# inj=-0.11, user-flagged 2026-08-14). Every gate that reads ashman_d is a
+# >= comparison against a threshold under 10 (min_ashman_d=2.0, ratio_
+# override_ashman_d=5.0), so flooring pooled here changes no classification
+# decision -- it only keeps the reported number sane. The floor sits well
+# below the smallest genuine pooled SD seen in this codebase's own examples
+# (~0.027ms for a confirmed quantization-noise case that legitimately scored
+# D=4.4), so it can't mask a real small-but-nonzero spread.
+_ASHMAN_D_SD_FLOOR_MS = 1e-3
 
 V_INDEX = 0
 
@@ -357,7 +371,11 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     # alternation just because the two means happen to be numerically close.
     s_short, s_long = np.std(isis_ms[short_mask]), np.std(isis_ms[long_mask])
     pooled = np.sqrt((s_short ** 2 + s_long ** 2) / 2.0)
-    ashman_d = abs(isi_long_ms - isi_short_ms) / pooled if pooled > 0 else float("inf")
+    # max(pooled, floor), not "if pooled > 0 else inf": a rock-steady tonic
+    # train's clusters can have floating-point-noise-scale spread (~1e-13ms)
+    # rather than exactly zero, which produced an inf-adjacent, equally
+    # meaningless D before this floor existed -- see _ASHMAN_D_SD_FLOOR_MS.
+    ashman_d = abs(isi_long_ms - isi_short_ms) / max(pooled, _ASHMAN_D_SD_FLOOR_MS)
     diagnostics["ashman_d"] = float(ashman_d)
 
     # A KDE peak count of 2 is not, by itself, reliable evidence of two
