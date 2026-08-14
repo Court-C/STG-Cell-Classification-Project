@@ -648,11 +648,32 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
         float(np.mean(isi_diff_signs[1:] != isi_diff_signs[:-1]))
         if isi_diff_signs is not None and len(isi_diff_signs) > 1 else None)
 
-    test_adaptation_ratio_extreme = (
-        test_pattern == "tonic" and test_isi_spread_ratio is not None
+    # Second, independent signature (2026-08-14, user-proposed): a "tonic"
+    # verdict implies ONGOING/sustained firing -- a train that instead
+    # genuinely CEASES firing well before the window ends (test_likely_
+    # ceased_firing, already computed above) is a bounded, self-terminated
+    # episode, which reads as a burst on its own terms regardless of
+    # whether its internal ISIs alternate or just smoothly decelerate
+    # ("even if the ISI begins to increase after each spike"). Confirmed
+    # directly: EVERY one of the 4 reference cases examined (the original
+    # panel-11 case, both flagged false-positive/borderline cases, and a
+    # real "bursting via the plain KDE test" case used as a control) shows
+    # ceased=True -- and separately, sampling 10 of the 46 total XB2IQX
+    # points that are "tonic" AND ceased (all with n_isis 10-42, out of
+    # 1433 tonic points total) shows the identical shape: a brief fast
+    # onset, smooth deceleration, then 1.6-2s of genuine silence in a ~3s
+    # window -- not "still firing, window just cut off." Tonic points as a
+    # whole show ceased=True only 3.2% of the time vs. 86.6% for points
+    # already called bursting, so this is a clean, selective signal, not
+    # something that would fire indiscriminately.
+    test_oscillating_burst = (
+        test_isi_spread_ratio is not None
         and test_isi_spread_ratio >= adaptation_ratio_override_threshold
         and test_isi_alternation_rate is not None
         and test_isi_alternation_rate >= isi_alternation_min_rate)
+    test_ceased_burst = bool(test_likely_ceased_firing)
+    test_adaptation_ratio_extreme = (
+        test_pattern == "tonic" and (test_oscillating_burst or test_ceased_burst))
     if test_adaptation_ratio_extreme:
         test_pattern = "bursting"
 
