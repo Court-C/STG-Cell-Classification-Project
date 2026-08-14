@@ -417,6 +417,7 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
                           min_ashman_d: float = 2.0, ratio_override_ashman_d: float = 5.0,
                           ratio_override_min_ratio: float = 1.15,
                           adaptation_ratio_override_threshold: float = 5.0,
+                          isi_alternation_min_rate: float = 0.3,
                           onset_rescue_max_isis: int = 15,
                           return_traces: bool = False) -> dict:
     """Test window at the ABSOLUTE injected current level (held is not added
@@ -620,9 +621,38 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
     test_isi_spread_ratio = (float(isis_test.max() / isis_test.min())
                              if isis_test is not None and len(isis_test) > 0 and isis_test.min() > 0
                              else None)
+
+    # A wide spread alone doesn't distinguish a genuinely OSCILLATING (burst-
+    # like) train from one that just smoothly, monotonically decelerates to
+    # a new steady rate (ordinary spike-frequency adaptation, e.g. after an
+    # onset transient) -- both can post a large max/min ratio, but only the
+    # first is actually bursting. Confirmed directly (2026-08-14): a KDE-
+    # "tonic" train with isis_test spanning 14.2ms->296ms (21x spread, well
+    # over this override's threshold) was being called "bursting" purely
+    # from spread, despite being a brief onset transient (~30 ISIs, tiny
+    # monotonic growth) then no real oscillation until a genuine burst
+    # phase only emerges in the last ~14 ISIs. test_isi_alternation_rate
+    # (the fraction of consecutive ISI-to-ISI steps that flip direction --
+    # up-then-down-then-up..., as a genuine short/long/short/long
+    # alternation would) separates these: a purely monotonic adapting tail
+    # scores far below (sampled real case: 0.15), a genuinely alternating
+    # train scores far above (the original confirmed panel-11 case: 0.88;
+    # the above mixed-phase case, which DOES eventually show real
+    # alternation, scores 0.55 -- correctly in between, not incorrectly
+    # rejected). A broader sample of 60 currently-spread-overridden points
+    # shows the same split: median rate 0.68, only ~12% below 0.3.
+    isi_diff_signs = np.sign(np.diff(isis_test)) if isis_test is not None and len(isis_test) > 2 else None
+    if isi_diff_signs is not None:
+        isi_diff_signs = isi_diff_signs[isi_diff_signs != 0]
+    test_isi_alternation_rate = (
+        float(np.mean(isi_diff_signs[1:] != isi_diff_signs[:-1]))
+        if isi_diff_signs is not None and len(isi_diff_signs) > 1 else None)
+
     test_adaptation_ratio_extreme = (
         test_pattern == "tonic" and test_isi_spread_ratio is not None
-        and test_isi_spread_ratio >= adaptation_ratio_override_threshold)
+        and test_isi_spread_ratio >= adaptation_ratio_override_threshold
+        and test_isi_alternation_rate is not None
+        and test_isi_alternation_rate >= isi_alternation_min_rate)
     if test_adaptation_ratio_extreme:
         test_pattern = "bursting"
 
@@ -669,6 +699,7 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
         "test_onset_n_spikes": test_onset_n_spikes, "test_onset_isi_mean_ms": test_onset_isi_mean_ms,
         "test_trailing_silence_ms": test_trailing_silence_ms,
         "test_likely_ceased_firing": test_likely_ceased_firing,
+        "test_isi_alternation_rate": test_isi_alternation_rate,
         "test_window_s_used": window_s,
     }
 
@@ -823,6 +854,7 @@ _TEST_RECOVERY_DEFAULTS = {
     "test_adaptation_ratio": None, "test_n_bursts": None, "test_spikes_per_burst": None,
     "test_onset_n_spikes": None, "test_onset_isi_mean_ms": None,
     "test_trailing_silence_ms": None, "test_likely_ceased_firing": None,
+    "test_isi_alternation_rate": None,
     "test_window_s_used": float("nan"),
     "rebound_applicable": False,
     "rebound_occurred": False, "rebound_spike_count": 0, "rebound_latency_ms": None,
@@ -946,6 +978,7 @@ def build_uniform_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_f
                       ratio_override_ashman_d=args.ratio_override_ashman_d,
                       ratio_override_min_ratio=args.ratio_override_min_ratio,
                       adaptation_ratio_override_threshold=args.adaptation_ratio_override_threshold,
+                      isi_alternation_min_rate=args.isi_alternation_min_rate,
                       onset_rescue_max_isis=args.onset_rescue_max_isis,
                       rebound_min_onset_isis=args.rebound_min_onset_isis,
                       sag_window_ms=args.sag_window_ms,
@@ -1400,6 +1433,18 @@ def parse_args() -> argparse.Namespace:
                              "and is confirmed unstable across resimulation on the exact case this "
                              "was added for. Confirmed real case: XB2IQX held=-2.39/inj=-3.37, ISIs "
                              "spanning 15-617ms (~41x spread).")
+    parser.add_argument("--isi-alternation-min-rate", type=float, default=0.3,
+                        help="Companion gate for --adaptation-ratio-override-threshold: a wide ISI "
+                             "spread alone doesn't distinguish a genuinely OSCILLATING (burst-like) "
+                             "train from one that just smoothly, monotonically decelerates to a new "
+                             "steady rate (ordinary adaptation), which can post an equally large max/"
+                             "min ratio. test_isi_alternation_rate is the fraction of consecutive ISI-"
+                             "to-ISI steps that flip direction (up-then-down-then-up..., as genuine "
+                             "short/long/short/long alternation would); both this and the spread gate "
+                             "must pass. Confirmed real case: XB2IQX isis spanning 14.2-296ms (21x, "
+                             "clears the spread gate) but alternation_rate=0.15 (a brief onset then "
+                             "~30 ISIs of tiny monotonic growth) -- not bursting. A sample of 60 "
+                             "currently-overridden points: median rate 0.68, only ~12 percent below 0.3.")
     parser.add_argument("--onset-rescue-max-isis", type=int, default=15,
                         help="classify_rebound_pattern's tier-1 (n >= --min-isis-for-burst-test) onset-"
                              "detector OR-clause only rescues a whole-window KDE 'tonic' verdict for "
