@@ -39,7 +39,7 @@ from steady_state_cache import CACHE_PATH as DEFAULT_STEADY_STATE_CACHE_PATH
 from steady_state_cache import PARAMS_DIR as DEFAULT_PARAMS_DIR
 from steady_state_cache import get_cached_state
 from run_held_injected_grid import (constant_iapp_func, settle_hold_level, run_test_and_recovery,
-                                    _round_level, V_INDEX,
+                                    classify_hold_pattern, _round_level, V_INDEX,
                                     DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_GRID_CACHE_PATH)
 
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "example_traces"
@@ -124,15 +124,27 @@ def select_exemplar_points(grid: dict, require_held_lt_injected: bool = True) ->
     return selected
 
 
-def resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA, cell_result, hold_tail_s) -> dict:
+def resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA, cell_result, hold_tail_s,
+                     ss_entry=None) -> dict:
     """Re-run hold-settle -> (short plotting-context hold tail) -> test ->
     recovery for one specific grid point, using the exact same run_args the
     original grid sweep used for this cell, and capturing full traces.
+
+    ss_entry (the steady-state cache entry y_ss/baseline_freq_hz were
+    themselves read from) is optional only for backward compatibility with
+    existing call sites that don't need hold_pattern accuracy for held=0 --
+    every current call site already has it at hand and passes it. Without
+    it, held=0 falls back to hold_pattern=None, which would make
+    run_test_and_recovery's test_pattern != hold_pattern check spuriously
+    fire for every held=0 point (None never equals a real pattern string).
     """
     run_args = cell_result["run_args"]
     dt, temp, reftemp = run_args["dt"], run_args["temp"], run_args["reftemp"]
     settle_kwargs = dict(chunk_s=run_args["hold_settle_chunk_s"], max_settle_s=run_args["max_hold_settle_s"],
-                         settle_rtol=run_args["hold_settle_rtol"], min_peaks_for_rate=run_args["min_peaks_for_rate"])
+                         settle_rtol=run_args["hold_settle_rtol"], min_peaks_for_rate=run_args["min_peaks_for_rate"],
+                         min_isis_for_burst_test=run_args["min_isis_for_burst_test"],
+                         isi_mode_prominence_frac=run_args["isi_mode_prominence_frac"],
+                         min_isi_ratio=run_args["min_isi_ratio"])
     isi_kwargs = dict(min_isis_for_burst_test=run_args["min_isis_for_burst_test"],
                       isi_mode_prominence_frac=run_args["isi_mode_prominence_frac"],
                       min_isi_ratio=run_args["min_isi_ratio"])
@@ -140,12 +152,17 @@ def resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA, cell_
     if _round_level(held_nA) == 0.0:
         hold_final_state = y_ss.copy()
         hold_freq_hz = baseline_freq_hz
+        burnin_v = ss_entry.get("burnin_v") if ss_entry is not None else None
+        burnin_t = ss_entry.get("burnin_t") if ss_entry is not None else None
+        hold_pattern = classify_hold_pattern(burnin_v, burnin_t, run_args["min_isis_for_burst_test"],
+                                             run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"])
     else:
         hold_result = settle_hold_level(params, held_nA, y_ss.copy(), dt, temp, reftemp, **settle_kwargs)
         if hold_result["blew_up"]:
             return {"blew_up": True, "error": hold_result.get("error"), "stage": "hold"}
         hold_final_state = hold_result["final_state"]
         hold_freq_hz = hold_result["freq_hz"] or 0.0
+        hold_pattern = hold_result["hold_pattern"]
 
     # Short dedicated hold-only segment, purely for plotting context before
     # the test window -- continues at the same held level from the settled
@@ -159,7 +176,7 @@ def resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA, cell_
     if not np.all(np.isfinite(states_hold)):
         return {"blew_up": True, "error": "hold tail: non-finite trajectory", "stage": "hold_tail"}
 
-    tr = run_test_and_recovery(params, states_hold[-1], held_nA, injected_nA, hold_freq_hz,
+    tr = run_test_and_recovery(params, states_hold[-1], held_nA, injected_nA, hold_freq_hz, hold_pattern,
                                dt, temp, reftemp, cell_result["test_window_s"], cell_result["recovery_window_s"],
                                run_args["rebound_latency_min_ms"], return_traces=True, **isi_kwargs)
     if tr["blew_up"]:
@@ -276,7 +293,7 @@ def main() -> None:
         for (test_pattern, rebound_pattern), (key, _point) in sorted(exemplars.items()):
             held_nA, injected_nA = key
             tr = resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA,
-                                  cell_result, args.hold_tail_s)
+                                  cell_result, args.hold_tail_s, ss_entry=ss_entry)
             if tr["blew_up"]:
                 print(f"  ({held_nA:+.2f}, {injected_nA:+.2f}) [{test_pattern}/{rebound_pattern}]: "
                      f"blew up re-simulating ({tr.get('stage')}: {tr.get('error')})")

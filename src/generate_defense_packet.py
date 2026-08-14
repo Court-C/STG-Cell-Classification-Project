@@ -81,8 +81,10 @@ def _save_page(fig, pdf: PdfPages, png_dir: Path, name: str, command: str, sourc
     plt.close(fig)
 
 
-def _resim(cell_id, params, y_ss, baseline_freq_hz, cell_result, held_nA, injected_nA, hold_tail_s=0.5):
-    return resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA, cell_result, hold_tail_s)
+def _resim(cell_id, params, y_ss, baseline_freq_hz, cell_result, held_nA, injected_nA, hold_tail_s=0.5,
+          ss_entry=None):
+    return resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA, cell_result, hold_tail_s,
+                            ss_entry=ss_entry)
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +630,8 @@ def build_packet(cell_id: str, args) -> None:
     y_ss, baseline_freq_hz = ss_entry["y_ss"], ss_entry["freq_hz"]
 
     def resim(held_nA, injected_nA):
-        return _resim(cell_id, params, y_ss, baseline_freq_hz, cell_result, held_nA, injected_nA)
+        return _resim(cell_id, params, y_ss, baseline_freq_hz, cell_result, held_nA, injected_nA,
+                      ss_entry=ss_entry)
 
     dt_ms = run_args["dt"]
 

@@ -51,7 +51,7 @@ def main() -> None:
         test_pattern = point["test_pattern"] or "silent"
         rebound_pattern = point["rebound_pattern"]
         tr = resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA,
-                              cell_result, args.hold_tail_s)
+                              cell_result, args.hold_tail_s, ss_entry=ss_entry)
         if tr["blew_up"]:
             print(f"  ({held_nA:+.2f}, {injected_nA:+.2f}): blew up re-simulating "
                  f"({tr.get('stage')}: {tr.get('error')})")

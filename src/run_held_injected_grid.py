@@ -129,17 +129,43 @@ def get_cell_floor_nA(silencing_entry: dict, margin_nA: float):
 # Per-point simulation
 # ---------------------------------------------------------------------------
 
+def classify_hold_pattern(chunk_v, chunk_t, min_isis_for_burst_test, isi_mode_prominence_frac,
+                          min_isi_ratio) -> str:
+    """tonic/bursting/silent for a held level's OWN steady-state firing,
+    from whichever settle chunk is already being simulated anyway (the
+    last hold-settle chunk for held!=0, the cached Iapp=0 burn-in trace for
+    held=0) -- zero extra simulation cost, same compute_isis_ms +
+    classify_burst_pattern + to_stored_pattern pipeline find_silencing_
+    threshold.py's own baseline (Iapp=0) probe already uses. Added
+    2026-08-13 so test_suppressed can compare test_pattern against what
+    this held level ACTUALLY produces, not just its average rate (see
+    run_test_and_recovery's test_suppressed docstring).
+    """
+    if chunk_v is None:
+        return "silent"
+    isis_ms, n_peaks = compute_isis_ms(chunk_v, chunk_t, PROMINENCE_FRACTION)
+    burst = classify_burst_pattern(isis_ms, min_isis_for_burst_test, isi_mode_prominence_frac,
+                                   min_isi_ratio, n_peaks=n_peaks)
+    return to_stored_pattern(burst["pattern"])
+
+
 def settle_hold_level(params, held_nA, warm_start_state, dt, temp, reftemp,
-                      chunk_s, max_settle_s, settle_rtol, min_peaks_for_rate) -> dict:
+                      chunk_s, max_settle_s, settle_rtol, min_peaks_for_rate,
+                      min_isis_for_burst_test, isi_mode_prominence_frac, min_isi_ratio) -> dict:
     """Settle at a constant held current, reusing Step 1's settle_at_level
     engine unchanged, plus the end-of-settle voltage (the pre-test baseline
-    compute_pre_spike_sag_trough's sag depth is measured against).
+    compute_pre_spike_sag_trough's sag depth is measured against) and this
+    held level's own tonic/bursting/silent classification (see
+    classify_hold_pattern).
     """
     r = settle_at_level(params, warm_start_state, held_nA, dt, temp, reftemp,
                         chunk_s, max_settle_s, settle_rtol, min_peaks_for_rate)
     if r["blew_up"]:
         return r
     r["hold_v_end_mV"] = float(r["last_chunk_v"][-1]) if r["last_chunk_v"] is not None else float("nan")
+    r["hold_pattern"] = classify_hold_pattern(r["last_chunk_v"], r["last_chunk_t"],
+                                              min_isis_for_burst_test, isi_mode_prominence_frac,
+                                              min_isi_ratio)
     # Trough of the held level's OWN last settle chunk -- for a flatline hold
     # this equals hold_v_end_mV (a constant trace's min is its endpoint), but
     # for a hold that's itself tonically/burst firing at rest (e.g. XB2IQX at
@@ -282,12 +308,70 @@ def detect_onset_burst(isis_ms: np.ndarray, min_isi_ratio: float, min_onset_isis
     return None, None
 
 
-def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz, dt, temp, reftemp,
+def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_ms: float,
+                             min_isis_for_burst_test: int, isi_mode_prominence_frac: float,
+                             min_isi_ratio: float, n_peaks: int,
+                             rebound_min_onset_isis: int = 1, trailing_silence_ratio: float = 3.0) -> str:
+    """"bursting_rebound" or "tonic_rebound" for a >=2-spike recovery-window
+    train (rebound_spike_count==1/0 are handled by the caller before this is
+    reached). classify_burst_pattern's whole-train KDE bimodality test is
+    right to be authoritative for LONG trains (it won't call a long,
+    gradually-adapting tonic rebound "bursting" just because it eventually
+    tapers off) -- but rebound trains are typically SHORT, bounded events
+    (a fixed recovery window, not indefinite firing), and the KDE test has
+    two confirmed failure modes there (XB2IQX, 2026-08-13): (1) enough ISIs
+    to attempt the test, but a short irregular onset-burst-then-decelerating
+    -tail sequence doesn't form two clean KDE clusters (held=-4.22/inj=
+    -3.37: 7 ISIs, onset 13.2/13.7/17.9ms then an irregular 31-88ms tail,
+    KDE says "tonic"); (2) too few ISIs (<6) to attempt the test at all,
+    silently defaulting to "tonic_rebound" regardless of structure
+    (held=-4.50/inj=-3.93: 2 ISIs, a tight 16.3/21.6ms triplet).
+
+    Three tiers, each reusing already-validated machinery:
+    1. Enough ISIs for the KDE test (n >= min_isis_for_burst_test): trust
+       it, OR detect_onset_burst's local leading-run finding -- either
+       "bursting" wins. Gated to this tier only (not applied to shorter
+       trains) so a confident KDE "tonic" verdict on a long train is never
+       second-guessed by the shorter-train fallbacks below.
+    2. Too few for the KDE test but enough for detect_onset_burst
+       (rebound_min_onset_isis defaults to 1, not test-window onset
+       detection's 2, so even a 2-ISI train gets a real jump check):
+       use detect_onset_burst alone.
+    3. No internal jump found anywhere (uniform ISIs, or too short to
+       compare at all): if the train then definitively ENDED within the
+       window (trailing silence >= trailing_silence_ratio times the last
+       ISI, the same reasoning test_likely_ceased_firing already uses),
+       treat the whole short train as one completed burst -- a handful of
+       spikes that fire in a consistent rhythm and then genuinely stop is
+       closer to a bounded burst than to "tonic" firing, which implies
+       ongoing/sustained activity. Deliberately NOT anchored to an
+       absolute ms threshold or a same-level tonic-rate comparison: a
+       short, internally-consistent, now-over train reads as a burst on
+       its own terms, arbitrary as that is at very small spike counts.
+    """
+    n = len(rebound_isis)
+    if n >= min_isis_for_burst_test:
+        kde_result = classify_burst_pattern(rebound_isis, min_isis_for_burst_test,
+                                            isi_mode_prominence_frac, min_isi_ratio, n_peaks=n_peaks)
+        onset_n, _ = detect_onset_burst(rebound_isis, min_isi_ratio, rebound_min_onset_isis)
+        return "bursting_rebound" if (kde_result["pattern"] == "bursting" or onset_n is not None) \
+            else "tonic_rebound"
+
+    onset_n, _ = detect_onset_burst(rebound_isis, min_isi_ratio, rebound_min_onset_isis)
+    if onset_n is not None:
+        return "bursting_rebound"
+
+    ceased = rebound_trailing_silence_ms >= trailing_silence_ratio * rebound_isis[-1]
+    return "bursting_rebound" if ceased else "tonic_rebound"
+
+
+def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz, hold_pattern,
+                          dt, temp, reftemp,
                           test_window_s, recovery_window_s, rebound_latency_min_ms,
                           min_isis_for_burst_test, isi_mode_prominence_frac, min_isi_ratio,
                           sag_window_ms: float = 500.0, sag_dead_zone_ms: float = 5.0,
                           adaptation_edge_n: int = 3, min_onset_isis: int = 2,
-                          trailing_silence_ratio: float = 3.0,
+                          trailing_silence_ratio: float = 3.0, rebound_min_onset_isis: int = 1,
                           max_test_window_s: float = None, test_window_extend_factor: float = 2.0,
                           return_traces: bool = False) -> dict:
     """Test window at the ABSOLUTE injected current level (held is not added
@@ -485,8 +569,21 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
     # detection on the already-simulated recovery trace. Checked across
     # XB2IQX's full grid: 438/2500 points (17.5%) share this exact gap
     # (hold_freq_hz==0, test_pattern != "silent").
+    #
+    # test_pattern != hold_pattern, not just a rate comparison (2026-08-13):
+    # the rate-ratio clause is only a PROXY for "did something qualitative
+    # change" -- it misses a pattern change (tonic hold -> bursting test)
+    # that isn't also a rate drop. hold_pattern (classify_hold_pattern on
+    # the hold level's own settle chunk, zero extra simulation cost) is the
+    # actual thing being approximated, so compare it directly. Confirmed
+    # missed cases on XB2IQX: held=-3.12/inj=-3.03 (hold tonic @ 13.5Hz,
+    # test bursting @ 18.7Hz -- rate went UP, never suppressed by the ratio
+    # clause) and held=-3.31/inj=-2.92 (hold tonic @ 5.0Hz, test tonic @
+    # 24.7Hz) both show a genuine multi-spike recovery burst that was
+    # entirely discarded.
     test_suppressed = (test_pattern == "silent"
                        or hold_freq_hz == 0
+                       or test_pattern != hold_pattern
                        or (hold_freq_hz > 0 and test_freq_hz < 0.5 * hold_freq_hz))
 
     if not test_suppressed:
@@ -517,10 +614,12 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
             rebound_pattern = "single_spike"
         else:
             rebound_isis = np.diff(qualifying)
-            rebound_burst = classify_burst_pattern(rebound_isis, min_isis_for_burst_test,
-                                                   isi_mode_prominence_frac, min_isi_ratio,
-                                                   n_peaks=rebound_spike_count)
-            rebound_pattern = "bursting_rebound" if rebound_burst["pattern"] == "bursting" else "tonic_rebound"
+            rebound_trailing_silence_ms = recovery_window_s * 1000.0 - qualifying[-1]
+            rebound_pattern = classify_rebound_pattern(
+                rebound_isis, rebound_trailing_silence_ms, min_isis_for_burst_test,
+                isi_mode_prominence_frac, min_isi_ratio, rebound_spike_count,
+                rebound_min_onset_isis=rebound_min_onset_isis,
+                trailing_silence_ratio=trailing_silence_ratio)
 
     recovery_result = {
         "rebound_applicable": test_suppressed,
@@ -567,7 +666,8 @@ def make_blew_up_point(held_nA, injected_nA, source, error, hold_blew_up=False) 
     return {
         "held_nA": held_nA, "injected_nA": injected_nA, "source": source,
         "hold_settled": False, "hold_freq_hz": 0.0, "hold_is_flatline": False,
-        "hold_v_end_mV": float("nan"), "hold_v_trough_mV": float("nan"), "hold_blew_up": hold_blew_up,
+        "hold_v_end_mV": float("nan"), "hold_v_trough_mV": float("nan"), "hold_pattern": None,
+        "hold_blew_up": hold_blew_up,
         **_TEST_RECOVERY_DEFAULTS,
         "blew_up": True, "error": error,
     }
@@ -580,14 +680,15 @@ def run_trial_point(params, hold_result, held_nA, injected_nA, dt, temp, reftemp
         return make_blew_up_point(held_nA, injected_nA, source, hold_result.get("error"), hold_blew_up=True)
 
     tr = run_test_and_recovery(params, hold_result["final_state"], held_nA, injected_nA,
-                               hold_result["freq_hz"] or 0.0, dt, temp, reftemp,
+                               hold_result["freq_hz"] or 0.0, hold_result["hold_pattern"],
+                               dt, temp, reftemp,
                                test_window_s, recovery_window_s,
                                rebound_latency_min_ms, **isi_kwargs)
     point = {
         "held_nA": held_nA, "injected_nA": injected_nA, "source": source,
         "hold_settled": hold_result["settled"], "hold_freq_hz": hold_result["freq_hz"] or 0.0,
         "hold_is_flatline": hold_result["is_flatline"], "hold_v_end_mV": hold_result["hold_v_end_mV"],
-        "hold_v_trough_mV": hold_result["hold_v_trough_mV"],
+        "hold_v_trough_mV": hold_result["hold_v_trough_mV"], "hold_pattern": hold_result["hold_pattern"],
         "hold_blew_up": False,
         **_TEST_RECOVERY_DEFAULTS,
     }
@@ -596,7 +697,8 @@ def run_trial_point(params, hold_result, held_nA, injected_nA, dt, temp, reftemp
 
 
 def get_or_settle_hold(params, held_nA, hold_settle_cache, y_ss, baseline_freq_hz,
-                       dt, temp, reftemp, settle_kwargs, y_ss_trough_mV=None) -> dict:
+                       dt, temp, reftemp, settle_kwargs, y_ss_trough_mV=None,
+                       y_ss_hold_pattern=None) -> dict:
     """Settle at held_nA, reusing a cached settle if this exact (rounded)
     held level has already been solved, else warm-starting from whichever
     already-settled held level is numerically nearest. held=0 is free --
@@ -608,15 +710,19 @@ def get_or_settle_hold(params, held_nA, hold_settle_cache, y_ss, baseline_freq_h
     cells (XB2IQX included), so it has the identical single-sample-baseline
     problem settle_hold_level's hold_v_trough_mV addition fixes. Falls back
     to the single y_ss sample only if no burn-in trace was cached.
+    y_ss_hold_pattern (classify_hold_pattern on that same burn-in trace)
+    plays the identical role for hold_pattern.
     """
     key = _round_level(held_nA)
     if key in hold_settle_cache:
         return hold_settle_cache[key]
     if key == 0.0:
         trough = y_ss_trough_mV if y_ss_trough_mV is not None else float(y_ss[V_INDEX])
+        hold_pattern = y_ss_hold_pattern if y_ss_hold_pattern is not None else "silent"
         result = {"blew_up": False, "settled": True, "freq_hz": baseline_freq_hz,
                   "is_flatline": False, "final_state": y_ss.copy(),
-                  "hold_v_end_mV": float(y_ss[V_INDEX]), "hold_v_trough_mV": trough}
+                  "hold_v_end_mV": float(y_ss[V_INDEX]), "hold_v_trough_mV": trough,
+                  "hold_pattern": hold_pattern}
         hold_settle_cache[key] = result
         return result
     # Only warm-start from a PREVIOUSLY SUCCESSFUL settle -- a blown-up cache
@@ -652,15 +758,19 @@ def get_or_settle_hold(params, held_nA, hold_settle_cache, y_ss, baseline_freq_h
 # simulated more or fewer times.
 
 def build_uniform_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_floor_nA, args,
-                       y_ss_trough_mV=None):
+                       y_ss_trough_mV=None, y_ss_hold_pattern=None):
     held_levels = [_round_level(v) for v in np.linspace(0.0, cell_floor_nA, args.n_points_held)]
     injected_levels = [_round_level(v) for v in np.linspace(0.0, injected_floor_nA, args.n_points_injected)]
 
     settle_kwargs = dict(chunk_s=args.hold_settle_chunk_s, max_settle_s=args.max_hold_settle_s,
-                         settle_rtol=args.hold_settle_rtol, min_peaks_for_rate=args.min_peaks_for_rate)
+                         settle_rtol=args.hold_settle_rtol, min_peaks_for_rate=args.min_peaks_for_rate,
+                         min_isis_for_burst_test=args.min_isis_for_burst_test,
+                         isi_mode_prominence_frac=args.isi_mode_prominence_frac,
+                         min_isi_ratio=args.min_isi_ratio)
     isi_kwargs = dict(min_isis_for_burst_test=args.min_isis_for_burst_test,
                       isi_mode_prominence_frac=args.isi_mode_prominence_frac,
                       min_isi_ratio=args.min_isi_ratio,
+                      rebound_min_onset_isis=args.rebound_min_onset_isis,
                       sag_window_ms=args.sag_window_ms,
                       sag_dead_zone_ms=args.sag_dead_zone_ms,
                       adaptation_edge_n=args.adaptation_edge_n,
@@ -680,7 +790,8 @@ def build_uniform_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_f
     for held in held_levels:
         hold_result = get_or_settle_hold(params, held, hold_settle_cache, y_ss, baseline_freq_hz,
                                          args.dt, args.temp, args.reftemp, settle_kwargs,
-                                         y_ss_trough_mV=y_ss_trough_mV)
+                                         y_ss_trough_mV=y_ss_trough_mV,
+                                         y_ss_hold_pattern=y_ss_hold_pattern)
         for injected in injected_levels:
             point = run_trial_point(params, hold_result, held, injected, args.dt, args.temp, args.reftemp,
                                     test_window_s, recovery_window_s, args.rebound_latency_min_ms,
@@ -714,12 +825,15 @@ def run_cell_grid(cell_id: str, params: np.ndarray, ss_entry, silencing_entry, a
     y_ss = ss_entry["y_ss"]
     baseline_freq_hz = ss_entry["freq_hz"]
     burnin_v = ss_entry.get("burnin_v")
+    burnin_t = ss_entry.get("burnin_t")
     y_ss_trough_mV = float(np.min(burnin_v)) if burnin_v is not None else None
+    y_ss_hold_pattern = classify_hold_pattern(burnin_v, burnin_t, args.min_isis_for_burst_test,
+                                              args.isi_mode_prominence_frac, args.min_isi_ratio)
 
     try:
         grid, hold_settle_cache, held_levels, injected_levels, test_window_s, recovery_window_s = \
             build_uniform_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_floor_nA, args,
-                               y_ss_trough_mV=y_ss_trough_mV)
+                               y_ss_trough_mV=y_ss_trough_mV, y_ss_hold_pattern=y_ss_hold_pattern)
     except (FloatingPointError, OverflowError, ValueError) as exc:
         return {**base, "status": "blew_up", "error": str(exc)}
 
@@ -1105,6 +1219,13 @@ def parse_args() -> argparse.Namespace:
                              "flagged this way -- a first-k/last-k ISI ratio measures something "
                              "different for a train that dies out mid-window than for one that keeps "
                              "firing steadily throughout.")
+    parser.add_argument("--rebound-min-onset-isis", type=int, default=1,
+                        help="Same role as --min-onset-isis, but for classify_rebound_pattern's local "
+                             "jump check on a recovery-window's own ISIs, not the test window's. Default "
+                             "1 (not --min-onset-isis's 2): rebound trains are short by nature, and a "
+                             "2-ISI train (3 spikes) needs this at 1 to get any jump check at all -- see "
+                             "classify_rebound_pattern's docstring for the confirmed XB2IQX cases this "
+                             "distinguishes.")
     parser.add_argument("--max-test-window-s", type=float, default=20.0,
                         help="If a test window comes back 'insufficient_data' (too few ISIs to "
                              "classify at all), it's re-simulated with a longer window (doubled by "
