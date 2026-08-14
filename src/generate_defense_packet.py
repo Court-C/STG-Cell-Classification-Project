@@ -26,7 +26,7 @@ ROOT_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from steady_state_cache import get_cached_state, CACHE_PATH as DEFAULT_STEADY_STATE_CACHE_PATH
-from plot_example_traces import resimulate_point, select_exemplar_points
+from plot_example_traces import resimulate_point, select_exemplar_points, build_example_trace_figure
 from find_silencing_threshold import (compute_isis_ms, classify_burst_pattern, count_spikes_and_rate,
                                       PROMINENCE_FRACTION, detect_spikes_dvdt_confirmed, FLATLINE_MV,
                                       MIN_SPIKE_AMPLITUDE_MV)
@@ -236,6 +236,30 @@ def make_representative_traces_page(cell_id, cell_result, resim) -> plt.Figure:
     # labels.
     fig.tight_layout(rect=(0, 0.11, 1, 0.93))
     return fig
+
+
+def make_example_trace_detail_pages(cell_id, cell_result, resim) -> list:
+    """One full-detail page per (test_pattern, rebound_pattern) combination
+    -- same exemplar selection as make_representative_traces_page's compact
+    overview grid, same underlying figure plot_example_traces.py used to
+    write as a standalone file per combination (build_example_trace_figure).
+    Folded into the packet itself instead of a separate figures/
+    example_traces/{cell_id}/ directory of loose files: everything a PI
+    needs to see lives in the one PDF, not scattered across the repo, and a
+    standalone copy risks going stale exactly the way one did (last
+    regenerated 2026-08-10, silently out of date through several
+    classification fixes landed after that).
+    """
+    exemplars = select_exemplar_points(cell_result["grid"])
+    pages = []
+    for (test_pattern, rebound_pattern), (key, _point) in sorted(exemplars.items()):
+        held_nA, injected_nA = key
+        tr = resim(held_nA, injected_nA)
+        if tr.get("blew_up"):
+            continue
+        fig = build_example_trace_figure(cell_id, held_nA, injected_nA, test_pattern, rebound_pattern, tr)
+        pages.append((f"{test_pattern}/{rebound_pattern}", fig))
+    return pages
 
 
 # ---------------------------------------------------------------------------
@@ -817,8 +841,9 @@ def build_packet(cell_id: str, args) -> None:
                             (-2.892861, -2.958704, "ratio-gate near-miss (rejected as tonic)")]
 
     sections = [
-        ("Representative traces", "One trace per distinct pattern/rebound combination actually "
-         "observed in this cell's grid."),
+        ("Representative traces", "One overview page (compact panels), then one full-detail page per "
+         "pattern/rebound combination actually observed in this cell's grid -- the same figures "
+         "plot_example_traces.py would otherwise write as separate standalone files per cell."),
         ("Spike detection", "Every detected peak overlaid on real traces."),
         ("Prominence-threshold sensitivity", "How stable spike counts are across a range of thresholds."),
         ("dV/dt cross-validation", "Independent detector cross-check across a random sample."),
@@ -849,14 +874,33 @@ def build_packet(cell_id: str, args) -> None:
     grid_cache_name = Path(args.grid_cache).name
     grid_features_cache_name = Path(args.grid_features_cache).name
 
+    # Tracks the real number of pages saved -- sections is a fixed top-level
+    # list, but section 1 now writes a variable number of detail pages (one
+    # per exemplar combination actually present in the grid), so len(sections)
+    # no longer equals the actual page count.
+    page_count = 0
+
     def save(fig, name, source):
+        nonlocal page_count
         _save_page(fig, pdf, png_dir, name, command, f"{grid_cache_name} -> {source}")
+        page_count += 1
 
     with PdfPages(pdf_path) as pdf:
         _save_page(make_cover_page(cell_id, cell_result, features, sections), pdf, png_dir, "00_cover",
                   command, f"{grid_cache_name} + {grid_features_cache_name}")
+        page_count += 1
         save(make_representative_traces_page(cell_id, cell_result, resim), "01_representative_traces",
             "plot_example_traces.select_exemplar_points() + resimulate_point()")
+        # One full-detail page per combination, folded into the packet
+        # instead of a standalone figures/example_traces/{cell_id}/
+        # directory -- see make_example_trace_detail_pages' docstring for
+        # why (a standalone copy of this exact content went stale for over
+        # a week through several classification fixes before being caught).
+        for combo_label, detail_fig in make_example_trace_detail_pages(cell_id, cell_result, resim):
+            slug = combo_label.replace("/", "-").replace(" ", "_")
+            save(detail_fig, f"01_representative_traces_detail__{slug}",
+                "plot_example_traces.select_exemplar_points() + resimulate_point() -> "
+                "plot_example_traces.build_example_trace_figure()")
         save(make_spike_detection_page(cell_id, spike_pts, resim), "02_spike_detection",
             "resimulate_point() -> trace_annotations.mark_spikes() (scipy.signal.find_peaks, same call "
             "find_silencing_threshold.compute_isis_ms uses)")
@@ -883,7 +927,7 @@ def build_packet(cell_id: str, args) -> None:
             "12_bimodality_test", "resimulate_point() -> find_silencing_threshold.classify_burst_pattern() "
             "(4th row: constructed synthetic ISIs, no resimulation)")
 
-    print(f"{cell_id}: wrote {pdf_path} and {len(sections) + 1} section PNGs to {png_dir}/")
+    print(f"{cell_id}: wrote {pdf_path} and {page_count} section PNGs to {png_dir}/")
 
 
 def parse_args() -> argparse.Namespace:

@@ -188,9 +188,14 @@ def resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA, cell_
     return tr
 
 
-def plot_example_trace(cell_id: str, held_nA: float, injected_nA: float,
-                       test_pattern: str, rebound_pattern: str, tr: dict,
-                       outdir: Path, command: str, fig_format: str) -> Path:
+def build_example_trace_figure(cell_id: str, held_nA: float, injected_nA: float,
+                               test_pattern: str, rebound_pattern: str, tr: dict) -> plt.Figure:
+    """The actual figure-building logic, split out from plot_example_trace
+    so a caller that wants the Figure object itself (e.g.
+    generate_defense_packet.py, to embed this exact rendering as a packet
+    page instead of a standalone file) doesn't have to save-then-reopen a
+    file to get it.
+    """
     t_hold, v_hold = tr["_trace_t_hold_ms"], tr["_trace_v_hold_mV"]
     t_test, v_test = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
     t_rec, v_rec = tr["_trace_t_rec_ms"], tr["_trace_v_rec_mV"]
@@ -220,6 +225,13 @@ def plot_example_trace(cell_id: str, held_nA: float, injected_nA: float,
     ax_i.set_xlabel("time (ms)")
 
     fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
+    return fig
+
+
+def plot_example_trace(cell_id: str, held_nA: float, injected_nA: float,
+                       test_pattern: str, rebound_pattern: str, tr: dict,
+                       outdir: Path, command: str, fig_format: str) -> Path:
+    fig = build_example_trace_figure(cell_id, held_nA, injected_nA, test_pattern, rebound_pattern, tr)
     fig.text(0.5, 0.01, command, ha="center", va="bottom",
              fontsize=6, family="monospace", color="dimgray", wrap=True)
 
