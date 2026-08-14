@@ -656,7 +656,7 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
     # ratio) despite that being the more obviously "adaptation-shaped"
     # signal: test_adaptation_ratio is itself only computed when NOT
     # test_likely_ceased_firing, and this exact confirmed case is already
-    # documented (see generate_defense_packet.py's adapt_exemplars comment)
+    # documented (see generate_validation_packet.py's adapt_exemplars comment)
     # to be unstable across resimulation runs on that specific flag --
     # sometimes ceased=True (adaptation_ratio never computed, None), other
     # times ceased=False (adaptation_ratio=17.5). A max/min spread ratio on

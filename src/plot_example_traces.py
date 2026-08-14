@@ -50,6 +50,20 @@ DEFAULT_FIGURE_FORMAT = "svg"
 # deepest silencing threshold, bursting-at-rest, tonic-only, deep+diverse).
 DEFAULT_CURATED_CELLS = ["W0E22J", "WX7CJ9", "2EXYPV", "4QSWXH", "5A6WBD"]
 
+_PATTERN_LABELS = {
+    "tonic": "tonic firing", "bursting": "bursting", "silent": "silent (no firing)",
+    "tonic_rebound": "a sustained (tonic) rebound", "bursting_rebound": "a burst-like rebound",
+    "single_spike": "a single-spike rebound", "none": "no rebound",
+}
+
+
+def describe_pattern(pattern) -> str:
+    """Plain-language description of a classification label, for figure
+    titles and captions meant to be read by a person rather than the code
+    that produced them.
+    """
+    return _PATTERN_LABELS.get(pattern, str(pattern))
+
 
 def _prominence_score(point: dict) -> float:
     """How clearly a point demonstrates its own test_pattern classification
@@ -192,7 +206,7 @@ def build_example_trace_figure(cell_id: str, held_nA: float, injected_nA: float,
                                test_pattern: str, rebound_pattern: str, tr: dict) -> plt.Figure:
     """The actual figure-building logic, split out from plot_example_trace
     so a caller that wants the Figure object itself (e.g.
-    generate_defense_packet.py, to embed this exact rendering as a packet
+    generate_validation_packet.py, to embed this exact rendering as a packet
     page instead of a standalone file) doesn't have to save-then-reopen a
     file to get it.
     """
@@ -208,20 +222,21 @@ def build_example_trace_figure(cell_id: str, held_nA: float, injected_nA: float,
 
     fig, (ax_v, ax_i) = plt.subplots(2, 1, figsize=(10, 5), sharex=True,
                                      gridspec_kw={"height_ratios": [3, 1]})
-    ax_v.plot(t_hold, v_hold, color="gray", lw=0.8, label=f"hold ({held_nA:.2f} nA)")
-    ax_v.plot(t_test_off, v_test, color="firebrick", lw=0.8, label=f"test ({injected_nA:.2f} nA)")
-    ax_v.plot(t_rec_off, v_rec, color="steelblue", lw=0.8, label=f"recovery ({held_nA:.2f} nA)")
+    ax_v.plot(t_hold, v_hold, color="gray", lw=0.8, label=f"holding current ({held_nA:.2f} nA)")
+    ax_v.plot(t_test_off, v_test, color="firebrick", lw=0.8, label=f"current step ({injected_nA:.2f} nA)")
+    ax_v.plot(t_rec_off, v_rec, color="steelblue", lw=0.8,
+             label=f"recovery, released to {held_nA:.2f} nA")
     ax_v.axvline(hold_end, color="black", ls=":", lw=1)
     ax_v.axvline(test_end, color="black", ls=":", lw=1)
-    ax_v.set_ylabel("V (mV)")
+    ax_v.set_ylabel("membrane potential (mV)")
     ax_v.legend(loc="upper right", fontsize=7)
-    ax_v.set_title(f"{cell_id} — held={held_nA:.2f} nA, injected={injected_nA:.2f} nA — "
-                   f"test: {test_pattern}, rebound: {rebound_pattern}", fontsize=9)
+    ax_v.set_title(f"{cell_id}: {describe_pattern(test_pattern)} during the current step, then "
+                   f"{describe_pattern(rebound_pattern)}", fontsize=9)
 
     ax_i.plot(t_hold, np.full_like(t_hold, held_nA), color="gray", lw=1.2)
     ax_i.plot(t_test_off, np.full_like(t_test_off, injected_nA), color="firebrick", lw=1.2)
     ax_i.plot(t_rec_off, np.full_like(t_rec_off, held_nA), color="steelblue", lw=1.2)
-    ax_i.set_ylabel("Iapp (nA)")
+    ax_i.set_ylabel("applied current (nA)")
     ax_i.set_xlabel("time (ms)")
 
     fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))

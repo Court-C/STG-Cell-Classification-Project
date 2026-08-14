@@ -41,9 +41,9 @@ def mark_spikes(ax, t_ms: np.ndarray, v_mV: np.ndarray, color: str = "black",
     """
     v_range = v_mV.max() - v_mV.min()
     if v_range < FLATLINE_MV:
-        caption = (f"No spikes detected: voltage range ({v_range:.2f} mV) is below the "
-                  f"FLATLINE_MV={FLATLINE_MV} mV cutoff, so this window is classified silent "
-                  "without ever running peak detection.")
+        caption = (f"No spikes were detected: the voltage stayed within a {v_range:.2f} mV range "
+                  f"for the whole window, below the {FLATLINE_MV} mV range required even to attempt "
+                  "peak detection, so this window is classified as electrically silent.")
         return np.array([], dtype=int), caption
 
     from scipy.signal import find_peaks
@@ -54,15 +54,16 @@ def mark_spikes(ax, t_ms: np.ndarray, v_mV: np.ndarray, color: str = "black",
                marker=marker, color=color, markersize=6, zorder=5, label=label)
 
     floor_active = prominence > v_range * PROMINENCE_FRACTION
-    caption = (f"Markers show every peak scipy.signal.find_peaks detects at "
-              f"prominence >= {prominence:.1f} mV ("
-              + (f"the {MIN_SPIKE_AMPLITUDE_MV:.0f}mV absolute floor, since "
-                 f"{PROMINENCE_FRACTION:.2f}x this trace's own {v_range:.1f}mV range would be smaller"
+    caption = (f"Markers show every spike this trace's automated peak detector found, requiring "
+              f"each peak to rise at least {prominence:.1f} mV above its surroundings ("
+              + (f"a fixed {MIN_SPIKE_AMPLITUDE_MV:.0f} mV floor, since this trace's own "
+                 f"{v_range:.1f} mV voltage range is small enough that a simple {PROMINENCE_FRACTION:.0%} "
+                 "threshold would let subthreshold noise through"
                  if floor_active else
-                 f"{PROMINENCE_FRACTION:.2f}x this trace's own {v_range:.1f}mV range")
-              + f") -- the exact call count_spikes_and_rate/compute_isis_ms use for every spike count, "
-              f"ISI, and burst/tonic classification in the pipeline. {len(peaks)} spike(s) detected "
-              "in this window.")
+                 f"{PROMINENCE_FRACTION:.0%} of this trace's own {v_range:.1f} mV voltage range")
+              + f") -- this is the same spike count used for every interspike-interval and "
+              f"burst/tonic classification elsewhere in this report. {len(peaks)} spike(s) were "
+              "detected in this window.")
     return peaks, caption
 
 
@@ -82,27 +83,28 @@ def mark_confirmed_vs_rejected(ax, t_ms: np.ndarray, v_mV: np.ndarray, dt_ms: fl
     v_range = v_mV.max() - v_mV.min()
     if v_range < FLATLINE_MV:
         return {"confirmed": np.array([], dtype=int), "rejected": np.array([], dtype=int)}, (
-            f"No spikes to cross-validate: voltage range ({v_range:.2f} mV) is below "
-            f"FLATLINE_MV={FLATLINE_MV} mV.")
+            f"There are no spikes to cross-validate: the voltage stayed within a {v_range:.2f} mV "
+            f"range for the whole window, below the {FLATLINE_MV} mV threshold for silence.")
 
     confirmed, rejected = detect_spikes_dvdt_confirmed(v_mV, t_ms, dt_ms)
     if len(confirmed) > 0:
         ax.plot(t_ms[confirmed], v_mV[confirmed] + 0.05 * v_range, linestyle="none", marker="o",
                color=confirmed_color, markersize=5, zorder=5,
-               label=f"dV/dt-confirmed (n={len(confirmed)})")
+               label=f"confirmed by upstroke shape (n={len(confirmed)})")
     if len(rejected) > 0:
         ax.plot(t_ms[rejected], v_mV[rejected] + 0.05 * v_range, linestyle="none", marker="x",
                color=rejected_color, markersize=8, markeredgewidth=2, zorder=6,
-               label=f"prominence-only, dV/dt-rejected (n={len(rejected)})")
+               label=f"rejected on upstroke shape (n={len(rejected)})")
 
     agree = len(rejected) == 0
-    caption = (f"Cross-check against a second, unused-in-production detector: a candidate peak "
-              f"additionally requires a genuine fast upstroke (dV/dt >= "
-              f"{DEFAULT_DVDT_THRESHOLD_MV_PER_MS:.0f} mV/ms within {DEFAULT_MIN_PRE_SPIKE_MS:.0f} ms "
-              f"before the peak, Bean 2007 convention) before counting. {len(confirmed)} of "
-              f"{len(confirmed) + len(rejected)} candidate peak(s) confirmed"
-              + ("; the two detectors agree on every spike in this window." if agree
-                 else f"; {len(rejected)} candidate(s) failed the shape check -- see red x markers."))
+    caption = (f"As an independent check, each candidate spike was also required to show a genuine "
+              f"fast upstroke -- a rate of voltage rise of at least {DEFAULT_DVDT_THRESHOLD_MV_PER_MS:.0f} "
+              f"mV/ms within {DEFAULT_MIN_PRE_SPIKE_MS:.0f} ms before the peak (the convention used by "
+              f"Bean, 2007) -- rather than amplitude alone. {len(confirmed)} of "
+              f"{len(confirmed) + len(rejected)} candidate spike(s) were confirmed by this stricter test"
+              + ("; the two methods agree on every spike in this window." if agree
+                 else f"; {len(rejected)} candidate(s) failed the upstroke-shape test -- see the "
+                      "red x markers."))
     return {"confirmed": confirmed, "rejected": rejected}, caption
 
 
@@ -148,17 +150,26 @@ def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
     if len(isis_ms) > 0:
         ax_isi.plot(np.arange(1, len(isis_ms) + 1), isis_ms, marker="o", markersize=3,
                    color="steelblue", lw=1)
-    ax_isi.set_xlabel("ISI index (spike-to-spike)")
-    ax_isi.set_ylabel("ISI (ms)")
-    ax_isi.set_title(f"ISI sequence -> classify_burst_pattern = '{result['pattern']}'", fontsize=9)
+        # Always include zero: auto-scaling tightly around the data (e.g. a
+        # clean tonic train whose intervals span only 12.9-13.0ms) blows a
+        # sub-millisecond wobble up to fill the whole panel height, making
+        # negligible jitter look like a dramatic zigzag -- user-flagged
+        # 2026-08-14, page 12 rows 2-3. A real axis anchored at zero keeps
+        # the panel's visual scale honest about how small that variation
+        # actually is relative to the interval itself.
+        ax_isi.set_ylim(bottom=0)
+    ax_isi.set_xlabel("interval index (spike-to-spike)")
+    ax_isi.set_ylabel("interspike interval (ms)")
+    ax_isi.set_title(f"Interspike intervals -- classified as '{result['pattern']}'", fontsize=9)
 
     diag = result.get("diagnostics")
     if diag is None:
-        ax_kde.text(0.5, 0.5, "KDE bimodality test never ran\n(too few ISIs, or degenerate/failed KDE fit)",
+        ax_kde.text(0.5, 0.5, "Too few spikes to test for two interval populations",
                    ha="center", va="center", fontsize=8, transform=ax_kde.transAxes, color="dimgray")
-        caption = (f"{n_peaks} spike(s), {len(isis_ms)} ISI(s) -- fewer than "
-                  f"min_isis_for_burst_test={min_isis_for_burst_test}, or a degenerate ISI spread, so "
-                  f"the log-ISI KDE bimodality test never ran and the point defaults to '{result['pattern']}'.")
+        caption = (f"This window had {n_peaks} spike(s), giving {len(isis_ms)} interspike interval(s) -- "
+                  f"fewer than the {min_isis_for_burst_test} needed to statistically test whether "
+                  "intervals fall into two separate populations (short, within-burst gaps vs. long, "
+                  f"between-burst gaps), so the window defaults to '{result['pattern']}'.")
     else:
         if log_isi_xlim is not None:
             grid = np.linspace(log_isi_xlim[0], log_isi_xlim[1], 400)
@@ -174,19 +185,20 @@ def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
         cand = diag.get("candidate_mode_idx")
         if cand is not None and len(cand) > 0:
             ax_kde.plot(diag["log_isi_grid"][cand], diag["density"][cand], linestyle="none", marker="^",
-                       color="gray", markersize=6, label="candidate mode")
+                       color="gray", markersize=6, label="candidate interval population")
         if "mode_lo_log_isi" in diag:
             ax_kde.axvline(diag["mode_lo_log_isi"], color="seagreen", ls=":", lw=1.2,
-                           label="within-burst ISI (short)")
+                           label="short (within-burst) intervals")
             ax_kde.axvline(diag["mode_hi_log_isi"], color="darkorange", ls=":", lw=1.2,
-                           label="between-burst ISI (long)")
-            ax_kde.axvline(diag["split_log_isi"], color="firebrick", ls="--", lw=1.5, label="valley split")
+                           label="long (between-burst) intervals")
+            ax_kde.axvline(diag["split_log_isi"], color="firebrick", ls="--", lw=1.5,
+                           label="dividing line between the two")
         if log_isi_xlim is not None:
             ax_kde.set_xlim(log_isi_xlim)
-        ax_kde.set_xlabel("log10(ISI / ms)")
-        ax_kde.set_ylabel("KDE density")
+        ax_kde.set_xlabel("interspike interval (log scale, ms)")
+        ax_kde.set_ylabel("relative frequency")
         ax_kde.legend(loc="best", fontsize=6)
-        ax_kde.set_title("log-ISI bimodality test", fontsize=9)
+        ax_kde.set_title("Do intervals form one population or two?", fontsize=9)
         # Ashman's D isn't a position on this axis (it's a scalar summarizing
         # how separated the two mode clusters are), so it can't be drawn as
         # a line the way the modes/valley are -- shown as an on-plot
@@ -199,25 +211,32 @@ def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
             # The area below the valley dip is reliably open regardless of
             # where the two modes themselves happen to sit.
             d, passed = diag["ashman_d"], diag["ashman_d"] >= min_ashman_d
-            ax_kde.annotate(f"Ashman's D = {d:.2f} (need >= {min_ashman_d} to call 'bursting')",
+            ax_kde.annotate(f"separation score = {d:.2f} (>= {min_ashman_d} counts as two separate "
+                            "populations)",
                             xy=(0.5, 0.04), xycoords="axes fraction", ha="center", va="bottom", fontsize=7,
                             color="darkgreen" if passed else "firebrick",
                             bbox=dict(boxstyle="round", fc="white", ec="darkgreen" if passed else "firebrick",
                                      alpha=0.9))
 
-        pieces = [f"{n_peaks} spikes, {len(isis_ms)} ISIs."]
+        pieces = [f"This window contained {n_peaks} spikes, giving {len(isis_ms)} interspike intervals."]
         if "isi_short_ms" in diag:
             ratio = diag["isi_long_ms"] / diag["isi_short_ms"]
-            pieces.append(f"Split at {len(cand)} candidate mode(s) -> short ISI="
-                         f"{diag['isi_short_ms']:.1f} ms, long ISI={diag['isi_long_ms']:.1f} ms "
-                         f"(ratio {ratio:.2f}x, needs >= {min_isi_ratio}x).")
+            pieces.append(f"Splitting the intervals at their {len(cand)} candidate population(s) gives a "
+                         f"short (within-burst) interval of {diag['isi_short_ms']:.1f} ms and a long "
+                         f"(between-burst) interval of {diag['isi_long_ms']:.1f} ms -- a "
+                         f"{ratio:.2f}-fold difference, above the {min_isi_ratio}-fold difference "
+                         "required to treat them as distinct.")
         if "avg_spikes_per_burst" in diag:
-            pieces.append(f"Avg spikes/burst = {diag['avg_spikes_per_burst']:.2f} "
-                         f"(needs >= {min_spikes_per_burst}).")
+            pieces.append(f"On average, {diag['avg_spikes_per_burst']:.2f} spikes fall within each burst "
+                         f"(a real burst requires at least {min_spikes_per_burst}, ruling out what would "
+                         "otherwise just be occasional missed spikes in an otherwise tonic train).")
         if "ashman_d" in diag:
-            pieces.append(f"Ashman's D = {diag['ashman_d']:.2f} (needs >= {min_ashman_d}).")
-        pieces.append(f"Final call: '{result['pattern']}'"
-                     + (f" (bimodality metric / Ashman's D = {result['bimodality_metric']:.2f})"
+            pieces.append(f"A statistical separation score (Ashman's D) of {diag['ashman_d']:.2f} "
+                         f"quantifies how cleanly the short and long intervals separate into two "
+                         f"distinct populations, rather than overlapping as one broad distribution "
+                         f"(a score of {min_ashman_d} or higher is required to call them separate).")
+        pieces.append(f"Taken together, this window is classified as '{result['pattern']}'"
+                     + (f", with a separation score of {result['bimodality_metric']:.2f}"
                         if result.get("bimodality_metric") else "") + ".")
         caption = " ".join(pieces)
 
@@ -235,19 +254,22 @@ def mark_sag_trough(ax, t_test: np.ndarray, v_test: np.ndarray, hold_v_end_mV: f
     trough_mV, first_spike_ms = compute_pre_spike_sag_trough(v_test, t_test, sag_window_ms)
     window_end_ms = min(sag_window_ms, first_spike_ms) if first_spike_ms is not None else sag_window_ms
 
-    ax.axhline(hold_v_end_mV, color="gray", ls=":", lw=1.2, label=f"pre-test baseline ({hold_v_end_mV:.1f} mV)")
+    ax.axhline(hold_v_end_mV, color="gray", ls=":", lw=1.2, label=f"pre-step baseline ({hold_v_end_mV:.1f} mV)")
     ax.axvspan(t_test[0], t_test[0] + window_end_ms, color="steelblue", alpha=0.12,
-              label="sag search window")
+              label="window searched for the trough")
     trough_idx = int(np.argmin(np.abs(v_test - trough_mV)))
     ax.plot(t_test[trough_idx], trough_mV, marker="v", color="firebrick", markersize=8, zorder=5,
-           label=f"trough ({trough_mV:.1f} mV)")
+           label=f"most hyperpolarized point ({trough_mV:.1f} mV)")
 
     sag_depth = hold_v_end_mV - trough_mV
-    reason = (f"truncated early by the first spike at {first_spike_ms:.0f} ms" if first_spike_ms is not None
-             and first_spike_ms < sag_window_ms else f"the full {sag_window_ms:.0f} ms window (no spike before it)")
-    caption = (f"Sag depth = baseline - trough = {hold_v_end_mV:.1f} - ({trough_mV:.1f}) = "
-              f"{sag_depth:.1f} mV. Baseline is the held-current settle's final voltage; trough is "
-              f"the minimum voltage over {reason}.")
+    reason = (f"stopping early at the first spike, {first_spike_ms:.0f} ms in" if first_spike_ms is not None
+             and first_spike_ms < sag_window_ms else f"the full {sag_window_ms:.0f} ms window (no spike "
+             "occurred before it ended)")
+    caption = (f"Sag depth is the difference between the voltage just before the current step "
+              f"({hold_v_end_mV:.1f} mV) and the most hyperpolarized point reached afterward "
+              f"({trough_mV:.1f} mV), giving {sag_depth:.1f} mV of sag -- a hallmark of the "
+              f"hyperpolarization-activated current (Ih) partially repolarizing the cell during the "
+              f"step. The trough was found by searching {reason}.")
     return {"trough_mV": trough_mV, "first_spike_ms": first_spike_ms, "sag_depth_mV": sag_depth}, caption
 
 
@@ -258,19 +280,22 @@ def mark_adaptation_window(ax_isi, isis_ms: np.ndarray, edge_n: int) -> tuple:
     """
     n = len(isis_ms)
     if n < 2 * edge_n:
-        caption = (f"Adaptation ratio not computed: only {n} ISI(s), fewer than 2 x "
-                  f"adaptation_edge_n={edge_n} needed for non-overlapping first/last windows.")
+        caption = (f"Spike-frequency adaptation was not assessed: this window contained only {n} "
+                  f"interspike interval(s), fewer than the {2 * edge_n} needed to compare non-overlapping "
+                  "groups of intervals at the start and end of firing.")
         return None, caption
 
     idx = np.arange(1, n + 1)
-    ax_isi.axvspan(idx[0] - 0.5, idx[edge_n - 1] + 0.5, color="seagreen", alpha=0.15, label="first N ISIs")
-    ax_isi.axvspan(idx[-edge_n] - 0.5, idx[-1] + 0.5, color="darkorange", alpha=0.15, label="last N ISIs")
+    ax_isi.axvspan(idx[0] - 0.5, idx[edge_n - 1] + 0.5, color="seagreen", alpha=0.15, label="first intervals")
+    ax_isi.axvspan(idx[-edge_n] - 0.5, idx[-1] + 0.5, color="darkorange", alpha=0.15, label="last intervals")
     ax_isi.legend(loc="best", fontsize=6)
 
     ratio = compute_adaptation_ratio(isis_ms, edge_n)
-    direction = "slows (adapts)" if ratio > 1.02 else ("speeds up (facilitates)" if ratio < 0.98 else "stays flat")
-    caption = (f"Adaptation ratio = mean(last {edge_n} ISIs) / mean(first {edge_n} ISIs) = {ratio:.2f}. "
-              f"Firing {direction} over the course of this test window.")
+    direction = ("slows over the course of firing (spike-frequency adaptation)" if ratio > 1.02
+                else ("speeds up over the course of firing (facilitation)" if ratio < 0.98
+                      else "stays roughly constant"))
+    caption = (f"The adaptation ratio -- the mean of the last {edge_n} interspike intervals divided by "
+              f"the mean of the first {edge_n} -- is {ratio:.2f}. Firing {direction} over this window.")
     return ratio, caption
 
 
@@ -286,9 +311,11 @@ def mark_rebound_window(ax, t_rec: np.ndarray, v_rec: np.ndarray, rebound_latenc
     from scipy.signal import find_peaks
     v_range = v_rec.max() - v_rec.min()
     ax.axvline(t_rec[0] + rebound_latency_min_ms, color="gray", ls="--", lw=1,
-              label=f"rebound latency cutoff ({rebound_latency_min_ms:.0f} ms)")
+              label=f"minimum latency to count as rebound ({rebound_latency_min_ms:.0f} ms)")
     if v_range < FLATLINE_MV:
-        caption = f"No peaks in recovery window (range {v_range:.2f} mV, below FLATLINE_MV={FLATLINE_MV})."
+        caption = (f"No spikes occurred during the recovery window (voltage range "
+                  f"{v_range:.2f} mV, below the {FLATLINE_MV} mV threshold for silence): this cell "
+                  "showed no post-inhibitory rebound.")
         return {"rebound_occurred": False, "rebound_spike_count": 0}, caption
 
     peaks, _ = find_peaks(v_rec, prominence=_spike_prominence(v_range, PROMINENCE_FRACTION))
@@ -298,15 +325,17 @@ def mark_rebound_window(ax, t_rec: np.ndarray, v_rec: np.ndarray, rebound_latenc
 
     if len(non_qualifying) > 0:
         ax.plot(t_rec[non_qualifying], v_rec[non_qualifying] + 0.05 * v_range, linestyle="none",
-               marker="x", color="gray", markersize=7, label="in-flight (excluded)")
+               marker="x", color="gray", markersize=7, label="already firing at release (excluded)")
     if len(qualifying) > 0:
         ax.plot(t_rec[qualifying], v_rec[qualifying] + 0.05 * v_range, linestyle="none",
                marker="v", color="mediumpurple", markersize=7, label="rebound spike")
 
     occurred = len(qualifying) > 0
-    caption = (f"{len(qualifying)} spike(s) at or after the {rebound_latency_min_ms:.0f} ms cutoff count "
-              f"as rebound" + (f" (plus {len(non_qualifying)} excluded as already in flight at release)"
-                               if len(non_qualifying) else "") + f". rebound_occurred={occurred}.")
+    caption = (f"{len(qualifying)} spike(s) occurred at or after {rebound_latency_min_ms:.0f} ms "
+              "post-release and so count as post-inhibitory rebound"
+              + (f" ({len(non_qualifying)} additional spike(s) were already underway at the moment of "
+                 "release and are excluded)" if len(non_qualifying) else "")
+              + f". This cell {'did' if occurred else 'did not'} show a rebound response.")
     return {"rebound_occurred": occurred, "rebound_spike_count": int(len(qualifying))}, caption
 
 
@@ -348,18 +377,22 @@ def mark_onset_and_trailing_silence(ax_v, ax_isi, t_ms: np.ndarray, v_mV: np.nda
         last_spike_ms = float(t_ms[peaks[-1]])
         trailing_silence_ms = window_ms - last_spike_ms
         ax_v.axvspan(last_spike_ms, window_ms, color="gray", alpha=0.15,
-                    label=f"trailing silence ({trailing_silence_ms:.0f} ms)")
+                    label=f"silence after the last spike ({trailing_silence_ms:.0f} ms)")
         if len(isis_ms) > 0:
             ceased = bool(trailing_silence_ms >= trailing_silence_ratio * isis_ms[-1])
 
     if len(isis_ms) > 0:
         ax_isi.plot(np.arange(1, len(isis_ms) + 1), isis_ms, marker="o", markersize=4, color="steelblue")
+        # See mark_isi_classification's identical fix: anchoring at zero
+        # keeps the panel from blowing a sub-millisecond wobble up into an
+        # apparently dramatic zigzag.
+        ax_isi.set_ylim(bottom=0)
         if onset_n and onset_n - 1 >= 1:
             ax_isi.axvspan(0.5, (onset_n - 1) + 0.5, color="firebrick", alpha=0.15,
-                          label=f"onset burst ISIs (n={onset_n - 1})")
+                          label=f"onset burst (n={onset_n - 1})")
             ax_isi.legend(loc="best", fontsize=6)
-    ax_isi.set_xlabel("ISI index (spike-to-spike)")
-    ax_isi.set_ylabel("ISI (ms)")
+    ax_isi.set_xlabel("interval index (spike-to-spike)")
+    ax_isi.set_ylabel("interspike interval (ms)")
 
     evidence = {"onset_n_spikes": onset_n, "onset_isi_mean_ms": onset_isi_mean,
                "trailing_silence_ms": trailing_silence_ms, "likely_ceased_firing": ceased,
@@ -367,22 +400,24 @@ def mark_onset_and_trailing_silence(ax_v, ax_isi, t_ms: np.ndarray, v_mV: np.nda
 
     pieces = []
     if onset_n:
-        pieces.append(f"Onset burst detected: {onset_n} spikes (mean ISI {onset_isi_mean:.1f} ms) at "
-                      "window start, found by scanning locally for the first ISI jump -- independent of "
-                      "whatever whole-window tonic/bursting/silent label the KDE bimodality test assigns.")
+        pieces.append(f"A leading onset burst of {onset_n} spikes (mean interval {onset_isi_mean:.1f} ms) "
+                      "occurred at the start of the window. This local test is independent of whichever "
+                      "tonic/bursting/silent label the whole-window statistical test assigns, so it can "
+                      "detect a real leading burst even when the window as a whole reads as tonic.")
     else:
-        pieces.append("No burst-shaped leading run detected at window start (either no jump found, or the "
-                      "leading run was shorter than min_onset_isis).")
+        pieces.append("No burst-shaped leading run of spikes occurred at the start of this window.")
     if trailing_silence_ms is not None:
-        pieces.append(f"Trailing silence after the last spike: {trailing_silence_ms:.0f} ms of a "
-                      f"{window_ms:.0f} ms window.")
+        pieces.append(f"Firing was followed by {trailing_silence_ms:.0f} ms of silence before the end of "
+                      f"this {window_ms:.0f} ms window.")
         if ceased is not None:
             pieces.append(
-                (f"likely_ceased_firing=True -- {trailing_silence_ms:.0f} ms is >= "
-                 f"{trailing_silence_ratio:.0f}x the most recent ISI, so test_adaptation_ratio is "
-                 "suppressed (reported as None): a first-k/last-k ratio isn't a meaningful 'smooth "
-                 "adaptation' number for a train that stopped partway through the window.") if ceased else
-                ("likely_ceased_firing=False -- firing continued close enough to window end that "
-                 "test_adaptation_ratio is still computed normally from this same ISI sequence."))
+                (f"This silence is at least {trailing_silence_ratio:.0f} times the most recent interspike "
+                 "interval, indicating firing had genuinely ended rather than merely being cut off by the "
+                 "window boundary; an adaptation ratio is not reported for this window, since comparing "
+                 "early and late intervals is not meaningful once firing has stopped partway through.")
+                if ceased else
+                ("Firing continued close enough to the end of the window that it was not cut off "
+                 "partway through, so an adaptation ratio is still computed normally from this interval "
+                 "sequence."))
     caption = " ".join(pieces)
     return evidence, caption

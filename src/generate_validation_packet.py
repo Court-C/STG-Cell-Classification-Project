@@ -1,7 +1,8 @@
-"""Consolidated PI defense packet: one PDF (plus standalone per-section PNGs
+"""Consolidated validation packet: one PDF (plus standalone per-section PNGs
 for attaching individually) that walks through every grid-feature panel's
-underlying detection/classification evidence on real traces, so the packet
-stands on its own without narration.
+underlying detection/classification evidence on real traces, so the reader
+can check that the feature-extraction pipeline is doing the right thing
+without taking any classification on faith.
 
 Every page/section reuses the actual production functions from
 find_silencing_threshold.py / run_held_injected_grid.py / extract_grid_features.py
@@ -27,7 +28,8 @@ ROOT_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from steady_state_cache import get_cached_state, CACHE_PATH as DEFAULT_STEADY_STATE_CACHE_PATH
-from plot_example_traces import resimulate_point, select_exemplar_points, build_example_trace_figure
+from plot_example_traces import (resimulate_point, select_exemplar_points, build_example_trace_figure,
+                                 describe_pattern as _describe_pattern)
 from find_silencing_threshold import (compute_isis_ms, classify_burst_pattern, count_spikes_and_rate,
                                       PROMINENCE_FRACTION, detect_spikes_dvdt_confirmed, FLATLINE_MV,
                                       MIN_SPIKE_AMPLITUDE_MV)
@@ -38,11 +40,13 @@ from trace_annotations import (mark_spikes, mark_confirmed_vs_rejected, mark_isi
                                mark_sag_trough, mark_adaptation_window, mark_rebound_window,
                                mark_onset_and_trailing_silence)
 
-DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "defense_packet"
+DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "validation_packet"
 
 
 def _wrap(text: str, width: int = 100) -> str:
     return textwrap.fill(text, width=width)
+
+
 
 
 def _place_caption_below(fig, ax, caption: str, width: int = 60, fontsize: float = 7, gap: float = 0.10) -> None:
@@ -68,9 +72,9 @@ def _save_page(fig, pdf: PdfPages, png_dir: Path, name: str, command: str, sourc
     every other figure-generating script in this repo (run_held_injected_
     grid.py, extract_grid_features.py, consolidate_features.py, cluster_
     features.py, plot_example_traces.py all embed the exact command that
-    produced the figure) -- generate_defense_packet.py was the one script
+    produced the figure) -- generate_validation_packet.py was the one script
     in the pipeline that didn't, which matters more here than anywhere
-    else: a PI defense packet whose own figures can't be traced back to
+    else: a validation packet whose own figures can't be traced back to
     the command and cache that produced them undercuts its own point.
     Bottom-left, not the bottom-center every caption already occupies, so
     the two never collide regardless of a given page's own layout.
@@ -98,36 +102,42 @@ def _resim(cell_id, params, y_ss, baseline_freq_hz, cell_result, held_nA, inject
 
 def make_cover_page(cell_id: str, cell_result: dict, features: dict, sections: list) -> plt.Figure:
     fig = plt.figure(figsize=(11, 8.5))
-    fig.text(0.5, 0.93, f"Grid Features Defense Packet -- {cell_id}", fontsize=18, ha="center", weight="bold")
+    fig.text(0.5, 0.93, f"Grid Features Validation Packet -- {cell_id}", fontsize=18, ha="center", weight="bold")
 
     intro = _wrap(
-        "Every trace in this packet is SIMULATED output from a fitted conductance-based single-"
-        "compartment cell model (src/singlecell_model_v1.py), integrated deterministically at a fixed "
-        "timestep -- not a raw current-clamp recording. What's being defended here is the feature-"
-        "extraction methodology applied on top of that model (spike detection, burst/tonic "
-        "classification, rebound detection, sag depth, adaptation ratio) -- i.e. do these algorithms "
-        "correctly characterize the dynamics the model actually produces. Every panel below reruns the "
-        "exact production function on a real simulated trace and marks what it found, so the "
-        "classification isn't just a text label to take on faith.", width=95)
+        "Every trace in this packet is simulated output from a fitted, multi-conductance "
+        "single-compartment model of this cell, integrated deterministically -- not a raw "
+        "current-clamp recording. What is being evaluated here is the feature-extraction "
+        "methodology applied on top of that model: spike detection, burst/tonic classification, "
+        "post-inhibitory rebound detection, sag depth, and spike-frequency adaptation. Each figure "
+        "below reruns the actual classification algorithm on a real simulated trace and marks what "
+        "it found directly on the trace, so each classification can be checked by eye rather than "
+        "taken on faith.", width=95)
     fig.text(0.08, 0.87, intro, fontsize=10, va="top", wrap=True)
 
-    summary = (f"cell_floor = {cell_result['cell_floor_nA']:.2f} nA   |   "
-              f"n grid points = {cell_result['n_points_total']}   |   "
-              f"burstiness index = {features.get('burstiness_index'):.3f}   |   "
-              f"F-I slope = {features.get('fi_slope_hz_per_nA'):.2f} Hz/nA "
-              f"(R^2={features.get('fi_slope_r2'):.3f})")
-    fig.text(0.08, 0.60, summary, fontsize=9, va="top", family="monospace")
+    summary_line1 = (f"Silencing threshold: {cell_result['cell_floor_nA']:.2f} nA   |   "
+                     f"{cell_result['n_points_total']} points sampled across the current grid")
+    summary_line2 = f"Burstiness index: {features.get('burstiness_index'):.3f}"
+    summary_line3 = (f"Firing-rate/current slope: {features.get('fi_slope_hz_per_nA'):.2f} Hz/nA "
+                     f"(R^2={features.get('fi_slope_r2'):.3f})")
+    fig.text(0.08, 0.60, summary_line1, fontsize=9, va="top", family="monospace")
+    fig.text(0.08, 0.575, summary_line2, fontsize=9, va="top", family="monospace")
+    fig.text(0.08, 0.55, summary_line3, fontsize=9, va="top", family="monospace")
 
-    fig.text(0.08, 0.53, "Contents:", fontsize=11, va="top", weight="bold")
-    y = 0.49
-    # 0.41, not the full 0.47 down to y=0.02: reserves room above the
+    fig.text(0.08, 0.50, "Contents:", fontsize=11, va="top", weight="bold")
+    y = 0.46
+    # 0.41, not the full 0.44 down to y=0.02: reserves room above the
     # provenance footer _save_page stamps at y=0.005 on every page
     # (including this one) -- confirmed directly that the previous 0.47
     # span let an 11-section list's last entry visually collide with it.
+    # Each entry budgets for a title line plus up to 2 description lines
+    # (0.014 each) -- descriptions are kept short enough to usually need
+    # only 1, but the budget must cover the worst case or a long
+    # description collides with the next entry's title.
     step = 0.41 / len(sections)
     for i, (title, desc) in enumerate(sections, start=1):
         fig.text(0.10, y, f"{i}. {title}", fontsize=9.5, va="top", weight="bold")
-        fig.text(0.14, y - 0.018, _wrap(desc, width=95), fontsize=7.5, va="top", color="dimgray")
+        fig.text(0.14, y - 0.016, _wrap(desc, width=105), fontsize=7, va="top", color="dimgray")
         y -= step
 
     return fig
@@ -203,8 +213,10 @@ def make_representative_traces_page(cell_id, cell_result, resim) -> plt.Figure:
     for ax, (combo, held_nA, injected_nA, trace_data) in zip(axes_flat, panels):
         test_pattern, rebound_pattern = combo
         if trace_data is None:
-            ax.text(0.5, 0.5, "resim failed", ha="center", va="center", transform=ax.transAxes, fontsize=8)
-            ax.set_title(f"{test_pattern} / {rebound_pattern}", fontsize=7.5)
+            ax.text(0.5, 0.5, "simulation failed", ha="center", va="center", transform=ax.transAxes,
+                   fontsize=8)
+            ax.set_title(f"{_describe_pattern(test_pattern)}, {_describe_pattern(rebound_pattern)}",
+                        fontsize=7.5)
             continue
         t_hold, v_hold, t_test_off, v_test, t_rec_off, v_rec, hold_end, test_end = trace_data
 
@@ -215,24 +227,24 @@ def make_representative_traces_page(cell_id, cell_result, resim) -> plt.Figure:
         ax.axvline(test_end, color="black", ls=":", lw=0.6)
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
-        ax.set_title(f"{test_pattern} / {rebound_pattern}\nheld={held_nA:.2f} inj={injected_nA:.2f}",
-                    fontsize=7.5)
+        ax.set_title(f"{_describe_pattern(test_pattern)}, then {_describe_pattern(rebound_pattern)}\n"
+                    f"held={held_nA:.2f} nA, injected={injected_nA:.2f} nA", fontsize=7.5)
         ax.tick_params(labelsize=6)
 
     for ax in axes_flat[n:]:
         ax.axis("off")
 
     caption = _wrap(
-       "One representative trace per distinct (test-window pattern, rebound pattern) combination "
-       f"actually present across this cell's full {cell_result['n_points_total']}-point held x injected "
-       "grid: gray = held baseline, red = test window (injected current), blue = recovery window "
-       "(released back to held). Chosen by the same selection plot_example_traces.py uses for its own "
-       "per-combination figures (most-prominent point, see that script's _prominence_score) -- this is "
-       "what the cell actually does at each combination, not a hand-picked illustration. Every panel "
-       f"shares the same V ({ylim[0]:.0f} to {ylim[1]:.0f} mV) and time (0-{xlim[1]:.0f} ms) axes, computed "
-       "from the actual data, so amplitude and duration are directly comparable across panels by eye -- "
-       "not independently auto-scaled, which would make a subthreshold wobble look as prominent as a real "
-       "spike train.", width=175)
+       "One representative trace for each distinct combination of response-to-current-step pattern "
+       f"and rebound pattern actually observed across this cell's full {cell_result['n_points_total']}-"
+       "point grid of held and injected current levels: gray is the held baseline before the current "
+       "step, red is the response during the current step, and blue is the recovery period after "
+       "release back to the held level. Each combination is represented by its most clearly-expressed "
+       "example among the grid points that produced it, not a hand-picked illustration. Every panel "
+       f"shares the same voltage ({ylim[0]:.0f} to {ylim[1]:.0f} mV) and time (0-{xlim[1]:.0f} ms) axes "
+       "so amplitude and duration are directly comparable by eye -- without this, a small subthreshold "
+       "wobble and a full-amplitude spike train would each be independently rescaled to fill the same "
+       "panel and look equally prominent.", width=175)
     fig.text(0.5, 0.005, caption, ha="center", va="bottom", fontsize=7.5)
     fig.suptitle("1. Representative traces", fontsize=13, weight="bold")
     # rect bottom raised to 0.11 (was 0.05): the added axis-standardization
@@ -313,25 +325,25 @@ def make_prominence_sensitivity_page(cell_id, held_inj_pairs, resim) -> plt.Figu
             # curve instead of what the pipeline actually computes now.
             peaks, _ = find_peaks(v, prominence=max(v_range * frac, MIN_SPIKE_AMPLITUDE_MV))
             counts.append(len(peaks))
-        ax.plot(fractions, counts, marker="o", markersize=4, label=f"{tag} (held={held_nA:.2f})")
+        ax.plot(fractions, counts, marker="o", markersize=4, label=f"{tag} (held={held_nA:.2f} nA)")
     ax.axvline(PROMINENCE_FRACTION, color="gray", ls="--", lw=1.2,
-              label=f"production value ({PROMINENCE_FRACTION})")
-    ax.set_xlabel("PROMINENCE_FRACTION")
+              label=f"threshold used throughout this report ({PROMINENCE_FRACTION:.0%})")
+    ax.set_xlabel("peak-detection threshold (fraction of each trace's own voltage range)")
     ax.set_ylabel("detected spike count")
     ax.legend(loc="best", fontsize=8)
-    ax.set_title(f"{cell_id} -- spike count vs. prominence threshold", fontsize=10)
+    ax.set_title(f"{cell_id} -- spike count vs. peak-detection threshold", fontsize=10)
     caption = _wrap(
-       "PROMINENCE_FRACTION=0.3 is the single most load-bearing, least-independently-calibrated "
-       "constant in the pipeline -- every spike count, ISI, and burst/tonic call across the codebase "
-       f"traces back to one find_peaks(..., prominence=max(range*0.3, {MIN_SPIKE_AMPLITUDE_MV:.0f}mV)) "
-       "call (the absolute floor added 2026-08-13, see section 1's representative traces for why). This "
-       "sweeps the fraction from 0.10 to 0.55 on real, large-amplitude spiking traces (the floor rarely "
-       "binds here, since these traces' own range x0.3 already exceeds it) -- a flat plateau around the "
-       "production value means the spike count this pipeline reports is not sensitive to the exact "
-       "fraction chosen, not an arbitrary cliff-edge pick.", width=105)
+       "Every spike count, interspike interval, and burst/tonic classification in this report depends "
+       f"on one detection threshold: a candidate peak must rise at least {PROMINENCE_FRACTION:.0%} of "
+       f"the trace's own voltage range above its surroundings (or {MIN_SPIKE_AMPLITUDE_MV:.0f} mV, "
+       "whichever is larger, so a tiny subthreshold wobble in a low-amplitude trace cannot be counted "
+       "as a spike). This sweeps that threshold from 10% to 55% on real, large-amplitude spiking traces: "
+       "a flat plateau around the value used throughout this report shows the reported spike counts are "
+       "not sensitive to the exact threshold chosen, rather than sitting on an arbitrary cliff edge.",
+       width=105)
     fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
-    fig.tight_layout(rect=(0, 0.14, 1, 1))
-    fig.suptitle("3. Prominence-threshold sensitivity", fontsize=13, weight="bold", y=1.0)
+    fig.tight_layout(rect=(0, 0.14, 1, 0.90))
+    fig.suptitle("3. Spike-detection threshold sensitivity", fontsize=13, weight="bold", y=0.99)
     return fig
 
 
@@ -378,13 +390,14 @@ def make_dvdt_crossvalidation_page(cell_id, grid, resim, dt_ms, n_sample=20, see
     ax_bar.set_ylabel("spike count (summed across sample)")
 
     caption = _wrap(
-       f"Cross-check across a random sample of {len(per_point)} XB2IQX grid points: every candidate "
-       "prominence-based peak is additionally required to pass a dV/dt shape-confirmation gate "
-       "(detect_spikes_dvdt_confirmed -- present in the codebase but not called by the production "
-       "pipeline). Agreement close to 100% means the simpler production detector isn't missing a shape "
-       "check that changes the answer.", width=115)
+       f"As an independent check on a random sample of {len(per_point)} grid points from this cell, "
+       "every spike detected by amplitude alone was additionally required to show a genuine fast "
+       "upstroke in voltage (rather than amplitude alone) before being counted, an independent "
+       "detection criterion not used for classification elsewhere in this report. Agreement close to "
+       "100% shows that the simpler amplitude-based detector used throughout is not missing any spikes "
+       "that a shape-based check would catch.", width=115)
     fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
-    fig.suptitle("4. dV/dt cross-validation (unused-in-production detector as a sanity check)",
+    fig.suptitle("4. Independent cross-check of spike detection by upstroke shape",
                fontsize=12, weight="bold")
     fig.tight_layout(rect=(0, 0.12, 1, 0.93))
     return fig
@@ -430,7 +443,7 @@ def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.F
     shouldn't have to flip back to section 1 to see what trace a given
     classification call is even about.
     """
-    fig, axes = plt.subplots(len(exemplars), 3, figsize=(18, 5.8 * len(exemplars)))
+    fig, axes = plt.subplots(len(exemplars), 3, figsize=(18, 7.4 * len(exemplars)))
     if len(exemplars) == 1:
         axes = axes[np.newaxis, :]
     traces = [resim(held_nA, injected_nA) for held_nA, injected_nA, _ in exemplars]
@@ -450,14 +463,14 @@ def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.F
             ax_isi, ax_kde, t, v, run_args["min_isis_for_burst_test"],
             run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
             min_ashman_d=run_args.get("min_ashman_d", 2.0), log_isi_xlim=shared_xlim)
-        ax_v.set_title(f"{tag}: held={held_nA:.2f} inj={injected_nA:.2f} -> '{result['pattern']}'",
-                      fontsize=9)
+        ax_v.set_title(f"{tag} (held={held_nA:.2f} nA, injected={injected_nA:.2f} nA): "
+                      f"classified as {_describe_pattern(result['pattern'])}", fontsize=8, wrap=True)
         captions.append((ax_isi, caption))
     fig.suptitle("5. Tonic / bursting / silent classification", fontsize=13, weight="bold")
-    fig.tight_layout(rect=(0, 0.02, 1, 0.95))
-    fig.subplots_adjust(hspace=0.9)
+    fig.tight_layout(rect=(0, 0.02, 1, 0.96))
+    fig.subplots_adjust(hspace=1.5)
     for ax_isi, caption in captions:
-        _place_caption_below(fig, ax_isi, caption, width=58)
+        _place_caption_below(fig, ax_isi, caption, width=62, fontsize=6.5, gap=0.06)
     return fig
 
 
@@ -509,7 +522,7 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
     demonstrated even though it has been inert on real data so far.
     """
     n_rows = len(real_exemplars) + 1
-    fig, axes = plt.subplots(n_rows, 3, figsize=(16, 4.6 * n_rows))
+    fig, axes = plt.subplots(n_rows, 3, figsize=(16, 6.8 * n_rows))
     if n_rows == 1:
         axes = axes[np.newaxis, :]
 
@@ -535,12 +548,13 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
             ax_isi, ax_kde, t, v, run_args["min_isis_for_burst_test"],
             run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
             min_ashman_d=run_args.get("min_ashman_d", 2.0), log_isi_xlim=shared_xlim)
-        ax_isi.set_title(f"ISI sequence -> '{result['pattern']}'", fontsize=9)
-        captions.append((ax_isi, f"[REAL, resimulated] {caption}"))
+        ax_isi.set_title(f"Interspike intervals -- classified as {_describe_pattern(result['pattern'])}",
+                        fontsize=9)
+        captions.append((ax_isi, f"Simulated {cell_id} trace. {caption}"))
 
     ax_v, ax_isi, ax_kde = axes[-1]
     ax_v.axis("off")
-    ax_v.text(0.5, 0.5, "CONSTRUCTED example\n(no simulated voltage trace --\nhand-built ISI sequence)",
+    ax_v.text(0.5, 0.5, "Constructed example\n(a hand-built interval sequence,\nnot a simulated trace)",
              ha="center", va="center", fontsize=9, style="italic", color="dimgray",
              transform=ax_v.transAxes, wrap=True)
     result, caption = mark_isi_classification(
@@ -548,9 +562,13 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
         run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
         min_ashman_d=run_args.get("min_ashman_d", 2.0), isis_override=synthetic_isis,
         n_peaks_override=synthetic_n_peaks, log_isi_xlim=shared_xlim)
-    ax_isi.set_title(f"ISI sequence -> '{result['pattern']}'", fontsize=9)
-    captions.append((ax_isi, f"[CONSTRUCTED, not an observed {cell_id} point -- same generator as "
-                    f"tests/test_burst_detection.py's Ashman's D boundary test] {caption}"))
+    ax_isi.set_title(f"Interspike intervals -- classified as {_describe_pattern(result['pattern'])}",
+                    fontsize=9)
+    captions.append((ax_isi, f"This example is constructed, not an observed point from {cell_id}: it "
+                    "illustrates a case where the short and long interval populations pass the simpler "
+                    "gates but remain too statistically overlapping to count as genuinely separate, a "
+                    "case this cell's own data has not been observed to produce. "
+                    f"{caption}"))
 
     fig.suptitle("12. Bimodality test: within-burst vs. between-burst ISIs", fontsize=13, weight="bold")
     # Both hspace and _place_caption_below's gap are figure-fraction
@@ -558,10 +576,10 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
     # make_burst_classification_page) eats a much bigger slice of a single
     # row's vertical budget here with 4 rows, which is what caused captions
     # to collide with the NEXT row's title before this was tuned down.
-    fig.tight_layout(rect=(0, 0.07, 1, 0.96))
-    fig.subplots_adjust(hspace=1.5)
+    fig.tight_layout(rect=(0, 0.11, 1, 0.96))
+    fig.subplots_adjust(hspace=1.9)
     for ax_isi, caption in captions:
-        _place_caption_below(fig, ax_isi, caption, width=95, gap=0.045)
+        _place_caption_below(fig, ax_isi, caption, width=95, fontsize=6.5, gap=0.032)
     return fig
 
 
@@ -583,7 +601,7 @@ def make_rebound_page(cell_id, exemplars, resim, rebound_latency_min_ms) -> plt.
         ax.legend(loc="upper right", fontsize=7)
         ax.set_xlabel("time since release (ms)")
         captions.append((ax, caption))
-    fig.suptitle("6. Rebound (post-inhibitory) detection", fontsize=13, weight="bold")
+    fig.suptitle("6. Post-inhibitory rebound detection", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.02, 1, 0.94))
     fig.subplots_adjust(hspace=0.9)
     for ax, caption in captions:
@@ -641,11 +659,15 @@ def make_adaptation_page(cell_id, exemplars, resim, adaptation_edge_n) -> plt.Fi
         ax_v.legend(loc="upper right", fontsize=6)
         isis_ms, _ = compute_isis_ms(v, t, PROMINENCE_FRACTION)
         ax_isi.plot(np.arange(1, len(isis_ms) + 1), isis_ms, marker="o", markersize=3, color="steelblue")
+        # Anchor at zero so a tightly-clustered interval sequence doesn't get
+        # auto-scaled into a visually exaggerated zigzag (see trace_
+        # annotations.mark_isi_classification's identical fix).
+        ax_isi.set_ylim(bottom=0)
         ratio, caption = mark_adaptation_window(ax_isi, isis_ms, adaptation_edge_n)
-        ax_isi.set_xlabel("ISI index")
-        ax_isi.set_ylabel("ISI (ms)")
+        ax_isi.set_xlabel("interval index (spike-to-spike)")
+        ax_isi.set_ylabel("interspike interval (ms)")
         captions.append((ax_isi, caption))
-    fig.suptitle("8. Adaptation ratio", fontsize=13, weight="bold")
+    fig.suptitle("8. Spike-frequency adaptation", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.14, 1, 0.93))
     fig.subplots_adjust(hspace=0.6)
     for ax_isi, caption in captions:
@@ -674,19 +696,19 @@ def make_fi_slope_page(cell_id, grid, features) -> plt.Figure:
         intercept = np.mean(y) - slope * np.mean(x)
         ax.plot(x_fit, slope * x_fit + intercept, color="darkorange", lw=1.5,
                label=f"linear fit: {slope:.2f} Hz/nA (R^2={r2:.3f})")
-    ax.set_xlabel("injected (nA)")
+    ax.set_xlabel("injected current (nA)")
     ax.set_ylabel("firing rate (Hz)")
     ax.invert_xaxis()
     ax.legend(loc="best", fontsize=8)
-    ax.set_title(f"{cell_id} -- F-I relationship along held=0", fontsize=10)
+    ax.set_title(f"{cell_id} -- firing rate vs. injected current, no holding current", fontsize=10)
     caption = _wrap(
-       f"{len(points)} non-silent, confidently-classified points along the held=0 column "
-       "(compute_fi_slope's own filter -- flat zero-rate points below rheobase-equivalent excluded so "
-       "they don't bias the linear fit). This scalar (fi_slope_hz_per_nA) already feeds the cross-cell "
-       "feature table; this is simply the first time it's been plotted against the data it was fit to.",
-       width=110)
+       f"{len(points)} non-silent points with a clearly-classified firing pattern, sampled across "
+       "injected current with no holding current applied (points still below firing threshold, which "
+       "would otherwise bias the linear fit toward zero, are excluded). This firing-rate/current slope "
+       "is one of the features used to characterize this cell in the cross-cell comparison; here it is "
+       "plotted directly against the data it was fit to.", width=110)
     fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
-    fig.suptitle("9. Firing rate / F-I slope", fontsize=13, weight="bold")
+    fig.suptitle("9. Firing rate vs. injected current", fontsize=13, weight="bold")
     fig.tight_layout(rect=(0, 0.12, 1, 0.93))
     return fig
 
@@ -722,29 +744,29 @@ def make_self_consistency_page(cell_id, cell_result, resim, n_sample=40, seed=11
                (tr["rebound_pattern"] == p["rebound_pattern"])
         matches.append(match)
 
-    fig, ax = plt.subplots(figsize=(8, 4.5))
+    fig, ax = plt.subplots(figsize=(8, 6.5))
     rate = 100.0 * sum(matches) / len(matches)
     bar = ax.bar(["all sampled points"], [rate], color="steelblue")
     ax.text(bar[0].get_x() + bar[0].get_width() / 2, rate, f"{rate:.0f}%\n(n={len(matches)})",
            ha="center", va="bottom", fontsize=9)
     ax.set_ylim(0, 110)
     ax.set_ylabel("match rate (%)")
-    ax.set_title(f"{cell_id} -- resimulated vs. cached classification match rate", fontsize=10)
+    ax.set_title(f"{cell_id} -- reproducibility of stored classifications under re-simulation", fontsize=10)
 
     caption = _wrap(
-       f"Re-simulates {len(sample)} random cached grid points end-to-end and checks whether the "
-       f"resulting test_pattern/rebound_pattern still matches what's stored in "
-       f"cell_held_injected_grid.pkl. Match rate: {rate:.0f}%. Every held level in the current "
-       "uniform-grid sweep (except held=0, which reuses the cell's own cached limit-cycle state "
-       "exactly) is settled via a warm-start from whichever already-settled held level is "
-       "numerically nearest -- the module docstring in run_held_injected_grid.py already documents "
-       "that this model shows path-dependent (hysteretic) settling near dynamical transitions, so a "
-       "resimulation that warm-starts from a different already-settled state than the original sweep "
-       "used can land on a different classification near a boundary. Any mismatches here are "
-       "consistent with that known property, not a new bug.", width=115)
-    fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
-    fig.suptitle("10. Self-consistency check", fontsize=13, weight="bold")
-    fig.tight_layout(rect=(0, 0.22, 1, 0.93))
+       f"{len(sample)} random points from this cell's grid were re-simulated independently and "
+       f"compared against the classification stored from the original sweep. Match rate: {rate:.0f}%. "
+       "Except at zero holding current, where the cell's own steady-state limit cycle is reused "
+       "exactly, each holding-current level is reached by integrating forward from whichever "
+       "already-settled level is numerically nearest -- this model is known to show path-dependent "
+       "(hysteretic) settling near dynamical transitions, so a re-simulation that approaches a "
+       "borderline point along a different path than the original sweep can occasionally land on a "
+       "different classification right at that boundary. Any mismatches here are consistent with that "
+       "known property of the model rather than indicating an error in the classification code.",
+       width=115)
+    fig.text(0.5, 0.03, caption, ha="center", va="bottom", fontsize=7.5)
+    fig.suptitle("10. Reproducibility check", fontsize=13, weight="bold")
+    fig.tight_layout(rect=(0, 0.22, 1, 0.88))
     return fig
 
 
@@ -754,7 +776,7 @@ def make_self_consistency_page(cell_id, cell_result, resim, n_sample=40, seed=11
 
 def make_onset_burst_page(cell_id, exemplars, resim, run_args) -> plt.Figure:
     """exemplars: list of (held_nA, injected_nA, tag). Added alongside the
-    fix this section defends: adaptation_ratio and spikes_per_burst used to
+    fix this section verifies: adaptation_ratio and spikes_per_burst used to
     have no way to represent a window that opens with a real burst and then
     trails off into silence before the window ends -- confirmed case:
     XB2IQX held=-2.48/inj=-4.04, ISIs 13-17ms onset then an irregular
@@ -777,10 +799,10 @@ def make_onset_burst_page(cell_id, exemplars, resim, run_args) -> plt.Figure:
             ax_v, ax_isi, t, v, run_args["min_isi_ratio"],
             run_args.get("min_onset_isis", 2), run_args.get("trailing_silence_ratio", 3.0))
         ratio = tr.get("test_adaptation_ratio")
-        ratio_str = "None (suppressed)" if ratio is None else f"{ratio:.2f}"
-        ax_v.set_title(f"{tag}: held={held_nA:.2f} inj={injected_nA:.2f} -> "
-                      f"pattern='{tr['test_pattern']}', adaptation_ratio={ratio_str}",
-                      fontsize=8.5)
+        ratio_str = "not reported (see caption)" if ratio is None else f"{ratio:.2f}"
+        ax_v.set_title(f"{tag} (held={held_nA:.2f} nA, injected={injected_nA:.2f} nA): "
+                      f"classified as {_describe_pattern(tr['test_pattern'])}, "
+                      f"adaptation ratio {ratio_str}", fontsize=8, wrap=True)
         ax_v.set_xlabel("time (ms)")
         ax_v.set_ylabel("V (mV)")
         ax_v.legend(loc="upper right", fontsize=6)
@@ -829,16 +851,17 @@ def build_packet(cell_id: str, args) -> None:
     # confirmed stable, unlike several other candidates whose cached D
     # didn't survive resimulation) and is still classified "tonic".
     burst_exemplars = [(-3.21429, -3.363838, "clean bursting"),
-                       (-1.377551, -1.234694, "near-miss boundary (correctly rejected as tonic)")]
+                       (-1.377551, -1.234694, "near-miss boundary")]
     # -4.040816/-4.377551 replaces the packet's original single_spike
     # exemplar (-3.857148, -3.92857): confirmed 2026-08-13 that the original
     # point was ITSELF one of the subthreshold false positives the
-    # MIN_SPIKE_AMPLITUDE_MV fix this packet's section 1/6 now defends was
+    # MIN_SPIKE_AMPLITUDE_MV fix this packet's section 1/6 now verifies was
     # added to reject -- resimulating it post-fix shows rebound_occurred=
     # False, not "single_spike". After the fix XB2IQX has exactly one
     # genuine single_spike rebound point left in its whole grid; this is it
     # (48.6mV amplitude, confirmed stable under resimulation).
-    rebound_exemplars = [(-4.040816, -4.377551, "single_spike"), (-0.321429, -3.535713, "tonic_rebound")]
+    rebound_exemplars = [(-4.040816, -4.377551, "single-spike rebound"),
+                        (-0.321429, -3.535713, "sustained (tonic) rebound")]
     sag_exemplars = [(-3.535719, -5.5, "silent, deep sag")]
     # -4.316327/-3.255102: this cell's classifier logic changed enough times
     # this session that TWO earlier adaptation-ratio exemplars went stale in
@@ -866,33 +889,37 @@ def build_packet(cell_id: str, args) -> None:
     # adaptation_ratio=1.00) so its single dominant ISI mode is unambiguous.
     bimodality_exemplars = [(-3.21429, -3.363838, "confidently bursting"),
                             (-0.091837, -0.112245, "confidently tonic"),
-                            (-1.377551, -1.234694, "D-gate near-miss (rejected as tonic)")]
+                            (-1.377551, -1.234694, "separation-score near-miss (rejected as tonic)")]
 
     sections = [
-        ("Representative traces", "One overview page (compact panels), then one full-detail page per "
-         "pattern/rebound combination actually observed in this cell's grid -- the same figures "
-         "plot_example_traces.py would otherwise write as separate standalone files per cell."),
-        ("Spike detection", "Every detected peak overlaid on real traces."),
-        ("Prominence-threshold sensitivity", "How stable spike counts are across a range of thresholds."),
-        ("dV/dt cross-validation", "Independent detector cross-check across a random sample."),
-        ("Tonic/bursting/silent classification", "ISI sequence + log-ISI KDE evidence."),
-        ("Rebound detection", "Recovery-window rebound spikes and the latency cutoff."),
-        ("Sag depth", "Baseline, search window, and trough on a real trace."),
-        ("Adaptation ratio", "First/last ISI windows on a real, sustained tonic trace."),
-        ("Firing rate / F-I slope", "Rate vs. injected current with the fit line."),
-        ("Self-consistency check", "Resimulated vs. cached classification match rate."),
-        ("Burst-onset-then-silence detection", "Onset-burst detection and the adaptation-ratio "
-         "ceased-firing gate, contrasted against a burst-onset that keeps firing."),
-        ("Bimodality test", "Voltage trace, ISI sequence, and log-ISI KDE evidence for the within-burst "
-         "vs. between-burst ISI split underlying every burst/tonic call, including the Ashman's D "
-         "separation gate."),
+        ("Representative traces", "Every distinct response pattern this cell produces, then one "
+         "full-detail trace per pattern."),
+        ("Spike detection", "Every spike the automated detector found, marked on real traces."),
+        ("Spike-detection threshold sensitivity", "How stable spike counts are across detection "
+         "thresholds."),
+        ("Independent cross-check of spike detection", "A second detection method compared against the "
+         "primary one."),
+        ("Tonic / bursting / silent classification", "Interspike intervals and the statistical test for "
+         "two separate interval populations."),
+        ("Post-inhibitory rebound detection", "Rebound spikes after release from hyperpolarization, and "
+         "the latency cutoff used."),
+        ("Sag depth", "The baseline voltage, search window, and trough behind the sag measurement."),
+        ("Spike-frequency adaptation", "Early vs. late interspike intervals on a real, sustained tonic "
+         "trace."),
+        ("Firing rate vs. injected current", "Firing rate vs. current, with the linear fit used to "
+         "summarize it."),
+        ("Reproducibility check", "How often re-simulation reproduces the original classification."),
+        ("Burst-onset-then-silence detection", "A leading onset burst followed by genuine cessation, vs. "
+         "one that sustains."),
+        ("Bimodality test", "The full statistical-separation evidence behind the tonic/bursting "
+         "distinction."),
     ]
 
     outdir = Path(args.figures_dir)
     outdir.mkdir(parents=True, exist_ok=True)
     png_dir = outdir / cell_id
     png_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = outdir / f"{cell_id}_defense_packet.pdf"
+    pdf_path = outdir / f"{cell_id}_validation_packet.pdf"
 
     # Every page's footer names exactly which cache(s) and which production
     # function(s) its evidence traces back to -- see _save_page's docstring
@@ -970,9 +997,10 @@ def build_packet(cell_id: str, args) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate a consolidated PI defense packet (PDF + "
+    parser = argparse.ArgumentParser(description="Generate a consolidated validation packet (PDF + "
                                     "standalone section PNGs) walking through the trace-level evidence "
-                                    "behind every grid-feature panel.")
+                                    "behind every grid-feature panel, to verify the feature-extraction "
+                                    "and classification pipeline is accurate.")
     parser.add_argument("--cells", nargs="+", default=["XB2IQX"])
     parser.add_argument("--grid-cache", default=DEFAULT_GRID_CACHE_PATH)
     parser.add_argument("--grid-features-cache", default=DEFAULT_GRID_FEATURES_CACHE_PATH)
