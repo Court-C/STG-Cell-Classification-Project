@@ -233,8 +233,8 @@ def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
         if "ashman_d" in diag:
             pieces.append(f"A statistical separation score (Ashman's D) of {diag['ashman_d']:.2f} "
                          f"quantifies how cleanly the short and long intervals separate into two "
-                         f"distinct populations, rather than overlapping as one broad distribution "
-                         f"(a score of {min_ashman_d} or higher is required to call them separate).")
+                         f"distinct populations (a score of {min_ashman_d} or higher is required to "
+                         "call them separate).")
         pieces.append(f"Taken together, this window is classified as '{result['pattern']}'"
                      + (f", with a separation score of {result['bimodality_metric']:.2f}"
                         if result.get("bimodality_metric") else "") + ".")

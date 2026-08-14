@@ -57,7 +57,7 @@ def _wrap(text: str, width: int = 100) -> str:
 
 
 
-def _place_caption_below(fig, ax, caption: str, width: int = 60, fontsize: float = 7, gap: float = 0.10,
+def _place_caption_below(fig, ax, caption: str, width: int = None, fontsize: float = None, gap: float = 0.10,
                          right_ax=None) -> None:
     """Places a caption under `ax` using its REAL post-layout bounding box
     (fig.transFigure, computed from ax.get_position() after tight_layout has
@@ -77,11 +77,26 @@ def _place_caption_below(fig, ax, caption: str, width: int = 60, fontsize: float
     caption under -- gives a much wider wrap width for the same font size
     instead of cramming into one column while the rest of the row sits
     empty (user-flagged 2026-08-14, page 5).
+
+    width/fontsize: left as None, both scale automatically with the span's
+    real width in inches, so a caption under a single narrow column doesn't
+    default to the same small size as one spanning a whole multi-column row
+    (user-flagged 2026-08-14 -- "make the captions larger depending on the
+    page size" -- previously every page hand-picked its own fixed values).
+    The two coefficients below were fit to the fontsize/width pairs already
+    hand-tuned and visually confirmed not to overflow on pages 2, 5, 6, 7,
+    and 8 (spans from ~6in single columns to ~19in full-row spans) -- pass
+    either explicitly to override the derived value for a specific page.
     """
     bbox = ax.get_position()
     x0, x1 = bbox.x0, bbox.x1
     if right_ax is not None:
         x1 = right_ax.get_position().x1
+    span_in = (x1 - x0) * fig.get_size_inches()[0]
+    if fontsize is None:
+        fontsize = float(np.clip(6.35 + 0.192 * span_in, 6.5, 11.0))
+    if width is None:
+        width = max(30, int(65 * span_in / fontsize))
     fig.text((x0 + x1) / 2, bbox.y0 - gap, _wrap(caption, width),
              ha="center", va="top", fontsize=fontsize, transform=fig.transFigure)
 
@@ -130,8 +145,7 @@ def make_cover_page(cell_id: str, cell_result: dict, features: dict, sections: l
         "methodology applied on top of that model: spike detection, burst/tonic classification, "
         "post-inhibitory rebound detection, sag depth, and spike-frequency adaptation. Each figure "
         "below reruns the actual classification algorithm on a real simulated trace and marks what "
-        "it found directly on the trace, so each classification can be checked by eye rather than "
-        "taken on faith.", width=95)
+        "it found directly on the trace.", width=95)
     fig.text(0.08, 0.87, intro, fontsize=10, va="top", wrap=True)
 
     summary_line1 = (f"Silencing threshold: {cell_result['cell_floor_nA']:.2f} nA   |   "
@@ -190,7 +204,11 @@ def make_representative_traces_page(cell_id, cell_result, resim) -> plt.Figure:
     exemplars = select_exemplar_points(cell_result["grid"])
     combos = sorted(exemplars.keys())
     n = len(combos)
-    ncols = min(5, n) or 1
+    # Balanced/square-ish grid (e.g. 3x3 for n=9), not a fixed 5-wide strip
+    # that leaves an oddly short, visually lopsided last row (5-then-4 for
+    # n=9, user-flagged 2026-08-14) -- ncols grows only as fast as needed to
+    # keep the grid roughly as wide as it is tall.
+    ncols = max(1, int(np.ceil(np.sqrt(n)))) if n else 1
     nrows = -(-n // ncols) if n else 1
 
     # First pass: resimulate every exemplar and collect its offset traces,
@@ -253,24 +271,22 @@ def make_representative_traces_page(cell_id, cell_result, resim) -> plt.Figure:
     for ax in axes_flat[n:]:
         ax.axis("off")
 
-    caption = _wrap(
+    caption = (
        "One representative trace for each distinct combination of response-to-current-step pattern "
        f"and rebound pattern observed across this cell's full {cell_result['n_points_total']}-"
        "point grid of held and injected current levels: gray is the held baseline before the current "
        "step, red is the response during the current step, and blue is the recovery period after "
        "release back to the held level. Each combination is represented by its most clearly-expressed "
-       "example among the grid points that produced it, not a hand-picked illustration. Every panel "
+       "example among the grid points that produced it. Every panel "
        f"shares the same voltage ({ylim[0]:.0f} to {ylim[1]:.0f} mV) and time (0-{xlim[1]:.0f} ms) axes "
        "so amplitude and duration are directly comparable by eye -- without this, a small subthreshold "
        "wobble and a full-amplitude spike train would each be independently rescaled to fill the same "
-       "panel and look equally prominent.", width=175)
-    fig.text(0.5, 0.005, caption, ha="center", va="bottom", fontsize=7.5)
+       "panel and look equally prominent.")
     fig.suptitle("1. Representative traces", fontsize=13, weight="bold")
-    # rect bottom raised to 0.11 (was 0.05): the added axis-standardization
-    # sentence makes this a 4-5 line caption now, not 3 -- confirmed
-    # directly that 0.05 let it overlap the bottom row's own x-axis tick
-    # labels.
-    fig.tight_layout(rect=(0, 0.11, 1, 0.93))
+    fig.tight_layout(rect=(0, 0.18, 1, 0.93))
+    bottom_left = axes_flat[(nrows - 1) * ncols]
+    bottom_right = axes_flat[-1]
+    _place_caption_below(fig, bottom_left, caption, gap=0.06, right_ax=bottom_right)
     return fig
 
 
@@ -358,7 +374,7 @@ def make_prominence_sensitivity_page(cell_id, held_inj_pairs, resim) -> plt.Figu
        "whichever is larger, so a tiny subthreshold wobble in a low-amplitude trace cannot be counted "
        "as a spike). This sweeps that threshold from 10% to 55% on real, large-amplitude spiking traces: "
        "a flat plateau around the value used throughout this report shows the reported spike counts are "
-       "not sensitive to the exact threshold chosen, rather than sitting on an arbitrary cliff edge.",
+       "insensitive to the exact threshold chosen.",
        width=105)
     fig.text(0.5, 0.02, caption, ha="center", va="bottom", fontsize=7.5)
     fig.tight_layout(rect=(0, 0.14, 1, 0.90))
@@ -562,6 +578,14 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
             crop_end_ms = t[peaks[MAX_DISPLAYED_SPIKES - 1]] + 0.05 * (t[-1] - t[0])
             ax_v.set_xlim(t[0], crop_end_ms)
             ax_isi.set_xlim(0.5, MAX_DISPLAYED_SPIKES - 0.5)
+        if tag.startswith("separation-score near-miss"):
+            # This row's whole point is a real ~0.1ms separation between the
+            # short and long interval populations -- the default zero-
+            # anchored range (see mark_isi_classification) is right for a
+            # flat/uniform row but hides this row's actual structure by
+            # compressing it against the top of a 0-17ms axis. User-set
+            # range, 2026-08-14.
+            ax_isi.set_ylim(14, 18)
         ax_isi.set_title(f"Interspike intervals -- classified as {_describe_pattern(result['pattern'])}",
                         fontsize=9)
         captions.append((ax_v, ax_kde, f"Simulated {cell_id} trace. {caption}"))
