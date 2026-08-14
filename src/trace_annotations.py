@@ -109,7 +109,8 @@ def mark_confirmed_vs_rejected(ax, t_ms: np.ndarray, v_mV: np.ndarray, dt_ms: fl
 def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
                             min_isis_for_burst_test: int, isi_mode_prominence_frac: float,
                             min_isi_ratio: float, min_spikes_per_burst: float = 1.5,
-                            min_ashman_d: float = 2.0, isis_override=None, n_peaks_override=None) -> tuple:
+                            min_ashman_d: float = 2.0, isis_override=None, n_peaks_override=None,
+                            log_isi_xlim: tuple = None) -> tuple:
     """Runs the real production classify_burst_pattern (via compute_isis_ms
     on this trace) and plots the two pieces of evidence behind whatever
     label it returned: the raw ISI-vs-spike-index sequence on `ax_isi`, and
@@ -125,6 +126,17 @@ def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
     synthetic ISI sequence with no underlying simulated trace to derive one
     from -- e.g. a hand-built example of a specific gate's decision
     boundary. Both must be given together.
+
+    log_isi_xlim: when a caller is placing several of these panels side by
+    side for direct comparison, each panel's own KDE curve is otherwise
+    plotted over whatever [min, max] its own data happens to span -- which
+    makes the panels visually incomparable (a confidently-tonic point's ISI
+    might span a fraction of a log10-unit while a confidently-bursting
+    point's spans two full units). Pass a shared (lo, hi) range -- the union
+    across every panel being compared, not this panel's own range -- and
+    the ALREADY-FITTED kde (diag["kde"]) is re-evaluated over that wider
+    window before plotting, so the curve is a real continuation of the same
+    fit, not a cropped/rescaled copy of the original narrower one.
     """
     if isis_override is not None:
         isis_ms, n_peaks = isis_override, n_peaks_override
@@ -148,18 +160,29 @@ def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
                   f"min_isis_for_burst_test={min_isis_for_burst_test}, or a degenerate ISI spread, so "
                   f"the log-ISI KDE bimodality test never ran and the point defaults to '{result['pattern']}'.")
     else:
-        grid, density = diag["log_isi_grid"], diag["density"]
+        if log_isi_xlim is not None:
+            grid = np.linspace(log_isi_xlim[0], log_isi_xlim[1], 400)
+            density = diag["kde"](grid)
+        else:
+            grid, density = diag["log_isi_grid"], diag["density"]
         ax_kde.plot(grid, density, color="black", lw=1)
+        # candidate_mode_idx indexes diag's OWN original grid/density arrays
+        # (200 points over this panel's own data range), never the
+        # log_isi_xlim-rescaled arrays above (400 points, different range/
+        # spacing) -- index into diag directly rather than the local
+        # grid/density names to stay correct in both branches.
         cand = diag.get("candidate_mode_idx")
         if cand is not None and len(cand) > 0:
-            ax_kde.plot(grid[cand], density[cand], linestyle="none", marker="^", color="gray",
-                       markersize=6, label="candidate mode")
+            ax_kde.plot(diag["log_isi_grid"][cand], diag["density"][cand], linestyle="none", marker="^",
+                       color="gray", markersize=6, label="candidate mode")
         if "mode_lo_log_isi" in diag:
             ax_kde.axvline(diag["mode_lo_log_isi"], color="seagreen", ls=":", lw=1.2,
                            label="within-burst ISI (short)")
             ax_kde.axvline(diag["mode_hi_log_isi"], color="darkorange", ls=":", lw=1.2,
                            label="between-burst ISI (long)")
             ax_kde.axvline(diag["split_log_isi"], color="firebrick", ls="--", lw=1.5, label="valley split")
+        if log_isi_xlim is not None:
+            ax_kde.set_xlim(log_isi_xlim)
         ax_kde.set_xlabel("log10(ISI / ms)")
         ax_kde.set_ylabel("KDE density")
         ax_kde.legend(loc="best", fontsize=6)

@@ -308,8 +308,14 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     grid = np.linspace(log_isi.min() - pad, log_isi.max() + pad, 200)
     density = kde(grid)
     peaks, _ = find_peaks(density, prominence=density.max() * isi_mode_prominence_frac)
+    # "kde" (the fitted callable itself, not just this call's own padded-to-
+    # its-own-data grid/density) is kept so a caller comparing multiple
+    # panels can re-evaluate the SAME fit over a shared, wider x-range for
+    # plotting -- extending the visible window this way redraws the actual
+    # already-fitted curve further out, it does not fabricate/smooth new
+    # data. See trace_annotations.mark_isi_classification's log_isi_xlim.
     diagnostics = {"log_isi_grid": grid, "density": density, "candidate_mode_idx": peaks,
-                  "isi_mode_prominence_frac": isi_mode_prominence_frac}
+                  "isi_mode_prominence_frac": isi_mode_prominence_frac, "kde": kde}
 
     if len(peaks) < 2:
         return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),

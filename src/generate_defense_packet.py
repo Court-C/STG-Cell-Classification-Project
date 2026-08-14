@@ -365,6 +365,33 @@ def make_dvdt_crossvalidation_page(cell_id, grid, resim, dt_ms, n_sample=20, see
 # Burst/tonic classification
 # ---------------------------------------------------------------------------
 
+def _shared_log_isi_xlim(isis_list) -> tuple:
+    """Union, not intersection: when several log-ISI KDE panels are shown
+    side by side for direct comparison, scaling each to its OWN data range
+    makes them visually incomparable -- a confidently-tonic point's ISIs
+    might span a fraction of a log10-unit while a confidently-bursting
+    point's span two full units, and both would render as similarly-sized
+    curves if each panel optimizes its own axis. Computes the same padded
+    range classify_burst_pattern's own grid uses (0.15x the data's own
+    span) per array, then takes the union across every array being
+    compared, so the shared range is exactly what the union of the panels'
+    own individual ranges would have been, not a fixed/arbitrary window.
+    """
+    los, his = [], []
+    for isis_ms in isis_list:
+        if len(isis_ms) < 2:
+            continue
+        log_isi = np.log10(isis_ms)
+        if np.ptp(log_isi) < 1e-6:
+            los.append(log_isi.min() - 0.5)
+            his.append(log_isi.max() + 0.5)
+            continue
+        pad = 0.15 * np.ptp(log_isi)
+        los.append(log_isi.min() - pad)
+        his.append(log_isi.max() + pad)
+    return (min(los), max(his))
+
+
 def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.Figure:
     """exemplars: list of (held_nA, injected_nA, tag) -- typically one clean
     bursting example and one boundary/near-miss "correctly rejected" example.
@@ -372,15 +399,18 @@ def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.F
     fig, axes = plt.subplots(len(exemplars), 2, figsize=(13, 5.8 * len(exemplars)))
     if len(exemplars) == 1:
         axes = axes[np.newaxis, :]
+    traces = [resim(held_nA, injected_nA) for held_nA, injected_nA, _ in exemplars]
+    isis_list = [compute_isis_ms(tr["_trace_v_test_mV"], tr["_trace_t_test_ms"], PROMINENCE_FRACTION)[0]
+                for tr in traces]
+    shared_xlim = _shared_log_isi_xlim(isis_list)
     captions = []
-    for row, (held_nA, injected_nA, tag) in zip(axes, exemplars):
+    for row, (held_nA, injected_nA, tag), tr in zip(axes, exemplars, traces):
         ax_isi, ax_kde = row
-        tr = resim(held_nA, injected_nA)
         t, v = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
         result, caption = mark_isi_classification(
             ax_isi, ax_kde, t, v, run_args["min_isis_for_burst_test"],
             run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
-            min_ashman_d=run_args.get("min_ashman_d", 2.0))
+            min_ashman_d=run_args.get("min_ashman_d", 2.0), log_isi_xlim=shared_xlim)
         ax_isi.set_title(f"{tag}: held={held_nA:.2f} inj={injected_nA:.2f} -> '{result['pattern']}'",
                         fontsize=9)
         captions.append((ax_isi, caption))
@@ -443,10 +473,19 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
     fig, axes = plt.subplots(n_rows, 3, figsize=(16, 4.6 * n_rows))
     if n_rows == 1:
         axes = axes[np.newaxis, :]
+
+    # First pass: gather every row's ISIs (resimulating the real points, no
+    # plotting yet) so the shared log-ISI range can be computed as the union
+    # across ALL rows before any panel is drawn -- see _shared_log_isi_xlim.
+    traces = [resim(held_nA, injected_nA) for held_nA, injected_nA, _ in real_exemplars]
+    real_isis = [compute_isis_ms(tr["_trace_v_test_mV"], tr["_trace_t_test_ms"], PROMINENCE_FRACTION)[0]
+                for tr in traces]
+    synthetic_isis, synthetic_n_peaks = _synthetic_ashman_d_near_miss()
+    shared_xlim = _shared_log_isi_xlim(real_isis + [synthetic_isis])
+
     captions = []
-    for row, (held_nA, injected_nA, tag) in zip(axes, real_exemplars):
+    for row, (held_nA, injected_nA, tag), tr in zip(axes, real_exemplars, traces):
         ax_v, ax_isi, ax_kde = row
-        tr = resim(held_nA, injected_nA)
         t, v = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
         mark_spikes(ax_v, t, v)
         ax_v.plot(t, v, color="black", lw=0.6)
@@ -456,7 +495,7 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
         result, caption = mark_isi_classification(
             ax_isi, ax_kde, t, v, run_args["min_isis_for_burst_test"],
             run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
-            min_ashman_d=run_args.get("min_ashman_d", 2.0))
+            min_ashman_d=run_args.get("min_ashman_d", 2.0), log_isi_xlim=shared_xlim)
         ax_isi.set_title(f"ISI sequence -> '{result['pattern']}'", fontsize=9)
         captions.append((ax_isi, f"[REAL, resimulated] {caption}"))
 
@@ -465,11 +504,11 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
     ax_v.text(0.5, 0.5, "CONSTRUCTED example\n(no simulated voltage trace --\nhand-built ISI sequence)",
              ha="center", va="center", fontsize=9, style="italic", color="dimgray",
              transform=ax_v.transAxes, wrap=True)
-    isis_ms, n_peaks = _synthetic_ashman_d_near_miss()
     result, caption = mark_isi_classification(
         ax_isi, ax_kde, None, None, run_args["min_isis_for_burst_test"],
         run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
-        min_ashman_d=run_args.get("min_ashman_d", 2.0), isis_override=isis_ms, n_peaks_override=n_peaks)
+        min_ashman_d=run_args.get("min_ashman_d", 2.0), isis_override=synthetic_isis,
+        n_peaks_override=synthetic_n_peaks, log_isi_xlim=shared_xlim)
     ax_isi.set_title(f"ISI sequence -> '{result['pattern']}'", fontsize=9)
     captions.append((ax_isi, f"[CONSTRUCTED, not an observed {cell_id} point -- same generator as "
                     f"tests/test_burst_detection.py's Ashman's D boundary test] {caption}"))
