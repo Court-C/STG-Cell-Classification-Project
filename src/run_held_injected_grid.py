@@ -130,7 +130,7 @@ def get_cell_floor_nA(silencing_entry: dict, margin_nA: float):
 # ---------------------------------------------------------------------------
 
 def classify_hold_pattern(chunk_v, chunk_t, min_isis_for_burst_test, isi_mode_prominence_frac,
-                          min_isi_ratio) -> str:
+                          min_isi_ratio, min_ashman_d: float = 2.0) -> str:
     """tonic/bursting/silent for a held level's OWN steady-state firing,
     from whichever settle chunk is already being simulated anyway (the
     last hold-settle chunk for held!=0, the cached Iapp=0 burn-in trace for
@@ -145,13 +145,14 @@ def classify_hold_pattern(chunk_v, chunk_t, min_isis_for_burst_test, isi_mode_pr
         return "silent"
     isis_ms, n_peaks = compute_isis_ms(chunk_v, chunk_t, PROMINENCE_FRACTION)
     burst = classify_burst_pattern(isis_ms, min_isis_for_burst_test, isi_mode_prominence_frac,
-                                   min_isi_ratio, n_peaks=n_peaks)
+                                   min_isi_ratio, min_ashman_d=min_ashman_d, n_peaks=n_peaks)
     return to_stored_pattern(burst["pattern"])
 
 
 def settle_hold_level(params, held_nA, warm_start_state, dt, temp, reftemp,
                       chunk_s, max_settle_s, settle_rtol, min_peaks_for_rate,
-                      min_isis_for_burst_test, isi_mode_prominence_frac, min_isi_ratio) -> dict:
+                      min_isis_for_burst_test, isi_mode_prominence_frac, min_isi_ratio,
+                      min_ashman_d: float = 2.0) -> dict:
     """Settle at a constant held current, reusing Step 1's settle_at_level
     engine unchanged, plus the end-of-settle voltage (the pre-test baseline
     compute_pre_spike_sag_trough's sag depth is measured against) and this
@@ -165,7 +166,7 @@ def settle_hold_level(params, held_nA, warm_start_state, dt, temp, reftemp,
     r["hold_v_end_mV"] = float(r["last_chunk_v"][-1]) if r["last_chunk_v"] is not None else float("nan")
     r["hold_pattern"] = classify_hold_pattern(r["last_chunk_v"], r["last_chunk_t"],
                                               min_isis_for_burst_test, isi_mode_prominence_frac,
-                                              min_isi_ratio)
+                                              min_isi_ratio, min_ashman_d)
     # Trough of the held level's OWN last settle chunk -- for a flatline hold
     # this equals hold_v_end_mV (a constant trace's min is its endpoint), but
     # for a hold that's itself tonically/burst firing at rest (e.g. XB2IQX at
@@ -311,7 +312,8 @@ def detect_onset_burst(isis_ms: np.ndarray, min_isi_ratio: float, min_onset_isis
 def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_ms: float,
                              min_isis_for_burst_test: int, isi_mode_prominence_frac: float,
                              min_isi_ratio: float, n_peaks: int, min_onset_isis: int = 2,
-                             rebound_min_onset_isis: int = 1, trailing_silence_ratio: float = 3.0) -> str:
+                             rebound_min_onset_isis: int = 1, trailing_silence_ratio: float = 3.0,
+                             min_ashman_d: float = 2.0) -> str:
     """"bursting_rebound" or "tonic_rebound" for a >=2-spike recovery-window
     train (rebound_spike_count==1/0 are handled by the caller before this is
     reached). classify_burst_pattern's whole-train KDE bimodality test is
@@ -364,7 +366,8 @@ def classify_rebound_pattern(rebound_isis: np.ndarray, rebound_trailing_silence_
     n = len(rebound_isis)
     if n >= min_isis_for_burst_test:
         kde_result = classify_burst_pattern(rebound_isis, min_isis_for_burst_test,
-                                            isi_mode_prominence_frac, min_isi_ratio, n_peaks=n_peaks)
+                                            isi_mode_prominence_frac, min_isi_ratio,
+                                            min_ashman_d=min_ashman_d, n_peaks=n_peaks)
         onset_n, _ = detect_onset_burst(rebound_isis, min_isi_ratio, min_onset_isis)
         return "bursting_rebound" if (kde_result["pattern"] == "bursting" or onset_n is not None) \
             else "tonic_rebound"
@@ -385,7 +388,7 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
                           adaptation_edge_n: int = 3, min_onset_isis: int = 2,
                           trailing_silence_ratio: float = 3.0, rebound_min_onset_isis: int = 1,
                           max_test_window_s: float = None, test_window_extend_factor: float = 2.0,
-                          return_traces: bool = False) -> dict:
+                          min_ashman_d: float = 2.0, return_traces: bool = False) -> dict:
     """Test window at the ABSOLUTE injected current level (held is not added
     on top -- see module docstring) followed by a recovery window (released
     back to held) watched for post-inhibitory rebound.
@@ -438,7 +441,7 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
             isis_test, test_n_spikes = compute_isis_ms(v_test, t_test, PROMINENCE_FRACTION)
             burst_test = classify_burst_pattern(isis_test, min_isis_for_burst_test,
                                                 isi_mode_prominence_frac, min_isi_ratio,
-                                                n_peaks=test_n_spikes)
+                                                min_ashman_d=min_ashman_d, n_peaks=test_n_spikes)
             test_pattern = burst_test["pattern"]
             test_isi_short_ms = burst_test["isi_short_ms"]
             test_isi_long_ms = burst_test["isi_long_ms"]
@@ -456,6 +459,11 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
     # Retry decision above is done -- collapse "insufficient_data"/"sparse"
     # (whichever it still is) down to "silent" for the reported label. See
     # to_stored_pattern's docstring for why this happens here, not earlier.
+    # _raw_test_pattern is kept (pre-collapse) so the onset-dominates-sparse
+    # override below can tell "genuinely too few spikes to classify" apart
+    # from a confidently-computed "tonic"/"bursting" that happens to also
+    # have a small onset run.
+    _raw_test_pattern = test_pattern
     test_pattern = to_stored_pattern(test_pattern)
 
     test_v_min_pre_spike_mV, test_first_spike_ms = compute_pre_spike_sag_trough(
@@ -473,6 +481,31 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
     test_onset_n_spikes, test_onset_isi_mean_ms = (
         detect_onset_burst(isis_test, min_isi_ratio, min_onset_isis)
         if isis_test is not None and len(isis_test) > 0 else (None, None))
+
+    # test_pattern override, 2026-08-13: too few total ISIs for the whole-
+    # window KDE test to even attempt classification (_raw_test_pattern was
+    # "insufficient_data"/"sparse", collapsed to "silent" above) -- but
+    # detect_onset_burst still found a genuine leading burst. At this low a
+    # spike count (classify_burst_pattern needs >= min_isis_for_burst_test+1
+    # spikes just to TRY the KDE test; detect_onset_burst needs only
+    # min_onset_isis+1), an onset burst it can still find necessarily
+    # accounts for most/all of what little activity there is -- confirmed
+    # case: XB2IQX held=-4.50/inj=-3.93, 5 total spikes, 3 of them the
+    # onset burst, then genuine silence, reported "silent" even though the
+    # cell plainly burst. Deliberately narrower than "onset found ->
+    # bursting" unconditionally: a LONG train with a small onset
+    # (confirmed contrast: held=-2.39/inj=-3.37, 19 spikes, 3-spike onset,
+    # 16 more spikes of ordinary tonic firing after) legitimately IS tonic
+    # overall and stays that way here -- classify_burst_pattern already ran
+    # its KDE test successfully there, so _raw_test_pattern is "tonic", not
+    # "sparse"/"insufficient_data", and this override never triggers.
+    # test_n_bursts/test_spikes_per_burst are set directly from the onset
+    # run below (burst_test's own n_long_isis doesn't apply -- classify_
+    # burst_pattern never reached its "bursting" branch here).
+    test_onset_dominates_sparse_window = (
+        _raw_test_pattern in ("insufficient_data", "sparse") and test_onset_n_spikes is not None)
+    if test_onset_dominates_sparse_window:
+        test_pattern = "bursting"
 
     # test_trailing_silence_ms: gap between the last detected spike and the
     # end of the (possibly window-extended) test window -- invisible to any
@@ -510,10 +543,19 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
     # short ISIs, so each inter-burst gap marks one more burst boundary);
     # spikes_per_burst is the average over the whole test window, not a
     # per-burst array -- see classify_burst_pattern's n_long_isis docstring.
-    test_n_bursts = (burst_test["n_long_isis"] + 1
-                     if test_pattern == "bursting" and burst_test is not None else None)
-    test_spikes_per_burst = ((test_n_isis + 1) / test_n_bursts
-                             if test_n_bursts else None)
+    # test_onset_dominates_sparse_window is checked FIRST: classify_burst_
+    # pattern never reached its "bursting" branch for this window (it
+    # returned "sparse"/"insufficient_data", overridden above), so
+    # burst_test["n_long_isis"] is None there -- the one detected onset
+    # run IS the whole observed train, i.e. exactly one burst.
+    if test_onset_dominates_sparse_window:
+        test_n_bursts = 1
+        test_spikes_per_burst = float(test_onset_n_spikes)
+    else:
+        test_n_bursts = (burst_test["n_long_isis"] + 1
+                         if test_pattern == "bursting" and burst_test is not None else None)
+        test_spikes_per_burst = ((test_n_isis + 1) / test_n_bursts
+                                 if test_n_bursts else None)
 
     test_result = {
         "test_pattern": test_pattern, "test_isi_short_ms": test_isi_short_ms,
@@ -631,7 +673,7 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
                 rebound_isis, rebound_trailing_silence_ms, min_isis_for_burst_test,
                 isi_mode_prominence_frac, min_isi_ratio, rebound_spike_count,
                 min_onset_isis=min_onset_isis, rebound_min_onset_isis=rebound_min_onset_isis,
-                trailing_silence_ratio=trailing_silence_ratio)
+                trailing_silence_ratio=trailing_silence_ratio, min_ashman_d=min_ashman_d)
 
     recovery_result = {
         "rebound_applicable": test_suppressed,
@@ -778,10 +820,11 @@ def build_uniform_grid(params, y_ss, baseline_freq_hz, cell_floor_nA, injected_f
                          settle_rtol=args.hold_settle_rtol, min_peaks_for_rate=args.min_peaks_for_rate,
                          min_isis_for_burst_test=args.min_isis_for_burst_test,
                          isi_mode_prominence_frac=args.isi_mode_prominence_frac,
-                         min_isi_ratio=args.min_isi_ratio)
+                         min_isi_ratio=args.min_isi_ratio, min_ashman_d=args.min_ashman_d)
     isi_kwargs = dict(min_isis_for_burst_test=args.min_isis_for_burst_test,
                       isi_mode_prominence_frac=args.isi_mode_prominence_frac,
                       min_isi_ratio=args.min_isi_ratio,
+                      min_ashman_d=args.min_ashman_d,
                       rebound_min_onset_isis=args.rebound_min_onset_isis,
                       sag_window_ms=args.sag_window_ms,
                       sag_dead_zone_ms=args.sag_dead_zone_ms,
@@ -840,7 +883,8 @@ def run_cell_grid(cell_id: str, params: np.ndarray, ss_entry, silencing_entry, a
     burnin_t = ss_entry.get("burnin_t")
     y_ss_trough_mV = float(np.min(burnin_v)) if burnin_v is not None else None
     y_ss_hold_pattern = classify_hold_pattern(burnin_v, burnin_t, args.min_isis_for_burst_test,
-                                              args.isi_mode_prominence_frac, args.min_isi_ratio)
+                                              args.isi_mode_prominence_frac, args.min_isi_ratio,
+                                              args.min_ashman_d)
 
     try:
         grid, hold_settle_cache, held_levels, injected_levels, test_window_s, recovery_window_s = \
@@ -1193,6 +1237,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-isis-for-burst-test", type=int, default=6)
     parser.add_argument("--isi-mode-prominence-frac", type=float, default=0.05)
     parser.add_argument("--min-isi-ratio", type=float, default=1.5)
+    parser.add_argument("--min-ashman-d", type=float, default=2.0,
+                        help="Minimum Ashman's D (separation of the short/long ISI clusters in "
+                             "units of pooled SD) required, on top of the ratio and spikes-per-"
+                             "burst gates, before classify_burst_pattern will call a window "
+                             "'bursting'. D>=2 is the classical mixture-modeling threshold for "
+                             "cleanly separated components (Ashman, Bird & Zepf 1994); exposed as "
+                             "a flag (unlike min-spikes-per-burst) so it can be swept during audits.")
     parser.add_argument("--sag-window-ms", type=float, default=500.0,
                         help="Window (from test-window onset) over which the pre-spike sag trough "
                              "(test_v_min_pre_spike_mV) is measured, truncated early if a spike occurs "

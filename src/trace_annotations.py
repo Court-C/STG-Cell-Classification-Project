@@ -108,7 +108,8 @@ def mark_confirmed_vs_rejected(ax, t_ms: np.ndarray, v_mV: np.ndarray, dt_ms: fl
 
 def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
                             min_isis_for_burst_test: int, isi_mode_prominence_frac: float,
-                            min_isi_ratio: float, min_spikes_per_burst: float = 1.5) -> tuple:
+                            min_isi_ratio: float, min_spikes_per_burst: float = 1.5,
+                            min_ashman_d: float = 2.0, isis_override=None, n_peaks_override=None) -> tuple:
     """Runs the real production classify_burst_pattern (via compute_isis_ms
     on this trace) and plots the two pieces of evidence behind whatever
     label it returned: the raw ISI-vs-spike-index sequence on `ax_isi`, and
@@ -118,10 +119,19 @@ def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
     still made it as far as the KDE (e.g. a near-miss rejected on the ratio
     or spikes-per-burst gate), so a borderline classification's rejection
     is just as visible as an accepted one.
+
+    isis_override/n_peaks_override: pass a pre-computed ISI array directly
+    (t_ms/v_mV are then ignored) for panels illustrating a CONSTRUCTED/
+    synthetic ISI sequence with no underlying simulated trace to derive one
+    from -- e.g. a hand-built example of a specific gate's decision
+    boundary. Both must be given together.
     """
-    isis_ms, n_peaks = compute_isis_ms(v_mV, t_ms, PROMINENCE_FRACTION)
+    if isis_override is not None:
+        isis_ms, n_peaks = isis_override, n_peaks_override
+    else:
+        isis_ms, n_peaks = compute_isis_ms(v_mV, t_ms, PROMINENCE_FRACTION)
     result = classify_burst_pattern(isis_ms, min_isis_for_burst_test, isi_mode_prominence_frac,
-                                    min_isi_ratio, min_spikes_per_burst, n_peaks=n_peaks)
+                                    min_isi_ratio, min_spikes_per_burst, min_ashman_d, n_peaks=n_peaks)
 
     if len(isis_ms) > 0:
         ax_isi.plot(np.arange(1, len(isis_ms) + 1), isis_ms, marker="o", markersize=3,
@@ -145,13 +155,32 @@ def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
             ax_kde.plot(grid[cand], density[cand], linestyle="none", marker="^", color="gray",
                        markersize=6, label="candidate mode")
         if "mode_lo_log_isi" in diag:
-            ax_kde.axvline(diag["mode_lo_log_isi"], color="seagreen", ls=":", lw=1.2, label="short mode")
-            ax_kde.axvline(diag["mode_hi_log_isi"], color="darkorange", ls=":", lw=1.2, label="long mode")
+            ax_kde.axvline(diag["mode_lo_log_isi"], color="seagreen", ls=":", lw=1.2,
+                           label="within-burst ISI (short)")
+            ax_kde.axvline(diag["mode_hi_log_isi"], color="darkorange", ls=":", lw=1.2,
+                           label="between-burst ISI (long)")
             ax_kde.axvline(diag["split_log_isi"], color="firebrick", ls="--", lw=1.5, label="valley split")
         ax_kde.set_xlabel("log10(ISI / ms)")
         ax_kde.set_ylabel("KDE density")
         ax_kde.legend(loc="best", fontsize=6)
         ax_kde.set_title("log-ISI bimodality test", fontsize=9)
+        # Ashman's D isn't a position on this axis (it's a scalar summarizing
+        # how separated the two mode clusters are), so it can't be drawn as
+        # a line the way the modes/valley are -- shown as an on-plot
+        # annotation instead of only in the caption below, so the pass/fail
+        # margin against the threshold is visible without reading text.
+        if "ashman_d" in diag:
+            # Bottom-center, not a corner: the mode/valley legend's loc="best"
+            # consistently lands top-right on this shape of curve (two peaks
+            # with a dip between them), so anchoring there collided with it.
+            # The area below the valley dip is reliably open regardless of
+            # where the two modes themselves happen to sit.
+            d, passed = diag["ashman_d"], diag["ashman_d"] >= min_ashman_d
+            ax_kde.annotate(f"Ashman's D = {d:.2f} (need >= {min_ashman_d} to call 'bursting')",
+                            xy=(0.5, 0.04), xycoords="axes fraction", ha="center", va="bottom", fontsize=7,
+                            color="darkgreen" if passed else "firebrick",
+                            bbox=dict(boxstyle="round", fc="white", ec="darkgreen" if passed else "firebrick",
+                                     alpha=0.9))
 
         pieces = [f"{n_peaks} spikes, {len(isis_ms)} ISIs."]
         if "isi_short_ms" in diag:
@@ -162,6 +191,8 @@ def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
         if "avg_spikes_per_burst" in diag:
             pieces.append(f"Avg spikes/burst = {diag['avg_spikes_per_burst']:.2f} "
                          f"(needs >= {min_spikes_per_burst}).")
+        if "ashman_d" in diag:
+            pieces.append(f"Ashman's D = {diag['ashman_d']:.2f} (needs >= {min_ashman_d}).")
         pieces.append(f"Final call: '{result['pattern']}'"
                      + (f" (bimodality metric / Ashman's D = {result['bimodality_metric']:.2f})"
                         if result.get("bimodality_metric") else "") + ".")

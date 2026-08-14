@@ -55,6 +55,9 @@ def test_synthetic_doublet_train_classified_bursting():
     assert result["pattern"] == "bursting"
     assert result["diagnostics"]["avg_spikes_per_burst"] == pytest.approx(65 / 33, abs=0.01)
     assert result["diagnostics"]["avg_spikes_per_burst"] < 2.0
+    # Non-regression: this known-good case must also clear the new Ashman's D
+    # gate -- a clean 31.4/60.0ms separation should score far above threshold.
+    assert result["diagnostics"]["ashman_d"] >= 2.0
 
 
 def test_vc08b6_near_miss_correctly_rejected_as_tonic():
@@ -83,6 +86,88 @@ def test_insufficient_data_below_minimum_isi_count():
     result = classify_burst_pattern(isis_ms, n_peaks=3, **DEFAULT_KWARGS)
     assert result["pattern"] == "sparse"
     assert result["diagnostics"] is None
+
+
+def _make_burst_train_with_long_tail(rng, n_bursts, mean_short=10.0, sd_short=0.5,
+                                     mean_long=20.0, sd_long=2.0, tail_frac=0.1,
+                                     tail_mean=55.0, tail_sd=6.0, spikes_per_burst=3):
+    """3-spike bursts (2 short intra-burst ISIs + 1 inter-burst ISI), where a
+    minority (tail_frac) of inter-burst ISIs are drawn from a much wider,
+    farther-out distribution instead of the main inter-burst mode. The KDE
+    still resolves two clean peaks (the tail is a minority, not its own
+    third mode) and the resulting short/long cluster means still pass the
+    ratio and spikes-per-burst gates comfortably -- but the tail inflates
+    the long cluster's standard deviation enough to pull Ashman's D below
+    the well-separated threshold, exactly the "two clusters that pass shape
+    checks but aren't actually well-separated populations" case the D-gate
+    exists to catch.
+    """
+    seq = []
+    for _ in range(n_bursts):
+        for _ in range(spikes_per_burst - 1):
+            seq.append(max(1.0, rng.normal(mean_short, sd_short)))
+        if rng.random() < tail_frac:
+            seq.append(max(1.0, rng.normal(tail_mean, tail_sd)))
+        else:
+            seq.append(max(1.0, rng.normal(mean_long, sd_long)))
+    return np.array(seq[:-1])
+
+
+def test_high_variance_cluster_rejected_by_ashman_d_alone():
+    """Ratio and spikes-per-burst gates both pass on this train (confirmed
+    below), so without the Ashman's D gate this would be called "bursting"
+    -- but the long cluster's tail-inflated spread pulls D to ~1.75, under
+    the default min_ashman_d=2.0 threshold, so it must be rejected as
+    "tonic". This isolates the new gate: it's the only one of the four that
+    catches this specific case.
+    """
+    isis_ms = _make_burst_train_with_long_tail(np.random.default_rng(11), n_bursts=60, tail_frac=0.1)
+    result = classify_burst_pattern(isis_ms, n_peaks=len(isis_ms) + 1, **DEFAULT_KWARGS)
+    diag = result["diagnostics"]
+    ratio = diag["isi_long_ms"] / diag["isi_short_ms"]
+    assert ratio >= DEFAULT_KWARGS["min_isi_ratio"], "ratio gate should pass on this data"
+    assert diag["avg_spikes_per_burst"] >= 1.5, "spikes-per-burst gate should pass on this data"
+    assert diag["ashman_d"] < 2.0
+    assert result["pattern"] == "tonic"
+
+    # Same data, looser D threshold -> confirms only the D gate is doing the
+    # rejecting above, not some other side effect of this construction.
+    looser = classify_burst_pattern(isis_ms, min_ashman_d=1.5, n_peaks=len(isis_ms) + 1, **DEFAULT_KWARGS)
+    assert looser["pattern"] == "bursting"
+
+
+def test_clean_bimodal_train_passes_ashman_d_gate():
+    """A well-separated, low-variance alternating train (10ms/100ms, only
+    small Gaussian jitter) must still classify as "bursting" with Ashman's D
+    comfortably above threshold -- the new gate must not reject genuine,
+    cleanly-separated bursters.
+    """
+    rng = np.random.default_rng(9)
+    seq = []
+    for _ in range(20):
+        seq.append(10.0 + rng.normal(0, 0.3))
+        seq.append(100.0 + rng.normal(0, 0.5))
+    isis_ms = np.array(seq)
+    result = classify_burst_pattern(isis_ms, n_peaks=len(isis_ms) + 1, **DEFAULT_KWARGS)
+    assert result["pattern"] == "bursting"
+    assert result["diagnostics"]["ashman_d"] >= 2.0
+
+
+def test_ashman_d_gate_flips_pattern_near_the_boundary():
+    """Two near-identical long-tail trains (see
+    _make_burst_train_with_long_tail), differing only in how often the tail
+    fires, straddle the default min_ashman_d=2.0 threshold from opposite
+    sides -- isolating the gate's actual decision boundary on real
+    (non-degenerate) data rather than a single one-sided example.
+    """
+    above = _make_burst_train_with_long_tail(np.random.default_rng(11), n_bursts=60, tail_frac=0.07)
+    below = _make_burst_train_with_long_tail(np.random.default_rng(11), n_bursts=60, tail_frac=0.08)
+    r_above = classify_burst_pattern(above, n_peaks=len(above) + 1, **DEFAULT_KWARGS)
+    r_below = classify_burst_pattern(below, n_peaks=len(below) + 1, **DEFAULT_KWARGS)
+    assert r_above["diagnostics"]["ashman_d"] >= 2.0
+    assert r_above["pattern"] == "bursting"
+    assert r_below["diagnostics"]["ashman_d"] < 2.0
+    assert r_below["pattern"] == "tonic"
 
 
 def test_spike_detection_ignores_subthreshold_noise():

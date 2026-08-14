@@ -379,7 +379,8 @@ def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.F
         t, v = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
         result, caption = mark_isi_classification(
             ax_isi, ax_kde, t, v, run_args["min_isis_for_burst_test"],
-            run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"])
+            run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
+            min_ashman_d=run_args.get("min_ashman_d", 2.0))
         ax_isi.set_title(f"{tag}: held={held_nA:.2f} inj={injected_nA:.2f} -> '{result['pattern']}'",
                         fontsize=9)
         captions.append((ax_isi, caption))
@@ -388,6 +389,101 @@ def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.F
     fig.subplots_adjust(hspace=0.9)
     for ax_isi, caption in captions:
         _place_caption_below(fig, ax_isi, caption, width=58)
+    return fig
+
+
+def _synthetic_ashman_d_near_miss():
+    """Same construction, same seed, same parameters as tests/
+    test_burst_detection.py's test_high_variance_cluster_rejected_by_
+    ashman_d_alone -- a 3-spike-burst train where a minority of inter-burst
+    ISIs are drawn from a much wider, farther-out distribution. The ratio
+    and spikes-per-burst gates both pass (short/long cluster means are
+    still >=1.5x apart, still >=1.5 spikes/burst), but the long cluster's
+    tail-inflated spread pulls Ashman's D to ~1.75 -- below the min_ashman_d
+    =2.0 default -- so classify_burst_pattern correctly rejects it as
+    tonic. No real cell in this project's current grid data has ever
+    exercised this specific gate (see the 2026-08 audit: 0/2513 points
+    across the 6-cell working set), so this panel is a CONSTRUCTED example
+    illustrating what the gate is for, not an observed case.
+    """
+    rng = np.random.default_rng(11)
+    mean_short, sd_short, mean_long, sd_long = 10.0, 0.5, 20.0, 2.0
+    tail_frac, tail_mean, tail_sd = 0.1, 55.0, 6.0
+    n_bursts, spikes_per_burst = 60, 3
+    seq = []
+    for _ in range(n_bursts):
+        for _ in range(spikes_per_burst - 1):
+            seq.append(max(1.0, rng.normal(mean_short, sd_short)))
+        if rng.random() < tail_frac:
+            seq.append(max(1.0, rng.normal(tail_mean, tail_sd)))
+        else:
+            seq.append(max(1.0, rng.normal(mean_long, sd_long)))
+    isis_ms = np.array(seq[:-1])
+    return isis_ms, len(isis_ms) + 1
+
+
+def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> plt.Figure:
+    """Dedicated teaching figure for the log-ISI bimodality test underlying
+    ALL burst/tonic classification in this pipeline: for each row, the raw
+    voltage trace with detected spikes marked (so within-burst vs. between-
+    burst gaps are visible as literal time gaps, not just abstract ISI
+    numbers), the ISI-vs-spike-index sequence, and the log-ISI KDE panel
+    with the short (within-burst) and long (between-burst) ISI populations
+    explicitly labeled and Ashman's D annotated against its threshold.
+
+    real_exemplars: list of (held_nA, injected_nA, tag) for real, resimulated
+    XB2IQX points. A fourth, CONSTRUCTED row (see
+    _synthetic_ashman_d_near_miss) is always appended, since no real point
+    in this project's data has ever needed the Ashman's D gate specifically
+    to reject it (confirmed by direct audit, 2026-08) -- shown clearly
+    labeled as synthetic rather than omitted, so the gate's purpose is still
+    demonstrated even though it has been inert on real data so far.
+    """
+    n_rows = len(real_exemplars) + 1
+    fig, axes = plt.subplots(n_rows, 3, figsize=(16, 4.6 * n_rows))
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
+    captions = []
+    for row, (held_nA, injected_nA, tag) in zip(axes, real_exemplars):
+        ax_v, ax_isi, ax_kde = row
+        tr = resim(held_nA, injected_nA)
+        t, v = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
+        mark_spikes(ax_v, t, v)
+        ax_v.plot(t, v, color="black", lw=0.6)
+        ax_v.set_title(f"{tag}: held={held_nA:.2f} inj={injected_nA:.2f}", fontsize=9)
+        ax_v.set_xlabel("time (ms)")
+        ax_v.set_ylabel("V (mV)")
+        result, caption = mark_isi_classification(
+            ax_isi, ax_kde, t, v, run_args["min_isis_for_burst_test"],
+            run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
+            min_ashman_d=run_args.get("min_ashman_d", 2.0))
+        ax_isi.set_title(f"ISI sequence -> '{result['pattern']}'", fontsize=9)
+        captions.append((ax_isi, f"[REAL, resimulated] {caption}"))
+
+    ax_v, ax_isi, ax_kde = axes[-1]
+    ax_v.axis("off")
+    ax_v.text(0.5, 0.5, "CONSTRUCTED example\n(no simulated voltage trace --\nhand-built ISI sequence)",
+             ha="center", va="center", fontsize=9, style="italic", color="dimgray",
+             transform=ax_v.transAxes, wrap=True)
+    isis_ms, n_peaks = _synthetic_ashman_d_near_miss()
+    result, caption = mark_isi_classification(
+        ax_isi, ax_kde, None, None, run_args["min_isis_for_burst_test"],
+        run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
+        min_ashman_d=run_args.get("min_ashman_d", 2.0), isis_override=isis_ms, n_peaks_override=n_peaks)
+    ax_isi.set_title(f"ISI sequence -> '{result['pattern']}'", fontsize=9)
+    captions.append((ax_isi, f"[CONSTRUCTED, not an observed {cell_id} point -- same generator as "
+                    f"tests/test_burst_detection.py's Ashman's D boundary test] {caption}"))
+
+    fig.suptitle("12. Bimodality test: within-burst vs. between-burst ISIs", fontsize=13, weight="bold")
+    # Both hspace and _place_caption_below's gap are figure-fraction
+    # quantities, not per-row -- a gap tuned for a 2-row page (see
+    # make_burst_classification_page) eats a much bigger slice of a single
+    # row's vertical budget here with 4 rows, which is what caused captions
+    # to collide with the NEXT row's title before this was tuned down.
+    fig.tight_layout(rect=(0, 0.07, 1, 0.96))
+    fig.subplots_adjust(hspace=1.5)
+    for ax_isi, caption in captions:
+        _place_caption_below(fig, ax_isi, caption, width=95, gap=0.045)
     return fig
 
 
@@ -672,6 +768,14 @@ def build_packet(cell_id: str, args) -> None:
     # resimulated vs. 9.51 cached).
     onset_exemplars = [(-2.479592, -4.040816, "burst then ceased"),
                        (-3.765306, -3.367347, "burst then sustained")]
+    # Reuses burst_exemplars' two real points (confidently bursting, D=6.33;
+    # and the ratio-gate near-miss, correctly rejected as tonic before D is
+    # ever computed) plus a real confidently-tonic point -- picked 2026-08
+    # for a clean, non-adapting, high-spike-count train (n_isis=230,
+    # adaptation_ratio=1.00) so its single dominant ISI mode is unambiguous.
+    bimodality_exemplars = [(-3.21429, -3.363838, "confidently bursting"),
+                            (-0.091837, -0.112245, "confidently tonic"),
+                            (-2.892861, -2.958704, "ratio-gate near-miss (rejected as tonic)")]
 
     sections = [
         ("Representative traces", "One trace per distinct pattern/rebound combination actually "
@@ -687,6 +791,9 @@ def build_packet(cell_id: str, args) -> None:
         ("Self-consistency check", "Resimulated vs. cached classification match rate."),
         ("Burst-onset-then-silence detection", "Onset-burst detection and the adaptation-ratio "
          "ceased-firing gate, contrasted against a burst-onset that keeps firing."),
+        ("Bimodality test", "Voltage trace, ISI sequence, and log-ISI KDE evidence for the within-burst "
+         "vs. between-burst ISI split underlying every burst/tonic call, including the Ashman's D "
+         "separation gate."),
     ]
 
     outdir = Path(args.figures_dir)
@@ -733,6 +840,9 @@ def build_packet(cell_id: str, args) -> None:
             "cached test_pattern/rebound_pattern vs. fresh resimulate_point() results")
         save(make_onset_burst_page(cell_id, onset_exemplars, resim, run_args), "11_onset_burst_detection",
             "resimulate_point() -> run_held_injected_grid.detect_onset_burst()")
+        save(make_bimodality_teaching_page(cell_id, bimodality_exemplars, resim, run_args),
+            "12_bimodality_test", "resimulate_point() -> find_silencing_threshold.classify_burst_pattern() "
+            "(4th row: constructed synthetic ISIs, no resimulation)")
 
     print(f"{cell_id}: wrote {pdf_path} and {len(sections) + 1} section PNGs to {png_dir}/")
 

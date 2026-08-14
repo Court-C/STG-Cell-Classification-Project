@@ -240,7 +240,8 @@ def detect_spikes_dvdt_confirmed(v: np.ndarray, t_ms: np.ndarray, dt_ms: float,
 
 def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
                           isi_mode_prominence_frac: float, min_isi_ratio: float = 1.5,
-                          min_spikes_per_burst: float = 1.5, n_peaks: int = None) -> dict:
+                          min_spikes_per_burst: float = 1.5, min_ashman_d: float = 2.0,
+                          n_peaks: int = None) -> dict:
     """Log-ISI bimodality test. A tonically firing cell has one dominant
     inter-spike interval (log(ISI) density is unimodal); a burster has two
     -- a short mode (intra-burst ISI) and a long mode (the gap from the last
@@ -257,6 +258,13 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
     even one interval needs 2 spikes). n_peaks=None keeps the old
     "insufficient_data" label for call sites that don't have a spike count
     handy.
+
+    Four gates must all pass before a candidate short/long ISI split is
+    accepted as "bursting": enough ISIs to run the test at all, the ratio
+    gate (min_isi_ratio), the spikes-per-burst gate (min_spikes_per_burst),
+    and finally the Ashman's D gate (min_ashman_d) -- see the comment at its
+    computation below for why a fourth, purely statistical separation check
+    is needed on top of the first three.
 
     Every return also carries a "diagnostics" key -- None wherever no KDE
     was ever evaluated (too few ISIs, degenerate/trivial ISI spread, or a
@@ -377,19 +385,38 @@ def classify_burst_pattern(isis_ms: np.ndarray, min_isis_for_burst_test: int,
                 "isi_long_ms": None, "n_isis": n, "bimodality_metric": 0.0,
                 "n_long_isis": None, "diagnostics": diagnostics}
 
-    # Ashman's D: separation of two Gaussians in units of pooled SD. D > 2 is
-    # a common rule of thumb for "cleanly" bimodal -- stored for transparency,
-    # not used to gate the pattern label itself (the checks above already did).
+    # Ashman's D: separation of two Gaussians in units of pooled SD --
+    # D = |mean_long - mean_short| / sqrt((sd_short^2 + sd_long^2) / 2).
+    # D >= 2 is the classical mixture-modeling threshold for declaring two
+    # components "cleanly" separated (Ashman, Bird & Zepf 1994; the log-ISI
+    # valley-split approach this whole function implements is itself the
+    # field-standard substrate for burst/tonic classification, e.g. Selinger
+    # et al. 2007's void parameter / Pasquale et al. 2010's LogISI method,
+    # ranked #2 of 8 methods in Cotterill et al. 2016's ground-truth
+    # comparison). The three gates above catch specific known false-positive
+    # SHAPES (quantization-noise pseudo-modes a timestep apart; a minority of
+    # stray short ISIs scattered through an otherwise-uniform train, e.g.
+    # VC08B6) but none of them measure whether the two candidate clusters
+    # are actually well-separated POPULATIONS rather than overlapping ones --
+    # a short cluster with heavy internal spread can pass both the ratio and
+    # count checks while still bleeding into the long cluster's range. This
+    # gate was inert (computed but never compared to anything) until
+    # 2026-08-13; see tests/test_burst_detection.py for the synthetic
+    # high-variance case it's specifically meant to catch.
     s_short, s_long = np.std(isis_ms[short_mask]), np.std(isis_ms[long_mask])
     pooled = np.sqrt((s_short ** 2 + s_long ** 2) / 2.0)
     ashman_d = abs(isi_long_ms - isi_short_ms) / pooled if pooled > 0 else float("inf")
+    diagnostics["ashman_d"] = float(ashman_d)
+    if ashman_d < min_ashman_d:
+        return {"pattern": "tonic", "isi_short_ms": float(np.median(isis_ms)),
+                "isi_long_ms": None, "n_isis": n, "bimodality_metric": float(ashman_d),
+                "n_long_isis": None, "diagnostics": diagnostics}
 
     # n_long_isis (the count of inter-burst gaps) lets a caller segment the
     # spike train into discrete bursts without redoing this KDE split: a
     # "burst" is a maximal run of consecutive short ISIs, so there are
     # exactly n_long_isis + 1 bursts, and (n_isis + 1) / (n_long_isis + 1)
     # is the average spikes-per-burst (see run_held_injected_grid.py).
-    diagnostics["ashman_d"] = float(ashman_d)
     return {"pattern": "bursting", "isi_short_ms": isi_short_ms,
             "isi_long_ms": isi_long_ms, "n_isis": n, "bimodality_metric": float(ashman_d),
             "n_long_isis": int(long_mask.sum()), "diagnostics": diagnostics}
