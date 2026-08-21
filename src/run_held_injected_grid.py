@@ -1367,8 +1367,14 @@ def draw_parameter_panel(ax, cell_result: dict, features: dict, parameter_key: s
     plot_parameter_trace.py / plot_held_slice.py (draw one, by key).
     """
     spec = PARAMETER_PANELS_BY_KEY[parameter_key]
-    held_levels = list(cell_result["held_levels_nA"])
-    injected_levels = list(cell_result["injected_levels_nA"])
+    # cell_result's held_levels_nA/injected_levels_nA run 0 -> floor
+    # (descending numerically, since floor < 0) by construction
+    # (build_uniform_grid). Reversed to ascending (floor -> 0) here so the
+    # more negative values sit at the left/bottom of the heatmap and 0 sits
+    # at the right/top -- the standard Cartesian convention -- rather than
+    # the other way around (user-flagged 2026-08-21 as unintuitive).
+    held_levels = list(cell_result["held_levels_nA"])[::-1]
+    injected_levels = list(cell_result["injected_levels_nA"])[::-1]
     extent = (held_levels[0], held_levels[-1], injected_levels[0], injected_levels[-1])
     value_map = spec["value_map_fn"](cell_result, features)
     if spec["kind"] == "categorical":
@@ -1410,14 +1416,10 @@ def build_cell_grid_features_fig(cell_result: dict, features: dict, bottom_margi
     if cell_result["status"] != "ok" or not cell_result["grid"] or features.get("status") != "ok":
         return None
 
-    # held_levels/injected_levels (used inside draw_parameter_panel for each
-    # panel's extent) run 0 -> floor (descending numerically, since floor <
-    # 0) by construction (build_uniform_grid) -- rendered directly as (left,
-    # right)/(bottom, top) this gives a "reversed" extent (left > right,
-    # bottom > top numerically) that matplotlib renders correctly (0 at the
-    # outer edge, floor at the inner edge, matching every other
-    # current-injection figure in this project) with no separate
-    # invert_xaxis()/invert_yaxis() step needed.
+    # held_levels/injected_levels/extent (see draw_parameter_panel) are
+    # oriented ascending (floor -> 0) so every panel below reads negative
+    # values left/bottom, 0 at right/top -- the standard Cartesian
+    # convention.
     fig, axes = plt.subplots(4, 4, figsize=(19, 16))
     for ax in (axes[0, 2], axes[0, 3]):
         ax.axis("off")
