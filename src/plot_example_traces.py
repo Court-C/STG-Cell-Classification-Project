@@ -233,9 +233,11 @@ def build_example_trace_figure(cell_id: str, held_nA: float, injected_nA: float,
     ax_v.set_title(f"{cell_id}: {describe_pattern(test_pattern)} during the current step, then "
                    f"{describe_pattern(rebound_pattern)}", fontsize=9)
 
-    ax_i.plot(t_hold, np.full_like(t_hold, held_nA), color="gray", lw=1.2)
-    ax_i.plot(t_test_off, np.full_like(t_test_off, injected_nA), color="firebrick", lw=1.2)
-    ax_i.plot(t_rec_off, np.full_like(t_rec_off, held_nA), color="steelblue", lw=1.2)
+    t_current = np.concatenate([t_hold, t_test_off, t_rec_off])
+    i_current = np.concatenate([np.full_like(t_hold, held_nA),
+                                np.full_like(t_test_off, injected_nA),
+                                np.full_like(t_rec_off, held_nA)])
+    ax_i.plot(t_current, i_current, color="black", lw=1.2)
     ax_i.set_ylabel("applied current (nA)")
     ax_i.set_xlabel("time (ms)")
 
