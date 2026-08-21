@@ -1,12 +1,24 @@
 """Helpers for loading and retrieving cached steady-state cell initial conditions."""
 
 import gzip
+import pathlib
 import pickle
+import platform
 import re
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+# Some committed caches (e.g. cell_held_injected_grid.pkl) were pickled on
+# Windows and embed WindowsPath instances (e.g. inside run_args), which
+# pickle.load refuses to reconstruct on macOS/Linux ("cannot instantiate
+# WindowsPath on your system"). Every cache-reading script imports this
+# module before unpickling anything, so aliasing WindowsPath to PosixPath
+# here -- the standard cross-platform-unpickling workaround -- covers all
+# of them in one place rather than patching each pickle.load call.
+if platform.system() != "Windows":
+    pathlib.WindowsPath = pathlib.PosixPath
 
 PARAMS_DIR = Path(__file__).resolve().parent / "models"
 CACHE_PATH = Path(__file__).resolve().parent.parent / "cell_steady_states.pkl"

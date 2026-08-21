@@ -202,13 +202,13 @@ def resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA, cell_
     return tr
 
 
-def build_example_trace_figure(cell_id: str, held_nA: float, injected_nA: float,
-                               test_pattern: str, rebound_pattern: str, tr: dict) -> plt.Figure:
-    """The actual figure-building logic, split out from plot_example_trace
-    so a caller that wants the Figure object itself (e.g.
-    generate_validation_packet.py, to embed this exact rendering as a packet
-    page instead of a standalone file) doesn't have to save-then-reopen a
-    file to get it.
+def _draw_trace_axes(ax_v, ax_i, cell_id: str, held_nA: float, injected_nA: float,
+                     test_pattern: str, rebound_pattern: str, tr: dict) -> None:
+    """Draws the V(t)/I(t) trace into a caller-supplied pair of axes --
+    split out of build_example_trace_figure so a second caller that builds
+    its own combined figure (e.g. plot_parameter_trace.py, which puts this
+    next to a heatmap panel rather than alone) can reuse the exact same
+    drawing code instead of a second copy that could drift out of sync.
     """
     t_hold, v_hold = tr["_trace_t_hold_ms"], tr["_trace_v_hold_mV"]
     t_test, v_test = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
@@ -220,8 +220,6 @@ def build_example_trace_figure(cell_id: str, held_nA: float, injected_nA: float,
     test_end = t_test_off[-1] + dt_ms if len(t_test_off) else hold_end
     t_rec_off = t_rec + test_end
 
-    fig, (ax_v, ax_i) = plt.subplots(2, 1, figsize=(10, 5), sharex=True,
-                                     gridspec_kw={"height_ratios": [3, 1]})
     ax_v.plot(t_hold, v_hold, color="gray", lw=0.8, label=f"holding current ({held_nA:.2f} nA)")
     ax_v.plot(t_test_off, v_test, color="firebrick", lw=0.8, label=f"current step ({injected_nA:.2f} nA)")
     ax_v.plot(t_rec_off, v_rec, color="steelblue", lw=0.8,
@@ -239,6 +237,16 @@ def build_example_trace_figure(cell_id: str, held_nA: float, injected_nA: float,
     ax_i.set_ylabel("applied current (nA)")
     ax_i.set_xlabel("time (ms)")
 
+
+def build_example_trace_figure(cell_id: str, held_nA: float, injected_nA: float,
+                               test_pattern: str, rebound_pattern: str, tr: dict) -> plt.Figure:
+    """The actual figure-building logic, split out from plot_example_trace
+    so a caller that wants the Figure object itself doesn't have to
+    save-then-reopen a file to get it.
+    """
+    fig, (ax_v, ax_i) = plt.subplots(2, 1, figsize=(10, 5), sharex=True,
+                                     gridspec_kw={"height_ratios": [3, 1]})
+    _draw_trace_axes(ax_v, ax_i, cell_id, held_nA, injected_nA, test_pattern, rebound_pattern, tr)
     fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
     return fig
 

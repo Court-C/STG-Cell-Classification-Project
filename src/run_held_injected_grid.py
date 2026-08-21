@@ -1205,6 +1205,73 @@ NO_DATA_COLOR = (1.0, 1.0, 1.0, 1.0)  # plain white: a pixel with nothing to rep
 # "nothing happened here" (user-flagged 2026-08-14).
 
 
+def _test_pattern_map(cell_result: dict, features: dict) -> dict:
+    pattern_names = list(PATTERN_COLORS.keys())
+    return {(p["held_nA"], p["injected_nA"]): pattern_names.index(p["test_pattern"] or "silent")
+            for p in cell_result["grid"].values()}
+
+
+def _rebound_pattern_map(cell_result: dict, features: dict) -> dict:
+    rp_names = list(REBOUND_PATTERN_COLORS.keys())
+    return {k: rp_names.index(v) for k, v in (features.get("rebound_pattern_map") or {}).items()}
+
+
+def _spikes_per_burst_map(cell_result: dict, features: dict) -> dict:
+    return {(p["held_nA"], p["injected_nA"]): p["test_spikes_per_burst"]
+           for p in cell_result["grid"].values() if p["test_pattern"] == "bursting"}
+
+
+def _iH_map(cell_result: dict, features: dict) -> dict:
+    # See build_cell_grid_features_fig's original inline comment (still
+    # applies): restricted to test_pattern == "silent" -- for a point that
+    # kept firing during the test window, argmin(v_rec) can land on an
+    # ongoing spike's AHP trough instead of a genuine PIR trough, confirmed
+    # directly on a real 9GBDEX point (held=-0.8, inj=-4.71).
+    return {(p["held_nA"], p["injected_nA"]): p["rebound_peak_iH_nA"]
+           for p in cell_result["grid"].values()
+           if p["rebound_peak_iH_nA"] is not None and p["test_pattern"] == "silent"}
+
+
+# One entry per grid-features heatmap panel, in the same order/grouping
+# build_cell_grid_features_fig lays them out in (classification overview /
+# rate-timing / rebound / passive-other). `key` is the stable CLI-facing name
+# used by plot_parameter_trace.py's and plot_held_slice.py's --parameter.
+# Shared by build_cell_grid_features_fig (renders all 14 via
+# draw_parameter_panel) and both of those scripts (render one, looked up by
+# key) so a panel's rendering can never drift between call sites.
+PARAMETER_PANELS = [
+    dict(key="test_pattern", title="test-window firing pattern", kind="categorical",
+        value_map_fn=_test_pattern_map, colors=PATTERN_COLORS, blank_labels=frozenset()),
+    dict(key="rebound_pattern", title="rebound pattern", kind="categorical",
+        value_map_fn=_rebound_pattern_map, colors=REBOUND_PATTERN_COLORS, blank_labels=REBOUND_BLANK_LABELS),
+    dict(key="firing_rate", title="test-window firing rate", kind="map", cmap="viridis", label="Hz",
+        value_map_fn=lambda cr, f: f.get("firing_rate_map") or {}),
+    dict(key="intra_burst_rate", title="intra-burst rate", kind="map", cmap="cividis", label="Hz",
+        value_map_fn=lambda cr, f: f.get("intra_burst_rate_map") or {}),
+    dict(key="burst_freq_approx", title="burst freq, approx", kind="map", cmap="cividis", label="Hz",
+        value_map_fn=lambda cr, f: f.get("burst_freq_approx_map") or {}),
+    dict(key="n_bursts", title="n bursts", kind="map", cmap="plasma", label="count",
+        value_map_fn=lambda cr, f: f.get("n_bursts_map") or {}),
+    dict(key="rebound_occurred", title="rebound occurred", kind="map", cmap="Oranges", label="fraction",
+        value_map_fn=lambda cr, f: f.get("rebound_occurred_map") or {}),
+    dict(key="rebound_count", title="rebound spike count", kind="map", cmap="YlOrBr", label="spike count",
+        value_map_fn=lambda cr, f: f.get("rebound_count_map") or {}),
+    dict(key="rebound_latency", title="rebound latency", kind="map", cmap="viridis", label="ms",
+        value_map_fn=lambda cr, f: f.get("rebound_latency_map") or {}),
+    dict(key="rebound_peak_mV", title="rebound peak", kind="map", cmap="magma", label="mV",
+        value_map_fn=lambda cr, f: f.get("rebound_peak_mV_map") or {}),
+    dict(key="sag_depth", title="sag depth", kind="map", cmap="YlGnBu", label="mV",
+        value_map_fn=lambda cr, f: f.get("sag_depth_map") or {}),
+    dict(key="adaptation_ratio", title="adaptation ratio (tonic)", kind="map", cmap="plasma", label="ratio",
+        value_map_fn=lambda cr, f: f.get("adaptation_ratio_map") or {}),
+    dict(key="spikes_per_burst", title="spikes per burst (bursting only)", kind="map", cmap="plasma",
+        label="spikes/burst", value_map_fn=_spikes_per_burst_map),
+    dict(key="iH_recovery_trough", title="i_H at recovery trough (silenced only)", kind="map", cmap="magma",
+        label="nA", value_map_fn=_iH_map),
+]
+PARAMETER_PANELS_BY_KEY = {spec["key"]: spec for spec in PARAMETER_PANELS}
+
+
 def _exact_grid_matrix(value_map: dict, held_levels, injected_levels) -> np.ndarray:
     """Builds an exact (n_injected, n_held) matrix directly from a
     {(held_nA, injected_nA): value} mapping and this cell's own uniform
@@ -1291,6 +1358,28 @@ def _panel_categorical(ax, value_map, held_levels, injected_levels, extent, colo
     ax.legend(handles=handles, loc="best", fontsize=6)
 
 
+def draw_parameter_panel(ax, cell_result: dict, features: dict, parameter_key: str) -> dict:
+    """Renders one PARAMETER_PANELS entry into `ax` -- heatmap or
+    categorical, exactly matching build_cell_grid_features_fig's own
+    per-panel rendering -- and returns its value_map, so a caller can look
+    up a specific point's or row's actual value after drawing. Shared by
+    build_cell_grid_features_fig (loops over all 14) and
+    plot_parameter_trace.py / plot_held_slice.py (draw one, by key).
+    """
+    spec = PARAMETER_PANELS_BY_KEY[parameter_key]
+    held_levels = list(cell_result["held_levels_nA"])
+    injected_levels = list(cell_result["injected_levels_nA"])
+    extent = (held_levels[0], held_levels[-1], injected_levels[0], injected_levels[-1])
+    value_map = spec["value_map_fn"](cell_result, features)
+    if spec["kind"] == "categorical":
+        _panel_categorical(ax, value_map, held_levels, injected_levels, extent,
+                           spec["colors"], spec["title"], blank_labels=spec["blank_labels"])
+    else:
+        _panel_map(ax, value_map, held_levels, injected_levels, extent,
+                  spec["cmap"], spec["label"], spec["title"])
+    return value_map
+
+
 def build_cell_grid_features_fig(cell_result: dict, features: dict, bottom_margin: float = 0.025):
     """Builds the 14-panel grid-features figure and returns it WITHOUT a
     suptitle, footer, or save/close -- split out of plot_cell_grid_features
@@ -1320,84 +1409,31 @@ def build_cell_grid_features_fig(cell_result: dict, features: dict, bottom_margi
     """
     if cell_result["status"] != "ok" or not cell_result["grid"] or features.get("status") != "ok":
         return None
-    cell_id = cell_result["cell_id"]
-    grid = cell_result["grid"]
-    held_levels = list(cell_result["held_levels_nA"])
-    injected_levels = list(cell_result["injected_levels_nA"])
-    # held_levels/injected_levels run 0 -> floor (descending numerically,
-    # since floor < 0) by construction (build_uniform_grid). Using them
-    # directly as (left, right)/(bottom, top) gives a "reversed" extent
-    # (left > right, bottom > top numerically) that matplotlib renders
-    # correctly (0 at the outer edge, floor at the inner edge, matching
-    # every other current-injection figure in this project) with no
-    # separate invert_xaxis()/invert_yaxis() step needed.
-    extent = (held_levels[0], held_levels[-1], injected_levels[0], injected_levels[-1])
 
+    # held_levels/injected_levels (used inside draw_parameter_panel for each
+    # panel's extent) run 0 -> floor (descending numerically, since floor <
+    # 0) by construction (build_uniform_grid) -- rendered directly as (left,
+    # right)/(bottom, top) this gives a "reversed" extent (left > right,
+    # bottom > top numerically) that matplotlib renders correctly (0 at the
+    # outer edge, floor at the inner edge, matching every other
+    # current-injection figure in this project) with no separate
+    # invert_xaxis()/invert_yaxis() step needed.
     fig, axes = plt.subplots(4, 4, figsize=(19, 16))
     for ax in (axes[0, 2], axes[0, 3]):
         ax.axis("off")
 
-    # Row 0 -- classification overview (2 categorical panels).
-    pattern_names = list(PATTERN_COLORS.keys())
-    pattern_map = {(p["held_nA"], p["injected_nA"]): pattern_names.index(p["test_pattern"] or "silent")
-                  for p in grid.values()}
-    _panel_categorical(axes[0, 0], pattern_map, held_levels, injected_levels, extent,
-                       PATTERN_COLORS, "test-window firing pattern")
-
-    rebound_pattern_map = features.get("rebound_pattern_map") or {}
-    rp_names = list(REBOUND_PATTERN_COLORS.keys())
-    rp_codes = {k: rp_names.index(v) for k, v in rebound_pattern_map.items()}
-    _panel_categorical(axes[0, 1], rp_codes, held_levels, injected_levels, extent,
-                       REBOUND_PATTERN_COLORS, "rebound pattern", blank_labels=REBOUND_BLANK_LABELS)
-
-    # Row 1 -- rate/timing (4). firing_rate_map reconciled to the more
-    # permissive definition (see docstring): includes silent points at
-    # their real 0.0 Hz rather than NaN-ing them out.
-    _panel_map(axes[1, 0], features.get("firing_rate_map") or {}, held_levels, injected_levels,
-              extent, "viridis", "Hz", "test-window firing rate")
-    _panel_map(axes[1, 1], features.get("intra_burst_rate_map") or {}, held_levels, injected_levels,
-              extent, "cividis", "Hz", "intra-burst rate")
-    _panel_map(axes[1, 2], features.get("burst_freq_approx_map") or {}, held_levels, injected_levels,
-              extent, "cividis", "Hz", "burst freq, approx")
-    _panel_map(axes[1, 3], features.get("n_bursts_map") or {}, held_levels, injected_levels,
-              extent, "plasma", "count", "n bursts")
-
-    # Row 2 -- rebound (4).
-    _panel_map(axes[2, 0], features.get("rebound_occurred_map") or {}, held_levels, injected_levels,
-              extent, "Oranges", "fraction", "rebound occurred")
-    _panel_map(axes[2, 1], features.get("rebound_count_map") or {}, held_levels, injected_levels,
-              extent, "YlOrBr", "spike count", "rebound spike count")
-    _panel_map(axes[2, 2], features.get("rebound_latency_map") or {}, held_levels, injected_levels,
-              extent, "viridis", "ms", "rebound latency")
-    _panel_map(axes[2, 3], features.get("rebound_peak_mV_map") or {}, held_levels, injected_levels,
-              extent, "magma", "mV", "rebound peak")
-
-    # Row 3 -- passive/other (4).
-    _panel_map(axes[3, 0], features.get("sag_depth_map") or {}, held_levels, injected_levels,
-              extent, "YlGnBu", "mV", "sag depth")
-    _panel_map(axes[3, 1], features.get("adaptation_ratio_map") or {}, held_levels, injected_levels,
-              extent, "plasma", "ratio", "adaptation ratio (tonic)")
-
-    spb_map = {(p["held_nA"], p["injected_nA"]): p["test_spikes_per_burst"]
-              for p in grid.values() if p["test_pattern"] == "bursting"}
-    _panel_map(axes[3, 2], spb_map, held_levels, injected_levels, extent, "plasma", "spikes/burst",
-              "spikes per burst (bursting only)")
-
-    # trough_idx = argmin(v_rec) (see run_test_and_recovery) is only a
-    # genuine post-inhibitory-rebound trough when the cell was actually
-    # silenced during the test window -- rebound_applicable/test_suppressed
-    # alone isn't strict enough (it allows a still-firing "tonic" test
-    # window as long as its rate dropped enough), so for a point that kept
-    # firing, argmin(v_rec) can land on an arbitrary ongoing spike's AHP
-    # trough instead, contaminating the value with spike-phase noise.
-    # Confirmed directly on a real 9GBDEX point (held=-0.8, inj=-4.71):
-    # reports iH=-6.1 nA against a neighbor median of -2.0 nA, test_pattern
-    # there is "tonic" not "silent".
-    iH_map = {(p["held_nA"], p["injected_nA"]): p["rebound_peak_iH_nA"]
-             for p in grid.values()
-             if p["rebound_peak_iH_nA"] is not None and p["test_pattern"] == "silent"}
-    _panel_map(axes[3, 3], iH_map, held_levels, injected_levels, extent, "magma", "nA",
-              "i_H at recovery trough (silenced only)")
+    # Panel grid positions in PARAMETER_PANELS order: row 0 has only 2
+    # (classification overview, categorical), the other 2 slots in that row
+    # are blank (turned off above); rows 1-3 are full (rate/timing, rebound,
+    # passive/other, 4 panels each). firing_rate_map (row 1, first) is
+    # reconciled to the more permissive definition: includes silent points
+    # at their real 0.0 Hz rather than NaN-ing them out.
+    panel_axes = [axes[0, 0], axes[0, 1],
+                 axes[1, 0], axes[1, 1], axes[1, 2], axes[1, 3],
+                 axes[2, 0], axes[2, 1], axes[2, 2], axes[2, 3],
+                 axes[3, 0], axes[3, 1], axes[3, 2], axes[3, 3]]
+    for ax, spec in zip(panel_axes, PARAMETER_PANELS):
+        draw_parameter_panel(ax, cell_result, features, spec["key"])
 
     for ax in axes.flat:
         if not ax.axison:

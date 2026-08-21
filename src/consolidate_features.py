@@ -35,8 +35,6 @@ from steady_state_cache import CACHE_PATH as DEFAULT_STEADY_STATE_CACHE_PATH
 DEFAULT_TRACK_A_PATH = ROOT_DIR / "track_a_features.csv"
 DEFAULT_SILENCING_CACHE_PATH = ROOT_DIR / "cell_silencing_thresholds.pkl"
 DEFAULT_GRID_FEATURES_CACHE_PATH = ROOT_DIR / "cell_grid_features.pkl"
-DEFAULT_PRC_CACHE_PATH = ROOT_DIR / "cell_prc.pkl"
-DEFAULT_ENTRAINMENT_CACHE_PATH = ROOT_DIR / "cell_entrainment_validation.pkl"
 DEFAULT_OUTPUT_CSV_PATH = ROOT_DIR / "master_features.csv"
 DEFAULT_PCA_OUTPUT_PATH = ROOT_DIR / "master_features_pca.pkl"
 DEFAULT_PCA_LOADINGS_CSV_PATH = ROOT_DIR / "master_features_pca_loadings.csv"
@@ -160,83 +158,22 @@ def extract_grid_scalar_features(cache_path: Path) -> pd.DataFrame:
     return pd.DataFrame.from_dict(rows, orient="index")
 
 
-def extract_prc_features(cache_path: Path) -> pd.DataFrame:
-    """Step 5 (PRC) scalars, plus two derived boolean columns so the
-    underlying string categories (prc_type, baseline_pattern) get a
-    numeric-dtype representation that flows into cluster_features.py's
-    "behavioral" feature pool automatically -- is_numeric_dtype excludes
-    plain strings there (same as the existing silencing_status column),
-    but not booleans.
-
-    baseline_freq_hz and natural_period_ms are NOT pulled through as a
-    second copy -- baseline_freq_hz already exists from extract_steady_
-    state_features (a different spike-detection pass over the same Iapp=0
-    condition); including this script's independent re-derivation under
-    the same name would collide in table.join(), and under a different
-    name would just be a near-duplicate. natural_period_ms IS kept here
-    (see extract_entrainment_features's docstring for why it's dropped
-    from the other side of this pair instead).
-    """
-    with open(cache_path, "rb") as f:
-        cache = pickle.load(f)
-    rows = {}
-    for cell_id, entry in cache.items():
-        if entry.get("status") != "ok":
-            continue
-        rows[cell_id] = {
-            "prc_type": entry["prc_type"],
-            "n_zero_crossings": entry["n_zero_crossings"],
-            "natural_period_ms": entry["natural_period_ms"],
-            "baseline_pattern": entry["baseline_pattern"],
-            "is_bursting_baseline": entry["baseline_pattern"] == "bursting",
-            "prc_biphasic": entry["prc_type"] == "biphasic",
-        }
-    return pd.DataFrame.from_dict(rows, orient="index")
-
-
-def extract_entrainment_features(cache_path: Path) -> pd.DataFrame:
-    """Step 6 (entrainment validation) scalars. baseline_pattern and
-    natural_period_ms are deliberately OMITTED here -- confirmed identical
-    to cell_prc.pkl's copies for all 69 cells (both scripts re-derive them
-    independently via the same characterize_baseline function, by design;
-    see run_entrainment_protocol.py's module docstring), so keeping both
-    copies would either collide in table.join() (same name) or just
-    duplicate a column under a different one. extract_prc_features is the
-    canonical source for both.
-    """
-    with open(cache_path, "rb") as f:
-        cache = pickle.load(f)
-    rows = {}
-    for cell_id, entry in cache.items():
-        if entry.get("status") != "ok":
-            continue
-        rows[cell_id] = {
-            "observed_lock": entry["observed_lock"],
-            "observed_locked_phase": entry["observed_locked_phase"],
-            "observed_phase_spread": entry["observed_phase_spread"],
-        }
-    return pd.DataFrame.from_dict(rows, orient="index")
-
-
 # ---------------------------------------------------------------------------
 # Assembly + PCA
 # ---------------------------------------------------------------------------
 
 def build_master_table(track_a_path: Path, steady_state_cache_path: Path,
-                       silencing_cache_path: Path, grid_features_cache_path: Path,
-                       prc_cache_path: Path, entrainment_cache_path: Path) -> pd.DataFrame:
+                       silencing_cache_path: Path, grid_features_cache_path: Path) -> pd.DataFrame:
     track_a = load_track_a(track_a_path)
     ss = extract_steady_state_features(steady_state_cache_path)
     sil = extract_silencing_features(silencing_cache_path)
     grid = extract_grid_scalar_features(grid_features_cache_path)
-    prc = extract_prc_features(prc_cache_path)
-    entrainment = extract_entrainment_features(entrainment_cache_path)
 
     # Outer join on cell_id -- a cell missing from a later stage (e.g. the 3
     # shooting_failed cells with no steady-state/silencing/grid data at all)
     # still keeps its Track A row, just with NaN for everything downstream,
     # rather than being silently dropped from the table entirely.
-    table = track_a.join([ss, sil, grid, prc, entrainment], how="outer")
+    table = track_a.join([ss, sil, grid], how="outer")
     table.index.name = "cell_id"
     return table
 
@@ -345,8 +282,7 @@ def plot_feature_distributions(table: pd.DataFrame, outdir: Path, command: str, 
     bar instead, since "sorted by value" isn't meaningful for those.
     """
     outdir.mkdir(parents=True, exist_ok=True)
-    categorical_cols = ["silencing_status", "any_bursting_before_silence",
-                       "baseline_pattern", "prc_type"]
+    categorical_cols = ["silencing_status", "any_bursting_before_silence"]
 
     for col in table.columns:
         series = table[col]
@@ -387,8 +323,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steady-state-cache", default=DEFAULT_STEADY_STATE_CACHE_PATH)
     parser.add_argument("--silencing-cache", default=DEFAULT_SILENCING_CACHE_PATH)
     parser.add_argument("--grid-features-cache", default=DEFAULT_GRID_FEATURES_CACHE_PATH)
-    parser.add_argument("--prc-cache", default=DEFAULT_PRC_CACHE_PATH)
-    parser.add_argument("--entrainment-cache", default=DEFAULT_ENTRAINMENT_CACHE_PATH)
     parser.add_argument("--output-csv", default=DEFAULT_OUTPUT_CSV_PATH)
     parser.add_argument("--pca-output", default=DEFAULT_PCA_OUTPUT_PATH)
     parser.add_argument("--pca-loadings-csv", default=DEFAULT_PCA_LOADINGS_CSV_PATH,
@@ -411,8 +345,7 @@ def main() -> None:
     command = "python " + " ".join(sys.argv)
 
     table = build_master_table(Path(args.track_a_csv), Path(args.steady_state_cache),
-                               Path(args.silencing_cache), Path(args.grid_features_cache),
-                               Path(args.prc_cache), Path(args.entrainment_cache))
+                               Path(args.silencing_cache), Path(args.grid_features_cache))
     table.to_csv(args.output_csv)
     print(f"Master feature table: {table.shape[0]} cells x {table.shape[1]} columns "
           f"-> {args.output_csv}")
