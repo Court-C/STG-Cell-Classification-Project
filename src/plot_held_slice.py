@@ -63,6 +63,17 @@ def build_held_slice_figure(cell_id: str, cell_result: dict, features: dict, par
     fig, (ax_heat, ax_curve) = plt.subplots(1, 2, figsize=(15, 6), gridspec_kw={"width_ratios": [1, 1.3]})
     value_map = draw_parameter_panel(ax_heat, cell_result, features, parameter)
 
+    # draw_parameter_panel's imshow sets xlim to exactly the swept held
+    # range, so a reference line at either extreme (e.g. held=0, the
+    # control condition, which IS the range's own edge by construction)
+    # lands exactly on the axes frame and gets clipped away entirely rather
+    # than just being hard to see (confirmed directly: a held=0 axvline
+    # was invisible, not just faint, 2026-08-21). A small symmetric margin
+    # gives every reference line room to render fully inside the frame.
+    x0, x1 = ax_heat.get_xlim()
+    margin = 0.03 * abs(x1 - x0)
+    ax_heat.set_xlim(min(x0, x1) - margin, max(x0, x1) + margin)
+
     if spec["kind"] == "categorical":
         category_names = list(spec["colors"].keys())
         ax_curve.set_yticks(range(len(category_names)))

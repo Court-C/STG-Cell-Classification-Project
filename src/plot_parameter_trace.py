@@ -92,7 +92,14 @@ def draw_parameter_trace_panel(fig: plt.Figure, subplot_spec, cell_id: str, cell
     ax_heat.plot(held_nA, injected_nA, marker="x", color="red", markersize=12, markeredgewidth=2)
 
     value = value_map.get((held_nA, injected_nA))
-    value_str = f"{value:.3g}" if isinstance(value, (int, float)) else str(value)
+    if spec["kind"] == "categorical" and isinstance(value, (int, float)):
+        # value_map stores categorical panels as integer codes (see
+        # _test_pattern_map/_rebound_pattern_map) -- translate back to the
+        # category name for a human-readable title instead of e.g. "= 0".
+        category_names = list(spec["colors"].keys())
+        value_str = category_names[int(value)]
+    else:
+        value_str = f"{value:.3g}" if isinstance(value, (int, float)) else str(value)
     _draw_trace_axes(ax_v, ax_i, cell_id, held_nA, injected_nA,
                      point["test_pattern"], point["rebound_pattern"], tr)
     ax_v.set_title(f"{spec['title']} = {value_str} at held={held_nA:+.2f} nA, injected={injected_nA:+.2f} nA\n"

@@ -103,39 +103,109 @@ def _prominence_score(point: dict) -> float:
     return score
 
 
-def select_exemplar_points(grid: dict, require_held_lt_injected: bool = True) -> dict:
+def _prefer(pts: list, predicate) -> list:
+    """Restricts `pts` to those satisfying `predicate`, falling back to the
+    full pool if none do -- shared soft-preference pattern: apply a
+    preference, but never let it eliminate a category that has no point
+    satisfying it at all.
+    """
+    preferred = [(k, p) for k, p in pts if predicate(k, p)]
+    return preferred if preferred else pts
+
+
+def _pick_best(pts: list, score_fn, require_held_lt_injected: bool,
+               held_levels: list = None, injected_levels: list = None) -> tuple:
+    """Shared by select_exemplar_points and select_exemplar_by_category.
+    Applies two soft preferences (each falling back to the full pool if it
+    would eliminate every candidate), then picks the single (key, point)
+    scoring highest under score_fn among what's left:
+
+    1. Interior points (neither held_nA nor injected_nA at the swept grid's
+       own outer edge) over border points -- a marked point sitting exactly
+       on the heatmap's edge is easy to miss/misread (user-flagged
+       2026-08-21). Only applied when held_levels/injected_levels are given.
+    2. held_nA < injected_nA (the test window releases somewhat from the
+       held baseline, rather than deepening it) -- confirmed directly this
+       is where illustrative/interesting dynamics concentrate across a
+       randomly-sampled population; the opposite direction rarely shows
+       anything worth spotlighting.
+    """
+    pool = pts
+    if held_levels is not None and injected_levels is not None:
+        held_min, held_max = held_levels[0], held_levels[-1]
+        inj_min, inj_max = injected_levels[0], injected_levels[-1]
+        pool = _prefer(pool, lambda k, p: k[0] not in (held_min, held_max)
+                       and k[1] not in (inj_min, inj_max))
+    if require_held_lt_injected:
+        pool = _prefer(pool, lambda k, p: k[0] < k[1])
+    return sorted(pool, key=lambda kp: (-score_fn(kp[1]), kp[0]))[0]
+
+
+def select_exemplar_points(cell_result: dict, require_held_lt_injected: bool = True) -> dict:
     """One representative point per distinct (test_pattern, rebound_pattern)
     combination actually present in this cell's grid, chosen by
     _prominence_score to most clearly demonstrate that combination rather
     than an arbitrary or borderline point -- so the resulting trace
-    actually backs up its own label.
-
-    Restricted by default to held_nA < injected_nA (the test window
-    releases somewhat from the held baseline, rather than deepening it) --
-    confirmed directly this is where illustrative/interesting dynamics
-    concentrate across a randomly-sampled population; the opposite
-    direction rarely shows anything worth spotlighting. Falls back to the
-    full candidate set for any (pattern, rebound) combination that has NO
-    point at all satisfying that constraint, rather than silently losing
-    combinations that only occur on the other side.
+    actually backs up its own label. See select_exemplar_by_category for the
+    single-dimension version (one representative per test_pattern value
+    alone, or per rebound_pattern value alone, ignoring the other axis).
     """
+    grid = cell_result["grid"]
+    held_levels = list(cell_result["held_levels_nA"])
+    injected_levels = list(cell_result["injected_levels_nA"])
     candidates: dict = {}
     for key, point in grid.items():
         if point["blew_up"] or point["test_pattern"] is None:
             continue
         combo = (point["test_pattern"], point["rebound_pattern"])
         candidates.setdefault(combo, []).append((key, point))
+    return {combo: _pick_best(pts, _prominence_score, require_held_lt_injected, held_levels, injected_levels)
+           for combo, pts in candidates.items()}
 
-    selected = {}
-    for combo, pts in candidates.items():
-        if require_held_lt_injected:
-            filtered = [(k, p) for k, p in pts if k[0] < k[1]]
-            pool = filtered if filtered else pts
-        else:
-            pool = pts
-        pts_sorted = sorted(pool, key=lambda kp: (-_prominence_score(kp[1]), kp[0]))
-        selected[combo] = pts_sorted[0]
-    return selected
+
+def select_exemplar_by_category(cell_result: dict, category_of, score_of, exclude_categories: frozenset = frozenset(),
+                                require_held_lt_injected: bool = True) -> dict:
+    """One representative point per distinct value of category_of(point)
+    actually present in this cell's grid -- unlike select_exemplar_points
+    (which groups by the JOINT (test_pattern, rebound_pattern) combination),
+    this groups by a single dimension alone, for a page that showcases every
+    mode of ONE heatmap panel (e.g. every test_pattern value, or every
+    rebound_pattern value) rather than every combination of two.
+
+    exclude_categories drops values that mean "nothing to report" (e.g.
+    rebound_pattern's "none"/"not_applicable" -- matching
+    REBOUND_BLANK_LABELS, the same categories run_held_injected_grid.py's
+    _panel_categorical renders as blank rather than a real color) --
+    there's no trace that meaningfully demonstrates "no rebound happened."
+    category_of is responsible for its own applicability gating (e.g.
+    returning None for a point where rebound_pattern isn't meaningful) so
+    the category selected here always matches what the corresponding
+    heatmap panel's own value_map would show for that point.
+    """
+    grid = cell_result["grid"]
+    held_levels = list(cell_result["held_levels_nA"])
+    injected_levels = list(cell_result["injected_levels_nA"])
+    candidates: dict = {}
+    for key, point in grid.items():
+        if point["blew_up"]:
+            continue
+        category = category_of(point)
+        if category is None or category in exclude_categories:
+            continue
+        candidates.setdefault(category, []).append((key, point))
+    return {category: _pick_best(pts, score_of, require_held_lt_injected, held_levels, injected_levels)
+           for category, pts in candidates.items()}
+
+
+def rebound_prominence_score(point: dict) -> float:
+    """How clearly a point demonstrates its own rebound_pattern -- more
+    rebound spikes is more visibly demonstrative, mirroring
+    _prominence_score's logic for test_pattern but keyed on the rebound side
+    instead (test_pattern's own bimodality/adaptation-ratio criteria don't
+    apply here: a point's rebound_pattern is independent of what it did
+    during the test window itself).
+    """
+    return point.get("rebound_spike_count") or 0
 
 
 def resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA, cell_result, hold_tail_s,
@@ -324,7 +394,7 @@ def main() -> None:
             continue
         y_ss, baseline_freq_hz = ss_entry["y_ss"], ss_entry["freq_hz"]
 
-        exemplars = select_exemplar_points(cell_result["grid"],
+        exemplars = select_exemplar_points(cell_result,
                                            require_held_lt_injected=not args.allow_held_gt_injected)
         print(f"{cell_id}: {len(exemplars)} exemplar point(s)")
         for (test_pattern, rebound_pattern), (key, _point) in sorted(exemplars.items()):

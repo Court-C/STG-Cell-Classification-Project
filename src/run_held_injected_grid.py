@@ -872,6 +872,18 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
                                                                    PROMINENCE_FRACTION))
         peak_times_ms = t_rec[peaks]
 
+    # Recovery-window firing rate over the FULL window (unlike
+    # rebound_spike_count below, which only counts spikes past
+    # rebound_latency_min_ms -- excluding an early settling transient
+    # that's a genuine part of the window's own firing rate even if it
+    # isn't attributable to a rebound mechanism specifically). Reuses
+    # peak_times_ms rather than a second independent find_peaks call, but
+    # otherwise mirrors count_spikes_and_rate's own convention exactly
+    # (test_freq_hz's computation): <2 peaks reports 0.0 rather than an
+    # extrapolation from a single interval, since one peak carries no rate
+    # information.
+    recovery_freq_hz = (len(peak_times_ms) / recovery_window_s) if len(peak_times_ms) >= 2 else 0.0
+
     qualifying = peak_times_ms[peak_times_ms >= rebound_latency_min_ms]
     rebound_occurred = len(qualifying) > 0
     rebound_spike_count = int(len(qualifying))
@@ -905,6 +917,7 @@ def run_test_and_recovery(params, hold_state, held_nA, injected_nA, hold_freq_hz
         "rebound_peak_iH_nA": rebound_peak_iH_nA, "rebound_peak_iCaT_nA": rebound_peak_iCaT_nA,
         "rebound_pattern": rebound_pattern, "recovery_settled": None,
         "recovery_v_min_mV": recovery_v_min_mV, "recovery_v_final_mV": recovery_v_final_mV,
+        "recovery_freq_hz": recovery_freq_hz,
     }
 
     result = {"blew_up": False, "error": None, **test_result, **recovery_result}
@@ -937,6 +950,7 @@ _TEST_RECOVERY_DEFAULTS = {
     "rebound_peak_mV": None, "rebound_peak_iH_nA": None, "rebound_peak_iCaT_nA": None,
     "rebound_pattern": "not_applicable", "recovery_settled": None,
     "recovery_v_min_mV": float("nan"), "recovery_v_final_mV": float("nan"),
+    "recovery_freq_hz": 0.0,
 }
 
 
@@ -1239,37 +1253,51 @@ def _iH_map(cell_result: dict, features: dict) -> dict:
 # Shared by build_cell_grid_features_fig (renders all 14 via
 # draw_parameter_panel) and both of those scripts (render one, looked up by
 # key) so a panel's rendering can never drift between call sites.
+# Grouped by which simulated phase each panel's data comes from (2026-08-21,
+# user-flagged) -- "test phase" = during the injected current step itself;
+# "recovery phase" = after release back to held, watching for post-
+# inhibitory rebound. build_cell_grid_features_fig renders these as two
+# explicitly labeled sections so a reader never has to infer which window a
+# given panel is describing (rebound_pattern/rebound_* are recovery-phase by
+# their name alone, but e.g. sag_depth or adaptation_ratio are not obviously
+# test-phase without this).
 PARAMETER_PANELS = [
-    dict(key="test_pattern", title="test-window firing pattern", kind="categorical",
+    # --- test phase ---
+    dict(key="test_pattern", title="test-window firing pattern", kind="categorical", phase="test",
         value_map_fn=_test_pattern_map, colors=PATTERN_COLORS, blank_labels=frozenset()),
-    dict(key="rebound_pattern", title="rebound pattern", kind="categorical",
-        value_map_fn=_rebound_pattern_map, colors=REBOUND_PATTERN_COLORS, blank_labels=REBOUND_BLANK_LABELS),
     dict(key="firing_rate", title="test-window firing rate", kind="map", cmap="viridis", label="Hz",
-        value_map_fn=lambda cr, f: f.get("firing_rate_map") or {}),
+        phase="test", value_map_fn=lambda cr, f: f.get("firing_rate_map") or {}),
     dict(key="intra_burst_rate", title="intra-burst rate", kind="map", cmap="cividis", label="Hz",
-        value_map_fn=lambda cr, f: f.get("intra_burst_rate_map") or {}),
+        phase="test", value_map_fn=lambda cr, f: f.get("intra_burst_rate_map") or {}),
     dict(key="burst_freq_approx", title="burst freq, approx", kind="map", cmap="cividis", label="Hz",
-        value_map_fn=lambda cr, f: f.get("burst_freq_approx_map") or {}),
+        phase="test", value_map_fn=lambda cr, f: f.get("burst_freq_approx_map") or {}),
     dict(key="n_bursts", title="n bursts", kind="map", cmap="plasma", label="count",
-        value_map_fn=lambda cr, f: f.get("n_bursts_map") or {}),
-    dict(key="rebound_occurred", title="rebound occurred", kind="map", cmap="Oranges", label="fraction",
-        value_map_fn=lambda cr, f: f.get("rebound_occurred_map") or {}),
-    dict(key="rebound_count", title="rebound spike count", kind="map", cmap="YlOrBr", label="spike count",
-        value_map_fn=lambda cr, f: f.get("rebound_count_map") or {}),
-    dict(key="rebound_latency", title="rebound latency", kind="map", cmap="viridis", label="ms",
-        value_map_fn=lambda cr, f: f.get("rebound_latency_map") or {}),
-    dict(key="rebound_peak_mV", title="rebound peak", kind="map", cmap="magma", label="mV",
-        value_map_fn=lambda cr, f: f.get("rebound_peak_mV_map") or {}),
+        phase="test", value_map_fn=lambda cr, f: f.get("n_bursts_map") or {}),
     dict(key="sag_depth", title="sag depth", kind="map", cmap="YlGnBu", label="mV",
-        value_map_fn=lambda cr, f: f.get("sag_depth_map") or {}),
+        phase="test", value_map_fn=lambda cr, f: f.get("sag_depth_map") or {}),
     dict(key="adaptation_ratio", title="adaptation ratio (tonic)", kind="map", cmap="plasma", label="ratio",
-        value_map_fn=lambda cr, f: f.get("adaptation_ratio_map") or {}),
+        phase="test", value_map_fn=lambda cr, f: f.get("adaptation_ratio_map") or {}),
     dict(key="spikes_per_burst", title="spikes per burst (bursting only)", kind="map", cmap="plasma",
-        label="spikes/burst", value_map_fn=_spikes_per_burst_map),
+        label="spikes/burst", phase="test", value_map_fn=_spikes_per_burst_map),
+    # --- recovery phase ---
+    dict(key="rebound_pattern", title="rebound pattern", kind="categorical", phase="recovery",
+        value_map_fn=_rebound_pattern_map, colors=REBOUND_PATTERN_COLORS, blank_labels=REBOUND_BLANK_LABELS),
+    dict(key="recovery_firing_rate", title="recovery-window firing rate", kind="map", cmap="viridis",
+        label="Hz", phase="recovery", value_map_fn=lambda cr, f: f.get("recovery_firing_rate_map") or {}),
+    dict(key="rebound_occurred", title="rebound occurred", kind="map", cmap="Oranges", label="fraction",
+        phase="recovery", value_map_fn=lambda cr, f: f.get("rebound_occurred_map") or {}),
+    dict(key="rebound_count", title="rebound spike count", kind="map", cmap="YlOrBr", label="spike count",
+        phase="recovery", value_map_fn=lambda cr, f: f.get("rebound_count_map") or {}),
+    dict(key="rebound_latency", title="rebound latency", kind="map", cmap="viridis", label="ms",
+        phase="recovery", value_map_fn=lambda cr, f: f.get("rebound_latency_map") or {}),
+    dict(key="rebound_peak_mV", title="rebound peak", kind="map", cmap="magma", label="mV",
+        phase="recovery", value_map_fn=lambda cr, f: f.get("rebound_peak_mV_map") or {}),
     dict(key="iH_recovery_trough", title="i_H at recovery trough (silenced only)", kind="map", cmap="magma",
-        label="nA", value_map_fn=_iH_map),
+        label="nA", phase="recovery", value_map_fn=_iH_map),
 ]
 PARAMETER_PANELS_BY_KEY = {spec["key"]: spec for spec in PARAMETER_PANELS}
+TEST_PHASE_PANELS = [spec for spec in PARAMETER_PANELS if spec["phase"] == "test"]
+RECOVERY_PHASE_PANELS = [spec for spec in PARAMETER_PANELS if spec["phase"] == "recovery"]
 
 
 def _exact_grid_matrix(value_map: dict, held_levels, injected_levels) -> np.ndarray:
@@ -1399,9 +1427,15 @@ def build_cell_grid_features_fig(cell_result: dict, features: dict, bottom_margi
     Merged replacement for the old plot_cell_grid (6 panels, this module)
     + plot_cell_features (12 panels, extract_grid_features.py) -- 4 of the
     6/12 were exact duplicates (firing rate, rebound count, rebound
-    latency, spikes/burst); this shows the 14 genuinely distinct panels
-    once each, grouped thematically (classification overview / rate-timing
-    / rebound / passive-other) rather than in arbitrary reading order.
+    latency, spikes/burst); this shows the 15 genuinely distinct panels
+    once each, grouped by which simulated phase each one's data comes from
+    (test phase: during the injected current step; recovery phase: after
+    release back to held, watching for rebound -- see PARAMETER_PANELS'
+    own module comment) rather than in arbitrary reading order, with an
+    explicit section header for each so a reader never has to infer which
+    window a given panel describes (user-flagged 2026-08-21 -- several
+    panels, e.g. sag_depth or adaptation_ratio, aren't obviously test-phase
+    from their title alone the way rebound_pattern is recovery-phase).
 
     Needs BOTH the raw cell_result (grid: test_pattern, rebound_peak_iH_nA
     -- neither is exposed as a features map) and the precomputed features
@@ -1420,21 +1454,26 @@ def build_cell_grid_features_fig(cell_result: dict, features: dict, bottom_margi
     # oriented ascending (floor -> 0) so every panel below reads negative
     # values left/bottom, 0 at right/top -- the standard Cartesian
     # convention.
-    fig, axes = plt.subplots(4, 4, figsize=(19, 16))
-    for ax in (axes[0, 2], axes[0, 3]):
-        ax.axis("off")
+    #
+    # 6 rows, not 4: rows 0 and 3 are thin spacer/header rows (all 4 axes
+    # turned off, used only to host a bold "TEST PHASE"/"RECOVERY PHASE"
+    # label -- see below), so the phase boundary is a real visual gap, not
+    # just the panels themselves running together. Rows 1-2 hold the 8
+    # test-phase panels (a full 2x4), rows 4-5 hold the 7 recovery-phase
+    # panels (2x4, one slot left blank).
+    fig, axes = plt.subplots(6, 4, figsize=(19, 22), gridspec_kw={"height_ratios": [0.12, 1, 1, 0.12, 1, 1]})
+    for row in (0, 3):
+        for col in range(4):
+            axes[row, col].axis("off")
+    axes[5, 3].axis("off")
 
-    # Panel grid positions in PARAMETER_PANELS order: row 0 has only 2
-    # (classification overview, categorical), the other 2 slots in that row
-    # are blank (turned off above); rows 1-3 are full (rate/timing, rebound,
-    # passive/other, 4 panels each). firing_rate_map (row 1, first) is
-    # reconciled to the more permissive definition: includes silent points
-    # at their real 0.0 Hz rather than NaN-ing them out.
-    panel_axes = [axes[0, 0], axes[0, 1],
-                 axes[1, 0], axes[1, 1], axes[1, 2], axes[1, 3],
-                 axes[2, 0], axes[2, 1], axes[2, 2], axes[2, 3],
-                 axes[3, 0], axes[3, 1], axes[3, 2], axes[3, 3]]
-    for ax, spec in zip(panel_axes, PARAMETER_PANELS):
+    test_axes = [axes[1, 0], axes[1, 1], axes[1, 2], axes[1, 3],
+                axes[2, 0], axes[2, 1], axes[2, 2], axes[2, 3]]
+    recovery_axes = [axes[4, 0], axes[4, 1], axes[4, 2], axes[4, 3],
+                     axes[5, 0], axes[5, 1], axes[5, 2]]
+    for ax, spec in zip(test_axes, TEST_PHASE_PANELS):
+        draw_parameter_panel(ax, cell_result, features, spec["key"])
+    for ax, spec in zip(recovery_axes, RECOVERY_PHASE_PANELS):
         draw_parameter_panel(ax, cell_result, features, spec["key"])
 
     for ax in axes.flat:
@@ -1452,6 +1491,15 @@ def build_cell_grid_features_fig(cell_result: dict, features: dict, bottom_margi
     # caption below the panels that the standalone figure doesn't have --
     # it needs much more reserved space than a one-line command footer does.
     fig.tight_layout(rect=(0.0, bottom_margin, 1.0, 0.965))
+
+    # Section headers placed using each spacer row's REAL post-layout bbox
+    # (fig.transFigure y-center) rather than a guessed figure-fraction --
+    # must run AFTER tight_layout so it lands exactly centered in the gap
+    # tight_layout actually resolved, regardless of figure size/DPI.
+    for row, label in ((0, "TEST PHASE"), (3, "RECOVERY PHASE")):
+        bbox = axes[row, 0].get_position()
+        fig.text(0.5, bbox.y0 + 0.5 * bbox.height, label, ha="center", va="center",
+                 fontsize=14, fontweight="bold", color="dimgray")
     return fig
 
 
