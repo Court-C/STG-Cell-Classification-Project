@@ -272,6 +272,31 @@ def compute_firing_rate_map(grid: dict) -> dict:
     return rate_map
 
 
+def compute_recovery_firing_rate_map(grid: dict) -> dict:
+    """recovery_freq_hz per point -- the recovery-phase counterpart to
+    compute_firing_rate_map's test_freq_hz. Computed over the FULL recovery
+    window (run_held_injected_grid.py's run_test_and_recovery), not just the
+    "rebound" spikes past rebound_latency_min_ms, so this reads as a
+    genuine firing-rate map for the whole released-back-to-held period --
+    directly comparable to the test-window firing rate map above it, rather
+    than the narrower rebound-specific scalars (rebound_occurred/_count/
+    _latency), which stay scoped to the "was this distinguishable from the
+    held level's own baseline" question they were designed for.
+    """
+    rate_map = {}
+    for key, p in grid.items():
+        # .get(), not p["recovery_freq_hz"] (unlike test_freq_hz, which has
+        # always existed): a grid cache point from before this field was
+        # added (2026-08-21) has no key at all, not a None value -- skip it
+        # rather than KeyError, so a stale cell's other 14 panels still
+        # render while it awaits a stage-2 rerun to backfill this one.
+        recovery_freq_hz = p.get("recovery_freq_hz")
+        if p["blew_up"] or recovery_freq_hz is None:
+            continue
+        rate_map[key] = float(recovery_freq_hz)
+    return rate_map
+
+
 def _boundary_crossings(grid: dict, predicate) -> list:
     """For each distinct held row, walk points in descending injected order
     and record the (held, injected) midpoint of the first place `predicate`
@@ -372,6 +397,7 @@ def extract_cell_features(cell_id: str, cell_result: dict) -> dict:
     features["sag_depth_map"] = compute_sag_depth_map(grid)
     features["adaptation_ratio_map"] = compute_adaptation_map(grid)
     features["firing_rate_map"] = compute_firing_rate_map(grid)
+    features["recovery_firing_rate_map"] = compute_recovery_firing_rate_map(grid)
     features.update(compute_rebound_maps(grid))
     features.update(compute_burst_rate_maps(grid))
     features.update(compute_burst_structure_maps(grid))
