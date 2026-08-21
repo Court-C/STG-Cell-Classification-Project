@@ -50,10 +50,35 @@ DEFAULT_FIGURE_FORMAT = "png"
 # deepest silencing threshold, bursting-at-rest, tonic-only, deep+diverse).
 DEFAULT_CURATED_CELLS = ["W0E22J", "WX7CJ9", "2EXYPV", "4QSWXH", "5A6WBD"]
 
+# Font sizes for _draw_trace_axes/plot_example_trace -- sized for projector/
+# screen-share legibility (user-flagged 2026-08-21: the previous defaults,
+# tuned for a standalone reader zoomed into the PNG, were too small to read
+# in a live presentation).
+TITLE_FONTSIZE = 13
+AXIS_LABEL_FONTSIZE = 12
+TICK_FONTSIZE = 11
+LEGEND_FONTSIZE = 11
+FOOTER_FONTSIZE = 8
+
+# The held=0/injected=0 control trace has no perturbation to resolve at any
+# particular timescale, so instead of cell_result's test_window_s/
+# recovery_window_s (sized for ISI-classification accuracy at arbitrary
+# grid points, routinely several seconds) it's shown over this many of the
+# cell's own baseline periods -- long enough to read as a rhythm, short
+# enough that individual spikes stay resolvable rather than smearing into a
+# saturated block (user-flagged 2026-08-21: a full-length control trace at
+# a healthy firing rate crams hundreds of spikes into one figure).
+DEFAULT_CONTROL_CYCLES = 15.0
+# Fallback window when the cell doesn't fire at all at baseline (baseline_
+# freq_hz == 0) -- there's no period to scale a cycle count from, so this
+# is a plain fixed duration instead.
+DEFAULT_CONTROL_FALLBACK_WINDOW_S = 1.0
+
 _PATTERN_LABELS = {
     "tonic": "tonic firing", "bursting": "bursting", "silent": "silent (no firing)",
     "tonic_rebound": "a sustained (tonic) rebound", "bursting_rebound": "a burst-like rebound",
     "single_spike": "a single-spike rebound", "none": "no rebound",
+    "control": "its baseline rhythm (no injected current)",
 }
 
 
@@ -272,6 +297,34 @@ def resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA, cell_
     return tr
 
 
+def control_window_s(baseline_freq_hz: float, n_cycles: float = DEFAULT_CONTROL_CYCLES) -> float:
+    """Duration of each phase (hold tail, current step, recovery) in the
+    zero-current control trace -- see DEFAULT_CONTROL_CYCLES's docstring for
+    why this is scaled to the cell's own baseline period rather than reusing
+    cell_result's test/recovery windows. Falls back to a fixed duration for
+    a cell that's silent at its own baseline (no period to scale from).
+    """
+    if not baseline_freq_hz:
+        return DEFAULT_CONTROL_FALLBACK_WINDOW_S
+    return n_cycles / baseline_freq_hz
+
+
+def resimulate_control_point(params, y_ss, baseline_freq_hz, cell_result, ss_entry,
+                             n_cycles: float = DEFAULT_CONTROL_CYCLES) -> dict:
+    """Re-simulates the held=0/injected=0 control point (no perturbation at
+    all) over a short window scaled to the cell's own baseline period,
+    instead of cell_result's test_window_s/recovery_window_s -- those are
+    sized for ISI-classification accuracy at arbitrary grid points and would
+    cram hundreds of baseline-rate spikes into one figure at a healthy
+    firing rate, saturating the trace into an unreadable solid block rather
+    than a legible rhythm (user-flagged 2026-08-21).
+    """
+    window_s = control_window_s(baseline_freq_hz, n_cycles)
+    control_cell_result = dict(cell_result, test_window_s=window_s, recovery_window_s=window_s)
+    return resimulate_point(params, y_ss, baseline_freq_hz, 0.0, 0.0, control_cell_result,
+                            hold_tail_s=window_s, ss_entry=ss_entry)
+
+
 def _draw_trace_axes(ax_v, ax_i, cell_id: str, held_nA: float, injected_nA: float,
                      test_pattern: str, rebound_pattern: str, tr: dict) -> None:
     """Draws the V(t)/I(t) trace into a caller-supplied pair of axes --
@@ -296,18 +349,27 @@ def _draw_trace_axes(ax_v, ax_i, cell_id: str, held_nA: float, injected_nA: floa
              label=f"recovery, released to {held_nA:.2f} nA")
     ax_v.axvline(hold_end, color="black", ls=":", lw=1)
     ax_v.axvline(test_end, color="black", ls=":", lw=1)
-    ax_v.set_ylabel("membrane potential (mV)")
-    ax_v.legend(loc="upper right", fontsize=7)
-    ax_v.set_title(f"{cell_id}: {describe_pattern(test_pattern)} during the current step, then "
-                   f"{describe_pattern(rebound_pattern)}", fontsize=9)
+    ax_v.set_ylabel("membrane potential (mV)", fontsize=AXIS_LABEL_FONTSIZE)
+    ax_v.legend(loc="upper right", fontsize=LEGEND_FONTSIZE)
+    ax_v.tick_params(labelsize=TICK_FONTSIZE)
+    if test_pattern == "control":
+        # No perturbation happens in a control trace -- "during the current
+        # step, then rebound" doesn't apply, so this gets its own plain title
+        # rather than describe_pattern's phrasing built for a real test/
+        # rebound pair.
+        ax_v.set_title(f"{cell_id}: {describe_pattern(test_pattern)}", fontsize=TITLE_FONTSIZE)
+    else:
+        ax_v.set_title(f"{cell_id}: {describe_pattern(test_pattern)} during the current step, then "
+                       f"{describe_pattern(rebound_pattern)}", fontsize=TITLE_FONTSIZE)
 
     t_current = np.concatenate([t_hold, t_test_off, t_rec_off])
     i_current = np.concatenate([np.full_like(t_hold, held_nA),
                                 np.full_like(t_test_off, injected_nA),
                                 np.full_like(t_rec_off, held_nA)])
     ax_i.plot(t_current, i_current, color="black", lw=1.2)
-    ax_i.set_ylabel("applied current (nA)")
-    ax_i.set_xlabel("time (ms)")
+    ax_i.set_ylabel("applied current (nA)", fontsize=AXIS_LABEL_FONTSIZE)
+    ax_i.set_xlabel("time (ms)", fontsize=AXIS_LABEL_FONTSIZE)
+    ax_i.tick_params(labelsize=TICK_FONTSIZE)
 
 
 def build_example_trace_figure(cell_id: str, held_nA: float, injected_nA: float,
@@ -316,7 +378,7 @@ def build_example_trace_figure(cell_id: str, held_nA: float, injected_nA: float,
     so a caller that wants the Figure object itself doesn't have to
     save-then-reopen a file to get it.
     """
-    fig, (ax_v, ax_i) = plt.subplots(2, 1, figsize=(10, 5), sharex=True,
+    fig, (ax_v, ax_i) = plt.subplots(2, 1, figsize=(11, 5.5), sharex=True,
                                      gridspec_kw={"height_ratios": [3, 1]})
     _draw_trace_axes(ax_v, ax_i, cell_id, held_nA, injected_nA, test_pattern, rebound_pattern, tr)
     fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
@@ -328,7 +390,7 @@ def plot_example_trace(cell_id: str, held_nA: float, injected_nA: float,
                        outdir: Path, command: str, fig_format: str) -> Path:
     fig = build_example_trace_figure(cell_id, held_nA, injected_nA, test_pattern, rebound_pattern, tr)
     fig.text(0.5, 0.01, command, ha="center", va="bottom",
-             fontsize=6, family="monospace", color="dimgray", wrap=True)
+             fontsize=FOOTER_FONTSIZE, family="monospace", color="dimgray", wrap=True)
 
     cell_dir = outdir / cell_id
     cell_dir.mkdir(parents=True, exist_ok=True)
@@ -366,6 +428,16 @@ def parse_args() -> argparse.Namespace:
                              "dynamics concentrate across a randomly-sampled population, so the opposite "
                              "direction is excluded unless a (pattern, rebound) combination has no point "
                              "at all on the preferred side. Pass this to consider the full grid instead.")
+    parser.add_argument("--include-control", action="store_true",
+                        help="Also generate a held=0/injected=0 control trace per cell (no perturbation "
+                             "at all), shown over a short window scaled to the cell's own baseline period "
+                             "(see --control-cycles) rather than the cell's full test/recovery windows -- "
+                             "those are sized for ISI-classification accuracy and would cram hundreds of "
+                             "baseline-rate spikes into one figure, reading as a saturated block instead "
+                             "of a legible rhythm.")
+    parser.add_argument("--control-cycles", type=float, default=DEFAULT_CONTROL_CYCLES,
+                        help="Number of the cell's own baseline periods shown per phase (hold tail, "
+                             "current step, recovery) in the --include-control trace.")
     return parser.parse_args()
 
 
@@ -393,6 +465,19 @@ def main() -> None:
             print(f"{cell_id}: skipped -- no valid steady-state cache entry")
             continue
         y_ss, baseline_freq_hz = ss_entry["y_ss"], ss_entry["freq_hz"]
+
+        if args.include_control:
+            tr = resimulate_control_point(params, y_ss, baseline_freq_hz, cell_result, ss_entry,
+                                          n_cycles=args.control_cycles)
+            if tr["blew_up"]:
+                print(f"  (+0.00, +0.00) [control]: blew up re-simulating "
+                     f"({tr.get('stage')}: {tr.get('error')})")
+                total_failed += 1
+            else:
+                outpath = plot_example_trace(cell_id, 0.0, 0.0, "control", "none",
+                                             tr, figures_dir, command, args.figure_format)
+                print(f"  (+0.00, +0.00) [control] -> {outpath}")
+                total_written += 1
 
         exemplars = select_exemplar_points(cell_result,
                                            require_held_lt_injected=not args.allow_held_gt_injected)
