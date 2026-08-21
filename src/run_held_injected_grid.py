@@ -1455,6 +1455,23 @@ def build_cell_grid_features_fig(cell_result: dict, features: dict, bottom_margi
     return fig
 
 
+def grid_features_title(cell_result: dict, features: dict) -> str:
+    """One-line summary used as build_cell_grid_features_fig's suptitle --
+    factored out of plot_cell_grid_features so a second caller (e.g. a
+    combined-pages summary script) that embeds this same figure elsewhere
+    doesn't need its own copy of the burstiness/F-I-slope string formatting.
+    """
+    cell_id = cell_result["cell_id"]
+    burstiness = features.get("burstiness_index")
+    fi_slope = features.get("fi_slope_hz_per_nA")
+    burstiness_str = f"{burstiness:.3f}" if burstiness is not None else "None"
+    fi_slope_str = f"{fi_slope:.3f} Hz/nA" if fi_slope is not None else "None"
+    return (f"{cell_id} — status: {cell_result['status']}, "
+           f"cell_floor={cell_result['cell_floor_nA']:.2f} nA, "
+           f"n_points={cell_result['n_points_total']}, "
+           f"burstiness={burstiness_str}, F-I slope={fi_slope_str}")
+
+
 def plot_cell_grid_features(cell_result: dict, features: dict, outdir: Path, command: str,
                             fig_format: str = DEFAULT_FIGURE_FORMAT) -> None:
     """Thin save-to-disk wrapper around build_cell_grid_features_fig -- see
@@ -1464,15 +1481,7 @@ def plot_cell_grid_features(cell_result: dict, features: dict, outdir: Path, com
     if fig is None:
         return
     cell_id = cell_result["cell_id"]
-    burstiness = features.get("burstiness_index")
-    fi_slope = features.get("fi_slope_hz_per_nA")
-    burstiness_str = f"{burstiness:.3f}" if burstiness is not None else "None"
-    fi_slope_str = f"{fi_slope:.3f} Hz/nA" if fi_slope is not None else "None"
-    title = (f"{cell_id} — status: {cell_result['status']}, "
-            f"cell_floor={cell_result['cell_floor_nA']:.2f} nA, "
-            f"n_points={cell_result['n_points_total']}, "
-            f"burstiness={burstiness_str}, F-I slope={fi_slope_str}")
-    fig.suptitle(title, fontsize=10)
+    fig.suptitle(grid_features_title(cell_result, features), fontsize=10)
     fig.text(0.5, 0.005, command, ha="center", va="bottom",
              fontsize=6, family="monospace", color="dimgray", wrap=True)
     outpath = outdir / f"{cell_id}_grid.{fig_format}"
