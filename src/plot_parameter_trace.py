@@ -35,7 +35,7 @@ from steady_state_cache import get_cached_state
 from run_held_injected_grid import (PARAMETER_PANELS_BY_KEY, draw_parameter_panel, _round_level,
                                     DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_GRID_CACHE_PATH)
 from extract_grid_features import DEFAULT_OUTPUT_CACHE_PATH as DEFAULT_GRID_FEATURES_CACHE_PATH
-from plot_example_traces import resimulate_point, _draw_trace_axes
+from plot_example_traces import resimulate_point, _draw_trace_axes, describe_pattern
 
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "parameter_traces"
 DEFAULT_FIGURE_FORMAT = "png"
@@ -70,16 +70,23 @@ def resolve_grid_point(cell_result: dict, held_nA: float, injected_nA: float) ->
     return point
 
 
-def build_parameter_trace_figure(cell_id: str, cell_result: dict, features: dict, parameter: str,
-                                 held_nA: float, injected_nA: float, tr: dict) -> plt.Figure:
+def draw_parameter_trace_panel(fig: plt.Figure, subplot_spec, cell_id: str, cell_result: dict,
+                               features: dict, parameter: str, held_nA: float, injected_nA: float,
+                               tr: dict) -> None:
+    """Draws one heatmap(+marked point)/trace panel into `subplot_spec` (a
+    matplotlib SubplotSpec -- e.g. one cell of an outer GridSpec) -- split
+    out of build_parameter_trace_figure so a caller building a page with
+    SEVERAL examples (e.g. a curated-examples summary page) can lay out
+    multiple panels on one figure via nested GridSpecs instead of gluing
+    together several independent Figures.
+    """
     point = resolve_grid_point(cell_result, held_nA, injected_nA)
     spec = PARAMETER_PANELS_BY_KEY[parameter]
 
-    fig = plt.figure(figsize=(15, 6))
-    gs = fig.add_gridspec(2, 2, width_ratios=[1, 1.3], height_ratios=[3, 1])
-    ax_heat = fig.add_subplot(gs[:, 0])
-    ax_v = fig.add_subplot(gs[0, 1])
-    ax_i = fig.add_subplot(gs[1, 1], sharex=ax_v)
+    inner = subplot_spec.subgridspec(2, 2, width_ratios=[1, 1.3], height_ratios=[3, 1])
+    ax_heat = fig.add_subplot(inner[:, 0])
+    ax_v = fig.add_subplot(inner[0, 1])
+    ax_i = fig.add_subplot(inner[1, 1], sharex=ax_v)
 
     value_map = draw_parameter_panel(ax_heat, cell_result, features, parameter)
     ax_heat.plot(held_nA, injected_nA, marker="x", color="red", markersize=12, markeredgewidth=2)
@@ -88,10 +95,19 @@ def build_parameter_trace_figure(cell_id: str, cell_result: dict, features: dict
     value_str = f"{value:.3g}" if isinstance(value, (int, float)) else str(value)
     _draw_trace_axes(ax_v, ax_i, cell_id, held_nA, injected_nA,
                      point["test_pattern"], point["rebound_pattern"], tr)
+    ax_v.set_title(f"{spec['title']} = {value_str} at held={held_nA:+.2f} nA, injected={injected_nA:+.2f} nA\n"
+                   f"{describe_pattern(point['test_pattern'])} during the current step, then "
+                   f"{describe_pattern(point['rebound_pattern'])}", fontsize=9)
 
-    fig.suptitle(f"{cell_id} — {spec['title']} = {value_str} at held={held_nA:+.2f} nA, "
-                f"injected={injected_nA:+.2f} nA", fontsize=10)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+
+def build_parameter_trace_figure(cell_id: str, cell_result: dict, features: dict, parameter: str,
+                                 held_nA: float, injected_nA: float, tr: dict) -> plt.Figure:
+    fig = plt.figure(figsize=(15, 6))
+    gs = fig.add_gridspec(1, 1)
+    draw_parameter_trace_panel(fig, gs[0, 0], cell_id, cell_result, features, parameter,
+                               held_nA, injected_nA, tr)
+    fig.suptitle(cell_id, fontsize=10)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
     return fig
 
 
