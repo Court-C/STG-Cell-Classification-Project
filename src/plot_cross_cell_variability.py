@@ -19,8 +19,18 @@ step; a pixel with a large std is exactly the direct, visual evidence for
 question 2: cells genuinely diverge from each other there.
 
 No new simulation, no new cache -- reads only the already-computed
-cell_held_injected_grid.pkl (for the raw test_pattern used to build the
-bursting-or-not map) and cell_grid_features.pkl (for firing_rate_map).
+cell_held_injected_grid.pkl (for the raw test_pattern/rebound_pattern used
+to build the test- and recovery-phase bursting-or-not maps) and
+cell_grid_features.pkl (for the continuous feature maps).
+
+Continuous features (firing rate, sag depth, n bursts, rebound peak, ...)
+are z-scored per cell before stacking (each cell's own mean/std over its
+own real grid points, not the population's) so a cell that's simply larger
+in absolute magnitude everywhere -- e.g. a uniformly higher-firing cell --
+doesn't dominate the cross-cell mean at every pixel it covers; what's
+plotted is how far above/below ITS OWN typical value a cell runs at each
+point, averaged across cells. Bursting fraction is left alone since it's
+already a 0/1 indicator, not a magnitude. Disable with --no-zscore.
 """
 
 import pickle
@@ -62,24 +72,62 @@ CROSS_CELL_FEATURES = {
                           title="rebound spike count"),
     "rebound_latency": dict(feat_key="rebound_latency_map", cmap="viridis_r", label="ms",
                             title="rebound latency"),
+    "rebound_peak": dict(feat_key="rebound_peak_mV_map", cmap="magma", label="mV",
+                         title="rebound peak"),
 }
-DEFAULT_FEATURES = ["firing_rate"]
+DEFAULT_FEATURES = ["firing_rate", "sag_depth", "n_bursts", "rebound_peak"]
+
+# Both derived directly from the raw grid cache (not features_cache), always
+# included -- test_pattern=="bursting" for the test phase, rebound_pattern==
+# "bursting_rebound" for the recovery phase. Points where the corresponding
+# phase's classification doesn't apply at all (test_pattern is None /
+# rebound_pattern is "not_applicable") are excluded rather than counted as
+# 0 -- there's no answer to report there, not a confident "not bursting".
+BURST_INDICATORS = {
+    "test_burst": dict(title="fraction of cells bursting (test)",
+                       point_fn=lambda p: None if p["test_pattern"] is None
+                                          else 1.0 if p["test_pattern"] == "bursting" else 0.0),
+    "recovery_burst": dict(title="fraction of cells bursting (recovery)",
+                           point_fn=lambda p: None if p["rebound_pattern"] in (None, "not_applicable")
+                                              else 1.0 if p["rebound_pattern"] == "bursting_rebound" else 0.0),
+}
+
+
+def _zscore_map(feat_map: dict) -> dict:
+    """Centers and scales one cell's real (pre-interpolation) feature map by
+    ITS OWN mean/std, so the cross-cell stack averages comparable, dimension-
+    less "SDs from this cell's own typical value" rather than raw units a
+    uniformly larger/smaller cell would otherwise dominate. A cell with <2
+    points or zero variance is left centered-only (z=0 everywhere, since
+    every value already equals the mean) rather than divided by zero.
+    """
+    if len(feat_map) < 2:
+        return {k: 0.0 for k in feat_map}
+    values = np.array(list(feat_map.values()), dtype=float)
+    mean, std = float(np.mean(values)), float(np.std(values))
+    if std < 1e-9:
+        return {k: 0.0 for k in feat_map}
+    return {k: (v - mean) / std for k, v in feat_map.items()}
 
 
 def stack_cross_cell(grid_cache: dict, features_cache: dict, grid_n: int, feature_names: list,
-                     cell_ids_filter=None) -> dict:
-    """Normalizes every ok cell's requested map-valued features, plus a
-    derived bursting-or-not map, onto a common grid_n x grid_n (held_frac,
-    injected_frac) grid, and returns the stacked arrays plus their
-    cross-cell mean/std -- nan-aware, since not every cell's interpolated
-    grid covers every normalized coordinate (e.g. a cell whose real grid
-    barely extends past its floor leaves the far corners undefined).
+                     cell_ids_filter=None, zscore: bool = True) -> dict:
+    """Normalizes every ok cell's requested map-valued features, plus the
+    test- and recovery-phase bursting-or-not maps, onto a common
+    grid_n x grid_n (held_frac, injected_frac) grid, and returns the stacked
+    arrays plus their cross-cell mean/std -- nan-aware, since not every
+    cell's interpolated grid covers every normalized coordinate (e.g. a cell
+    whose real grid barely extends past its floor leaves the far corners
+    undefined).
 
     cell_ids_filter, when given, restricts stacking to that subset of cell
     IDs (e.g. the curated dev set) rather than every "ok" cell in the cache.
+    zscore controls whether the continuous feature_names maps are per-cell
+    z-scored before stacking (see _zscore_map); the burst indicators are
+    never z-scored, they're already 0/1.
     """
     layers = {name: [] for name in feature_names}
-    burst_layers = []
+    burst_layers = {name: [] for name in BURST_INDICATORS}
     cell_ids = []
     for cid, gres in grid_cache.items():
         if cell_ids_filter is not None and cid not in cell_ids_filter:
@@ -91,11 +139,18 @@ def stack_cross_cell(grid_cache: dict, features_cache: dict, grid_n: int, featur
 
         for name in feature_names:
             feat_map = {k: float(v) for k, v in (feat.get(CROSS_CELL_FEATURES[name]["feat_key"]) or {}).items()}
+            if zscore:
+                feat_map = _zscore_map(feat_map)
             layers[name].append(normalize_grid_to_common_coords(cell_floor_nA, feat_map, grid_n, "drop_feature"))
 
-        burst_map = {(p["held_nA"], p["injected_nA"]): (1.0 if p["test_pattern"] == "bursting" else 0.0)
-                    for p in gres["grid"].values() if p["test_pattern"] is not None}
-        burst_layers.append(normalize_grid_to_common_coords(cell_floor_nA, burst_map, grid_n, "drop_feature"))
+        for name, spec in BURST_INDICATORS.items():
+            point_map = {}
+            for p in gres["grid"].values():
+                value = spec["point_fn"](p)
+                if value is not None:
+                    point_map[(p["held_nA"], p["injected_nA"])] = value
+            burst_layers[name].append(normalize_grid_to_common_coords(cell_floor_nA, point_map, grid_n,
+                                                                       "drop_feature"))
         cell_ids.append(cid)
 
     result = {"cell_ids": cell_ids}
@@ -105,10 +160,11 @@ def stack_cross_cell(grid_cache: dict, features_cache: dict, grid_n: int, featur
         result[f"{name}_std"] = np.nanstd(stack, axis=0)
         result[f"{name}_n"] = np.sum(~np.isnan(stack), axis=0)
 
-    burst_stack = np.stack(burst_layers)
-    result["burst_mean"] = np.nanmean(burst_stack, axis=0)
-    result["burst_std"] = np.nanstd(burst_stack, axis=0)
-    result["burst_n"] = np.sum(~np.isnan(burst_stack), axis=0)
+    for name in BURST_INDICATORS:
+        stack = np.stack(burst_layers[name])
+        result[f"{name}_mean"] = np.nanmean(stack, axis=0)
+        result[f"{name}_std"] = np.nanstd(stack, axis=0)
+        result[f"{name}_n"] = np.sum(~np.isnan(stack), axis=0)
     return result
 
 
@@ -132,19 +188,22 @@ def _panel(ax, matrix, n_covering, title, cmap, label, min_n_cells):
 
 
 def build_cross_cell_variability_fig(result: dict, n_cells_total: int, min_n_cells: int,
-                                     feature_names: list) -> plt.Figure:
+                                     feature_names: list, zscore: bool) -> plt.Figure:
+    mean_label = "z-score (SD from cell's own mean)" if zscore else None
     rows = [(name, CROSS_CELL_FEATURES[name]["title"], CROSS_CELL_FEATURES[name]["cmap"],
-            CROSS_CELL_FEATURES[name]["label"]) for name in feature_names]
-    rows.append(("burst", "fraction of cells bursting", "cividis", "fraction"))
+            mean_label or CROSS_CELL_FEATURES[name]["label"]) for name in feature_names]
+    rows += [(name, spec["title"], "cividis", "fraction") for name, spec in BURST_INDICATORS.items()]
 
     fig, axes = plt.subplots(len(rows), 2, figsize=(16, 7 * len(rows)), squeeze=False)
     for row_idx, (key, title, cmap, label) in enumerate(rows):
+        is_burst = key in BURST_INDICATORS
         _panel(axes[row_idx, 0], result[f"{key}_mean"], result[f"{key}_n"], f"mean {title}",
               cmap, label, min_n_cells)
         _panel(axes[row_idx, 1], result[f"{key}_std"], result[f"{key}_n"], f"{title} variability (SD)",
-              "inferno", label if key != "burst" else "SD", min_n_cells)
+              "inferno", "SD" if is_burst else "SD of z-score" if zscore else label, min_n_cells)
 
-    fig.suptitle("Cross-cell variability in " + ", ".join(t for _, t, _, _ in rows) +
+    fig.suptitle("Cross-cell variability" +
+                (" (continuous features z-scored per cell)" if zscore else "") +
                 f"\n(n = {len(result['cell_ids'])}/{n_cells_total} cells, matched on held/injected "
                 f"as a fraction of each cell's own floor)",
                 fontsize=18)
@@ -169,12 +228,19 @@ def parse_args() -> argparse.Namespace:
                              "rather than shown as a (noisy, low-n) mean/std.")
     parser.add_argument("--features", nargs="+", default=DEFAULT_FEATURES,
                         choices=sorted(CROSS_CELL_FEATURES), metavar="FEATURE",
-                        help=f"Map-valued grid features to stack, in addition to bursting "
-                             f"(always included). One of {sorted(CROSS_CELL_FEATURES)}.")
+                        help=f"Map-valued grid features to stack, in addition to test- and "
+                             f"recovery-phase bursting fraction (always included). One of "
+                             f"{sorted(CROSS_CELL_FEATURES)}.")
     parser.add_argument("--cells", nargs="+", default=None, metavar="CELLID",
                         help="Restrict to these cell IDs (e.g. the curated dev set) instead of "
                              "every 'ok' cell in the cache -- use for testing before a full-"
                              "population run. --min-n-cells will usually need lowering to match.")
+    parser.add_argument("--no-zscore", dest="zscore", action="store_false",
+                        help="Stack continuous features in their raw units instead of per-cell "
+                             "z-scoring them first -- lets a uniformly larger/smaller cell "
+                             "dominate the cross-cell mean at every pixel it covers; the default "
+                             "(z-scored) avoids that.")
+    parser.set_defaults(zscore=True)
     return parser.parse_args()
 
 
@@ -186,12 +252,18 @@ def main() -> None:
         features_cache = pickle.load(f)
 
     cell_ids_filter = set(args.cells) if args.cells else None
-    result = stack_cross_cell(grid_cache, features_cache, args.grid_n, args.features, cell_ids_filter)
-    fig = build_cross_cell_variability_fig(result, len(grid_cache), args.min_n_cells, args.features)
+    result = stack_cross_cell(grid_cache, features_cache, args.grid_n, args.features, cell_ids_filter,
+                              args.zscore)
+    fig = build_cross_cell_variability_fig(result, len(grid_cache), args.min_n_cells, args.features,
+                                           args.zscore)
 
     figures_dir = Path(args.figures_dir)
     figures_dir.mkdir(parents=True, exist_ok=True)
-    suffix = "_".join(args.features) if args.cells is None else "_".join(args.features) + "_test-cells"
+    suffix = "_".join(args.features)
+    if not args.zscore:
+        suffix += "_raw"
+    if args.cells is not None:
+        suffix += "_test-cells"
     outpath = figures_dir / f"cross_cell_variability_{suffix}.{args.figure_format}"
     fig.savefig(outpath, dpi=170)
     plt.close(fig)

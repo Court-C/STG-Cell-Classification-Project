@@ -182,14 +182,19 @@ python src/plot_cross_cell_variability.py --features firing_rate sag_depth
 ```
 
 Cross-cell counterpart to the single-cell tools above: normalizes every
-cell's chosen grid features (plus bursting, always included) onto a common
-(held, injected) grid expressed as a fraction of each cell's own floor, then
-plots the cross-cell mean and standard deviation at every matched point --
-where cells behave alike vs. where they genuinely diverge. `--features`
-accepts any of `firing_rate`, `sag_depth`, `n_bursts`, `spikes_per_burst`,
-`adaptation_ratio`, `rebound_count`, `rebound_latency`. No resimulation,
-reads straight from the grid/features caches. Defaults to the full
-population; pass `--cells CELLID [CELLID ...]` (with a lowered
+cell's chosen grid features, plus test- and recovery-phase bursting
+fraction (both always included), onto a common (held, injected) grid
+expressed as a fraction of each cell's own floor, then plots the cross-cell
+mean and standard deviation at every matched point -- where cells behave
+alike vs. where they genuinely diverge. `--features` accepts any of
+`firing_rate`, `sag_depth`, `n_bursts`, `spikes_per_burst`,
+`adaptation_ratio`, `rebound_count`, `rebound_latency`, `rebound_peak`
+(defaults to `firing_rate sag_depth n_bursts rebound_peak`). Continuous
+features are z-scored per cell before stacking by default (each cell
+against its own mean/std) so a uniformly larger/smaller cell doesn't
+dominate the cross-cell mean -- pass `--no-zscore` for raw units instead.
+No resimulation, reads straight from the grid/features caches. Defaults to
+the full population; pass `--cells CELLID [CELLID ...]` (with a lowered
 `--min-n-cells`) to try it on the curated 6-cell set first.
 
 ## Scope note
