@@ -325,6 +325,30 @@ def resimulate_control_point(params, y_ss, baseline_freq_hz, cell_result, ss_ent
                             hold_tail_s=window_s, ss_entry=ss_entry)
 
 
+def trace_time_offsets(tr: dict) -> dict:
+    """Stitches the hold/test/recovery segments' own independent time axes
+    (each starts at 0 in the raw trace dict) into one continuous timeline --
+    shared by _draw_trace_axes and any other caller (e.g.
+    plot_grid_overview.py's sag-depth annotation) that needs to place a
+    point from v_test/v_rec at its real position on the combined V(t) plot.
+
+    Returns dt_ms (the hold segment's own sample spacing, used as the
+    inter-segment gap so consecutive segments don't overlap by one sample),
+    hold_end/test_end (the stitched-timeline boundary between segments),
+    and t_test_off/t_rec_off (the test/recovery time arrays shifted onto
+    the stitched timeline).
+    """
+    t_hold = tr["_trace_t_hold_ms"]
+    t_test, t_rec = tr["_trace_t_test_ms"], tr["_trace_t_rec_ms"]
+    dt_ms = t_hold[1] - t_hold[0] if len(t_hold) > 1 else 0.1
+    hold_end = t_hold[-1] + dt_ms if len(t_hold) else 0.0
+    t_test_off = t_test + hold_end
+    test_end = t_test_off[-1] + dt_ms if len(t_test_off) else hold_end
+    t_rec_off = t_rec + test_end
+    return {"dt_ms": dt_ms, "hold_end": hold_end, "test_end": test_end,
+           "t_test_off": t_test_off, "t_rec_off": t_rec_off}
+
+
 def _draw_trace_axes(ax_v, ax_i, cell_id: str, held_nA: float, injected_nA: float,
                      test_pattern: str, rebound_pattern: str, tr: dict) -> None:
     """Draws the V(t)/I(t) trace into a caller-supplied pair of axes --
