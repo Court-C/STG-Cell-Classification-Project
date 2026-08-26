@@ -175,6 +175,23 @@ or more fixed held-current rows, next to the heatmap with those rows marked
 straight from the grid/features caches. `--held` is repeatable to overlay
 several rows.
 
+## Population-level figures
+
+```bash
+python src/plot_cross_cell_variability.py --features firing_rate sag_depth
+```
+
+Cross-cell counterpart to the single-cell tools above: normalizes every
+cell's chosen grid features (plus bursting, always included) onto a common
+(held, injected) grid expressed as a fraction of each cell's own floor, then
+plots the cross-cell mean and standard deviation at every matched point --
+where cells behave alike vs. where they genuinely diverge. `--features`
+accepts any of `firing_rate`, `sag_depth`, `n_bursts`, `spikes_per_burst`,
+`adaptation_ratio`, `rebound_count`, `rebound_latency`. No resimulation,
+reads straight from the grid/features caches. Defaults to the full
+population; pass `--cells CELLID [CELLID ...]` (with a lowered
+`--min-n-cells`) to try it on the curated 6-cell set first.
+
 ## Scope note
 
 Day-to-day development and testing of classification changes is scoped to a

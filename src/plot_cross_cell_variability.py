@@ -46,40 +46,70 @@ DEFAULT_FIGURES_DIR = ROOT_DIR / "figures"
 DEFAULT_FIGURE_FORMAT = "png"
 DEFAULT_GRID_N = 25
 
+# Registry of map-valued grid features available for cross-cell stacking,
+# beyond the always-included derived "bursting" map (built from test_pattern
+# in the raw grid cache rather than read directly off features_cache).
+# feat_key indexes straight into extract_grid_features.py's per-cell dict.
+CROSS_CELL_FEATURES = {
+    "firing_rate": dict(feat_key="firing_rate_map", cmap="viridis", label="Hz", title="firing rate"),
+    "sag_depth": dict(feat_key="sag_depth_map", cmap="magma", label="mV", title="sag depth"),
+    "n_bursts": dict(feat_key="n_bursts_map", cmap="plasma", label="count", title="n bursts"),
+    "spikes_per_burst": dict(feat_key="spikes_per_burst_map", cmap="plasma", label="spikes/burst",
+                             title="spikes per burst"),
+    "adaptation_ratio": dict(feat_key="adaptation_ratio_map", cmap="coolwarm", label="ratio",
+                             title="adaptation ratio (tonic)"),
+    "rebound_count": dict(feat_key="rebound_count_map", cmap="plasma", label="count",
+                          title="rebound spike count"),
+    "rebound_latency": dict(feat_key="rebound_latency_map", cmap="viridis_r", label="ms",
+                            title="rebound latency"),
+}
+DEFAULT_FEATURES = ["firing_rate"]
 
-def stack_cross_cell(grid_cache: dict, features_cache: dict, grid_n: int) -> dict:
-    """Normalizes every ok cell's firing_rate_map and a derived
-    bursting-or-not map onto a common grid_n x grid_n (held_frac,
+
+def stack_cross_cell(grid_cache: dict, features_cache: dict, grid_n: int, feature_names: list,
+                     cell_ids_filter=None) -> dict:
+    """Normalizes every ok cell's requested map-valued features, plus a
+    derived bursting-or-not map, onto a common grid_n x grid_n (held_frac,
     injected_frac) grid, and returns the stacked arrays plus their
     cross-cell mean/std -- nan-aware, since not every cell's interpolated
     grid covers every normalized coordinate (e.g. a cell whose real grid
     barely extends past its floor leaves the far corners undefined).
+
+    cell_ids_filter, when given, restricts stacking to that subset of cell
+    IDs (e.g. the curated dev set) rather than every "ok" cell in the cache.
     """
-    rate_layers, burst_layers = [], []
+    layers = {name: [] for name in feature_names}
+    burst_layers = []
     cell_ids = []
     for cid, gres in grid_cache.items():
+        if cell_ids_filter is not None and cid not in cell_ids_filter:
+            continue
         feat = features_cache.get(cid)
         if gres.get("status") != "ok" or feat is None or feat.get("status") != "ok":
             continue
         cell_floor_nA = gres["cell_floor_nA"]
 
-        rate_map = {k: float(v) for k, v in (feat.get("firing_rate_map") or {}).items()}
+        for name in feature_names:
+            feat_map = {k: float(v) for k, v in (feat.get(CROSS_CELL_FEATURES[name]["feat_key"]) or {}).items()}
+            layers[name].append(normalize_grid_to_common_coords(cell_floor_nA, feat_map, grid_n, "drop_feature"))
+
         burst_map = {(p["held_nA"], p["injected_nA"]): (1.0 if p["test_pattern"] == "bursting" else 0.0)
                     for p in gres["grid"].values() if p["test_pattern"] is not None}
-
-        rate_layers.append(normalize_grid_to_common_coords(cell_floor_nA, rate_map, grid_n, "drop_feature"))
         burst_layers.append(normalize_grid_to_common_coords(cell_floor_nA, burst_map, grid_n, "drop_feature"))
         cell_ids.append(cid)
 
-    rate_stack = np.stack(rate_layers)  # (n_cells, grid_n, grid_n)
+    result = {"cell_ids": cell_ids}
+    for name in feature_names:
+        stack = np.stack(layers[name])  # (n_cells, grid_n, grid_n)
+        result[f"{name}_mean"] = np.nanmean(stack, axis=0)
+        result[f"{name}_std"] = np.nanstd(stack, axis=0)
+        result[f"{name}_n"] = np.sum(~np.isnan(stack), axis=0)
+
     burst_stack = np.stack(burst_layers)
-    return {
-        "cell_ids": cell_ids,
-        "rate_mean": np.nanmean(rate_stack, axis=0), "rate_std": np.nanstd(rate_stack, axis=0),
-        "rate_n": np.sum(~np.isnan(rate_stack), axis=0),
-        "burst_mean": np.nanmean(burst_stack, axis=0), "burst_std": np.nanstd(burst_stack, axis=0),
-        "burst_n": np.sum(~np.isnan(burst_stack), axis=0),
-    }
+    result["burst_mean"] = np.nanmean(burst_stack, axis=0)
+    result["burst_std"] = np.nanstd(burst_stack, axis=0)
+    result["burst_n"] = np.sum(~np.isnan(burst_stack), axis=0)
+    return result
 
 
 def _panel(ax, matrix, n_covering, title, cmap, label, min_n_cells):
@@ -101,21 +131,24 @@ def _panel(ax, matrix, n_covering, title, cmap, label, min_n_cells):
     ax.tick_params(labelsize=15)
 
 
-def build_cross_cell_variability_fig(result: dict, n_cells_total: int, min_n_cells: int) -> plt.Figure:
-    fig, axes = plt.subplots(2, 2, figsize=(16, 14))
-    _panel(axes[0, 0], result["rate_mean"], result["rate_n"], "mean firing rate",
-          "viridis", "Hz", min_n_cells)
-    _panel(axes[0, 1], result["rate_std"], result["rate_n"], "firing rate variability (SD)",
-          "inferno", "Hz", min_n_cells)
-    _panel(axes[1, 0], result["burst_mean"], result["burst_n"], "fraction of cells bursting",
-          "cividis", "fraction", min_n_cells)
-    _panel(axes[1, 1], result["burst_std"], result["burst_n"], "bursting variability (SD)",
-          "inferno", "SD", min_n_cells)
-    fig.suptitle("Cross-cell variability in firing rate and bursting\n"
-                f"(n = {len(result['cell_ids'])}/{n_cells_total} cells, matched on held/injected "
+def build_cross_cell_variability_fig(result: dict, n_cells_total: int, min_n_cells: int,
+                                     feature_names: list) -> plt.Figure:
+    rows = [(name, CROSS_CELL_FEATURES[name]["title"], CROSS_CELL_FEATURES[name]["cmap"],
+            CROSS_CELL_FEATURES[name]["label"]) for name in feature_names]
+    rows.append(("burst", "fraction of cells bursting", "cividis", "fraction"))
+
+    fig, axes = plt.subplots(len(rows), 2, figsize=(16, 7 * len(rows)), squeeze=False)
+    for row_idx, (key, title, cmap, label) in enumerate(rows):
+        _panel(axes[row_idx, 0], result[f"{key}_mean"], result[f"{key}_n"], f"mean {title}",
+              cmap, label, min_n_cells)
+        _panel(axes[row_idx, 1], result[f"{key}_std"], result[f"{key}_n"], f"{title} variability (SD)",
+              "inferno", label if key != "burst" else "SD", min_n_cells)
+
+    fig.suptitle("Cross-cell variability in " + ", ".join(t for _, t, _, _ in rows) +
+                f"\n(n = {len(result['cell_ids'])}/{n_cells_total} cells, matched on held/injected "
                 f"as a fraction of each cell's own floor)",
                 fontsize=18)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.91))
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 1.0 - 0.03 * (2.0 / len(rows))))
     return fig
 
 
@@ -134,6 +167,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-n-cells", type=int, default=10,
                         help="A pixel covered by fewer than this many cells is blanked out "
                              "rather than shown as a (noisy, low-n) mean/std.")
+    parser.add_argument("--features", nargs="+", default=DEFAULT_FEATURES,
+                        choices=sorted(CROSS_CELL_FEATURES), metavar="FEATURE",
+                        help=f"Map-valued grid features to stack, in addition to bursting "
+                             f"(always included). One of {sorted(CROSS_CELL_FEATURES)}.")
+    parser.add_argument("--cells", nargs="+", default=None, metavar="CELLID",
+                        help="Restrict to these cell IDs (e.g. the curated dev set) instead of "
+                             "every 'ok' cell in the cache -- use for testing before a full-"
+                             "population run. --min-n-cells will usually need lowering to match.")
     return parser.parse_args()
 
 
@@ -144,12 +185,14 @@ def main() -> None:
     with open(args.features_cache, "rb") as f:
         features_cache = pickle.load(f)
 
-    result = stack_cross_cell(grid_cache, features_cache, args.grid_n)
-    fig = build_cross_cell_variability_fig(result, len(grid_cache), args.min_n_cells)
+    cell_ids_filter = set(args.cells) if args.cells else None
+    result = stack_cross_cell(grid_cache, features_cache, args.grid_n, args.features, cell_ids_filter)
+    fig = build_cross_cell_variability_fig(result, len(grid_cache), args.min_n_cells, args.features)
 
     figures_dir = Path(args.figures_dir)
     figures_dir.mkdir(parents=True, exist_ok=True)
-    outpath = figures_dir / f"cross_cell_variability.{args.figure_format}"
+    suffix = "_".join(args.features) if args.cells is None else "_".join(args.features) + "_test-cells"
+    outpath = figures_dir / f"cross_cell_variability_{suffix}.{args.figure_format}"
     fig.savefig(outpath, dpi=170)
     plt.close(fig)
     print(f"{len(result['cell_ids'])} cells stacked -> {outpath}")
