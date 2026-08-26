@@ -207,6 +207,32 @@ def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
         ax_kde.set_ylabel("relative frequency")
         ax_kde.legend(loc="best", fontsize=6)
         ax_kde.set_title("Do intervals form one population or two?", fontsize=9)
+
+        # Which gate actually decided this window's fate -- classify_burst_
+        # pattern checks ratio, then spikes-per-burst, then Ashman's D, each
+        # an early return, so a diagnostics field's mere PRESENCE tells you
+        # how far the window got: "avg_spikes_per_burst" is only ever added
+        # after the ratio gate passes (or is rescued), so its absence means
+        # ratio alone already rejected the window before Ashman's D could
+        # matter at all. Needed because "ashman_d" is populated on every
+        # ratio-gate rejection too (classify_burst_pattern computes it early
+        # so a strong D can rescue a modest ratio) -- so a caption that just
+        # reports "Ashman's D = {d}" unconditionally can describe a D of 100
+        # (a real, confirmed case: two near-identical intervals, e.g. 12.9ms
+        # and 13.0ms, whose near-zero internal spread inflates D despite a
+        # ratio of only 1.01x) as if it were the reason a window was called
+        # bursting/tonic, when the ratio gate -- not D -- actually decided
+        # it, and decided the opposite of what a bare "D=100" reads as
+        # (user-flagged 2026-08-26, XB2IQX held=-0.09/inj=-0.11: reported
+        # "classified as tonic, with a separation score of 100.00" with no
+        # indication that the ratio gate, not D, produced that call).
+        ratio_val = diag["isi_long_ms"] / diag["isi_short_ms"] if "isi_short_ms" in diag else None
+        ratio_meets_bar = ratio_val is not None and ratio_val >= min_isi_ratio
+        spikes_per_burst_reached = "avg_spikes_per_burst" in diag
+        spikes_per_burst_meets_bar = (spikes_per_burst_reached
+                                      and diag["avg_spikes_per_burst"] >= min_spikes_per_burst)
+        ashman_d_is_deciding_gate = ratio_meets_bar and spikes_per_burst_meets_bar
+
         # Ashman's D isn't a position on this axis (it's a scalar summarizing
         # how separated the two mode clusters are), so it can't be drawn as
         # a line the way the modes/valley are -- shown as an on-plot
@@ -218,34 +244,56 @@ def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
             # with a dip between them), so anchoring there collided with it.
             # The area below the valley dip is reliably open regardless of
             # where the two modes themselves happen to sit.
-            d, passed = diag["ashman_d"], diag["ashman_d"] >= min_ashman_d
-            ax_kde.annotate(f"separation score = {d:.2f} (>= {min_ashman_d} counts as two separate "
-                            "populations)",
-                            xy=(0.5, 0.04), xycoords="axes fraction", ha="center", va="bottom", fontsize=7,
-                            color="darkgreen" if passed else "firebrick",
+            d = diag["ashman_d"]
+            if ashman_d_is_deciding_gate:
+                passed = d >= min_ashman_d
+                text = f"separation score = {d:.2f} (>= {min_ashman_d} counts as two separate populations)"
+            else:
+                # D was computed but an earlier gate already rejected the
+                # window -- reporting it as "counts as two separate
+                # populations" here would contradict the tonic verdict
+                # (exactly the confirmed bug above), so state plainly that
+                # it wasn't the deciding factor instead of a pass/fail claim
+                # this score never actually got to make.
+                passed = False
+                text = f"separation score = {d:.2f} -- not the deciding factor (see caption)"
+            ax_kde.annotate(text, xy=(0.5, 0.04), xycoords="axes fraction", ha="center", va="bottom",
+                            fontsize=7, color="darkgreen" if passed else "firebrick",
                             bbox=dict(boxstyle="round", fc="white", ec="darkgreen" if passed else "firebrick",
                                      alpha=0.9))
 
         pieces = [f"This window contained {n_peaks} spikes, giving {len(isis_ms)} interspike intervals."]
-        if "isi_short_ms" in diag:
-            ratio = diag["isi_long_ms"] / diag["isi_short_ms"]
+        if ratio_val is not None:
+            relation = "above" if ratio_meets_bar else "below"
             pieces.append(f"Splitting the intervals at their {len(cand)} candidate population(s) gives a "
                          f"short (within-burst) interval of {diag['isi_short_ms']:.1f} ms and a long "
                          f"(between-burst) interval of {diag['isi_long_ms']:.1f} ms -- a "
-                         f"{ratio:.2f}-fold difference, above the {min_isi_ratio}-fold difference "
+                         f"{ratio_val:.2f}-fold difference, {relation} the {min_isi_ratio}-fold difference "
                          "required to treat them as distinct.")
-        if "avg_spikes_per_burst" in diag:
+            if not ratio_meets_bar:
+                pieces.append(f"Since that ratio doesn't clear the required {min_isi_ratio}-fold bar, this "
+                             "window is rejected as a single (tonic) interval population at this gate, "
+                             "before spikes-per-burst or Ashman's D are even considered as reasons to "
+                             "call it bursting.")
+        if spikes_per_burst_reached:
             pieces.append(f"On average, {diag['avg_spikes_per_burst']:.2f} spikes fall within each burst "
                          f"(a real burst requires at least {min_spikes_per_burst}, ruling out what would "
                          "otherwise just be occasional missed spikes in an otherwise tonic train).")
         if "ashman_d" in diag:
-            pieces.append(f"A statistical separation score (Ashman's D) of {diag['ashman_d']:.2f} "
-                         f"quantifies how cleanly the short and long intervals separate into two "
-                         f"distinct populations (a score of {min_ashman_d} or higher is required to "
-                         "call them separate).")
-        pieces.append(f"Taken together, this window is classified as '{result['pattern']}'"
-                     + (f", with a separation score of {result['bimodality_metric']:.2f}"
-                        if result.get("bimodality_metric") else "") + ".")
+            if ashman_d_is_deciding_gate:
+                pieces.append(f"A statistical separation score (Ashman's D) of {diag['ashman_d']:.2f} "
+                             f"quantifies how cleanly the short and long intervals separate into two "
+                             f"distinct populations (a score of {min_ashman_d} or higher is required to "
+                             "call them separate) -- this is the gate that decided this window's "
+                             f"classification.")
+            else:
+                pieces.append(f"A statistical separation score (Ashman's D) of {diag['ashman_d']:.2f} was "
+                             "also computed, but is not meaningful here: an earlier gate (ratio or "
+                             "spikes-per-burst) already rejected this window, and D can be misleadingly "
+                             "large for two intervals that are numerically almost identical (as here) "
+                             "since it grows as their own internal spread shrinks toward zero, "
+                             "independent of whether they represent two genuinely different timescales.")
+        pieces.append(f"Taken together, this window is classified as '{result['pattern']}'.")
         caption = " ".join(pieces)
 
     return result, caption
