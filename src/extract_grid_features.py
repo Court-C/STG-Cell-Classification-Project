@@ -92,6 +92,27 @@ def compute_burstiness(grid: dict) -> dict:
             "n_bursting_points": n_bursting, "n_tonic_points": n_tonic, "n_silent_points": n_silent}
 
 
+def compute_transience(grid: dict) -> dict:
+    """Fraction of confidently-classified, non-silent points whose test
+    window genuinely stopped firing before the window ended
+    (test_likely_ceased_firing=True) rather than firing through to the end
+    -- restricted to points where the question is answerable at all
+    (test_likely_ceased_firing is None for too-few-spikes points; see
+    run_test_and_recovery in run_held_injected_grid.py). Orthogonal to
+    burstiness_index above: a "bursting"-classified point can be either a
+    sustained oscillation or a one-shot transient that happened to cease
+    (see test_adaptation_ratio_extreme's override there) -- this quantifies
+    how much of that is really the latter.
+    """
+    answerable = [p for p in grid.values() if not p["blew_up"]
+                 and p["test_pattern"] not in (None, "silent")
+                 and p.get("test_likely_ceased_firing") is not None]
+    n_transient = sum(1 for p in answerable if p["test_likely_ceased_firing"])
+    transience_index = n_transient / len(answerable) if answerable else None
+    return {"transience_index": transience_index, "n_transient_points": n_transient,
+            "n_duration_answerable_points": len(answerable)}
+
+
 def compute_sag_depth_map(grid: dict, min_pre_spike_window_ms: float = 100.0) -> dict:
     """Sag depth per point (mV): hold_v_trough - test_v_min_pre_spike, i.e.
     how much FURTHER V dips below the held level's own baseline before
@@ -392,6 +413,7 @@ def extract_cell_features(cell_id: str, cell_result: dict) -> dict:
                "injected_floor_nA": cell_result["injected_floor_nA"]}
     features.update(compute_fi_slope(grid))
     features.update(compute_burstiness(grid))
+    features.update(compute_transience(grid))
     features.update(compute_summary_stats(grid))
     features.update(compute_boundary_slopes(grid))
     features["sag_depth_map"] = compute_sag_depth_map(grid)

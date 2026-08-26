@@ -334,14 +334,12 @@ def _draw_trace_axes(ax_v, ax_i, cell_id: str, held_nA: float, injected_nA: floa
     drawing code instead of a second copy that could drift out of sync.
     """
     t_hold, v_hold = tr["_trace_t_hold_ms"], tr["_trace_v_hold_mV"]
-    t_test, v_test = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
-    t_rec, v_rec = tr["_trace_t_rec_ms"], tr["_trace_v_rec_mV"]
+    v_test = tr["_trace_v_test_mV"]
+    v_rec = tr["_trace_v_rec_mV"]
 
-    dt_ms = t_hold[1] - t_hold[0] if len(t_hold) > 1 else 0.1
-    hold_end = t_hold[-1] + dt_ms if len(t_hold) else 0.0
-    t_test_off = t_test + hold_end
-    test_end = t_test_off[-1] + dt_ms if len(t_test_off) else hold_end
-    t_rec_off = t_rec + test_end
+    offsets = trace_time_offsets(tr)
+    hold_end, test_end = offsets["hold_end"], offsets["test_end"]
+    t_test_off, t_rec_off = offsets["t_test_off"], offsets["t_rec_off"]
 
     ax_v.plot(t_hold, v_hold, color="gray", lw=0.8, label=f"holding current ({held_nA:.2f} nA)")
     ax_v.plot(t_test_off, v_test, color="firebrick", lw=0.8, label=f"current step ({injected_nA:.2f} nA)")
