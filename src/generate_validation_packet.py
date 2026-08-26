@@ -43,13 +43,51 @@ from trace_annotations import (mark_spikes, mark_confirmed_vs_rejected, mark_isi
 
 DEFAULT_FIGURES_DIR = ROOT_DIR / "figures" / "validation_packet"
 
-# A train with far more spikes than this renders its raw trace/ISI panels as
-# a solid block of color / an unreadable dense line rather than
-# distinguishable spikes -- shared by every page that plots a raw voltage
-# trace or ISI-vs-index sequence next to a classification (sections 5 and 6,
-# user-flagged 2026-08-14). Crops what's DISPLAYED to the first N spikes;
-# the classification itself is always computed from the full train.
-MAX_DISPLAYED_SPIKES = 25
+# A train with more spikes than this renders its raw trace/ISI panels as a
+# solid block of color / an unreadable dense line rather than distinguishable
+# spikes, so the DISPLAYED window is cropped to its first DISPLAY_WINDOW_MS --
+# shared by every page that plots a raw voltage trace or ISI-vs-index
+# sequence next to a classification (sections 5 and 6, user-flagged
+# 2026-08-14). A trace with fewer spikes than this is left uncropped: a slow,
+# low-spike-count bursting train (e.g. 11 spikes over 3s) is already readable
+# at its full, natural window, and a fixed time crop would instead cut off
+# most of its inter-burst rhythm for no reason. The classification itself is
+# always computed from the full train regardless.
+CROP_TRIGGER_N_SPIKES = 25
+
+# A fixed TIME window, not a fixed spike COUNT (superseded 2026-08-26 for
+# whatever trace DOES get cropped, per CROP_TRIGGER_N_SPIKES above): the
+# first N spikes of a fast train and the first N spikes of a slow train span
+# very different real durations, so a spike-count-derived crop width doesn't
+# give a consistent, actually-readable window across different firing rates
+# -- confirmed still "too saturated to make out individual spikes" on a
+# ~60Hz tonic train even cropped to its first 25 spikes (~420ms). 500ms
+# keeps a fast tonic train's individual spikes visually distinct.
+DISPLAY_WINDOW_MS = 500.0
+
+
+def _crop_display_window(ax_v, ax_isi, t: np.ndarray, peaks: np.ndarray,
+                         window_ms: float = DISPLAY_WINDOW_MS,
+                         trigger_n_spikes: int = CROP_TRIGGER_N_SPIKES) -> None:
+    """Crops the DISPLAYED voltage trace (`ax_v`) and ISI-vs-index panel
+    (`ax_isi`) to this trace's first `window_ms`, but only when it's actually
+    dense enough to need it (more than `trigger_n_spikes` spikes) -- see
+    CROP_TRIGGER_N_SPIKES/DISPLAY_WINDOW_MS's docstrings for why each of
+    those is a separate decision (whether to crop vs. how wide the crop is).
+    No-op if the trace doesn't meet the trigger, or is already shorter than
+    the window. The classification itself (caption text, KDE curve,
+    separation score) is always computed from the full train; this only
+    narrows what's drawn.
+    """
+    if len(peaks) <= trigger_n_spikes:
+        return
+    if len(t) == 0 or t[-1] - t[0] <= window_ms:
+        return
+    crop_end_ms = t[0] + window_ms
+    ax_v.set_xlim(t[0], crop_end_ms)
+    n_isis_in_window = int(np.sum(t[peaks] <= crop_end_ms)) - 1
+    if n_isis_in_window >= 1:
+        ax_isi.set_xlim(0.5, n_isis_in_window + 0.5)
 
 
 def _wrap(text: str, width: int = 100) -> str:
@@ -536,17 +574,14 @@ def make_burst_classification_page(cell_id, exemplars, resim, run_args) -> plt.F
             min_ashman_d=run_args.get("min_ashman_d", 2.0))
         # A train with far more spikes than this renders as a solid block
         # of color rather than distinguishable spikes -- crop the DISPLAYED
-        # window to its first MAX_DISPLAYED_SPIKES only (user-flagged
+        # window to its first DISPLAY_WINDOW_MS only (user-flagged
         # 2026-08-14: the near-miss/tonic example fires 179 times in the
         # same window the bursting example fires 11, so the two rows won't
         # share a time axis here even though they happen to share a window
         # length). The classification itself -- caption text, KDE curve,
         # separation score -- is still computed from the full train; this
         # only narrows what's drawn, not what's measured.
-        if len(peaks) > MAX_DISPLAYED_SPIKES:
-            crop_end_ms = t[peaks[MAX_DISPLAYED_SPIKES - 1]] + 0.05 * (t[-1] - t[0])
-            ax_v.set_xlim(t[0], crop_end_ms)
-            ax_isi.set_xlim(0.5, MAX_DISPLAYED_SPIKES - 0.5)
+        _crop_display_window(ax_v, ax_isi, t, peaks)
         ax_v.set_title(f"{tag} (held={held_nA:.2f} nA, injected={injected_nA:.2f} nA): "
                       f"classified as {_describe_pattern(result['pattern'])}", fontsize=9, wrap=True)
         captions.append((ax_v, ax_kde, caption))
@@ -605,10 +640,11 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
     labeled as synthetic rather than omitted, so the gate's purpose is still
     demonstrated even though it has been inert on real data so far.
 
-    Each row's log-ISI panel scales to its OWN data range, and each row's
-    raw trace/ISI-index panels crop to at most MAX_DISPLAYED_SPIKES, for the
-    same reasons as make_burst_classification_page (user-flagged 2026-08-14
-    for section 5, extended here to section 6): a shared x-axis across rows
+    Each row's log-ISI panel scales to its OWN data range, and each real
+    row's raw trace/ISI-index panels crop to at most DISPLAY_WINDOW_MS, for
+    the same reasons as make_burst_classification_page (user-flagged
+    2026-08-14 for section 5, extended here to section 6): a shared x-axis
+    across rows
     this different in scale and firing rate hides the tight examples'
     structure rather than showing it.
     """
@@ -633,10 +669,7 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
             ax_isi, ax_kde, t, v, run_args["min_isis_for_burst_test"],
             run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
             min_ashman_d=run_args.get("min_ashman_d", 2.0))
-        if len(peaks) > MAX_DISPLAYED_SPIKES:
-            crop_end_ms = t[peaks[MAX_DISPLAYED_SPIKES - 1]] + 0.05 * (t[-1] - t[0])
-            ax_v.set_xlim(t[0], crop_end_ms)
-            ax_isi.set_xlim(0.5, MAX_DISPLAYED_SPIKES - 0.5)
+        _crop_display_window(ax_v, ax_isi, t, peaks)
         if tag.startswith("separation-score near-miss"):
             # This row's whole point is a real ~0.1ms separation between the
             # short and long interval populations -- the default zero-
@@ -659,8 +692,15 @@ def make_bimodality_teaching_page(cell_id, real_exemplars, resim, run_args) -> p
         run_args["isi_mode_prominence_frac"], run_args["min_isi_ratio"],
         min_ashman_d=run_args.get("min_ashman_d", 2.0), isis_override=synthetic_isis,
         n_peaks_override=synthetic_n_peaks)
-    if synthetic_n_peaks > MAX_DISPLAYED_SPIKES:
-        ax_isi.set_xlim(0.5, MAX_DISPLAYED_SPIKES - 0.5)
+    # This row has no simulated trace/time axis (a hand-built ISI sequence),
+    # so DISPLAY_WINDOW_MS's time-based crop doesn't apply -- kept as the
+    # original fixed-spike-count crop instead, matching every other row's
+    # displayed span closely enough (a ~13ms-ISI train's first 25 spikes is
+    # ~325ms, in the same ballpark as DISPLAY_WINDOW_MS) without needing a
+    # fabricated time axis just to reuse _crop_display_window.
+    SYNTHETIC_DISPLAY_SPIKES = 25
+    if synthetic_n_peaks > SYNTHETIC_DISPLAY_SPIKES:
+        ax_isi.set_xlim(0.5, SYNTHETIC_DISPLAY_SPIKES - 0.5)
     ax_isi.set_title(f"Interspike intervals -- classified as {_describe_pattern(result['pattern'])}",
                     fontsize=9)
     captions.append((ax_v, ax_kde, f"This example is constructed, not an observed point from {cell_id}: it "

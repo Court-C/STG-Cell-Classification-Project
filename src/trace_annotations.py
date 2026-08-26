@@ -238,27 +238,32 @@ def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
         # a line the way the modes/valley are -- shown as an on-plot
         # annotation instead of only in the caption below, so the pass/fail
         # margin against the threshold is visible without reading text.
-        if "ashman_d" in diag:
+        #
+        # Only drawn when Ashman's D is actually the gate that decided this
+        # window -- otherwise the number itself is meaningless noise, not
+        # just miscolored: it's computed early (see classify_burst_pattern)
+        # so a strong D can rescue a modest ratio, which means a window the
+        # RATIO gate already rejected outright (e.g. two near-identical
+        # intervals, 12.9ms and 13.0ms, a 1.01x difference -- the log-ISI
+        # plot shows this as two KDE modes right on top of each other) can
+        # still carry an astronomical D (~100) purely because near-zero
+        # internal spread inflates it, with no real second timescale behind
+        # it. Stating that number -- even caveated -- invites a reader to
+        # treat it as evidence either way; simply not showing it is more
+        # honest than showing a number that was never the reason for
+        # anything (user-flagged 2026-08-26, XB2IQX held=-0.09/inj=-0.11).
+        if "ashman_d" in diag and ashman_d_is_deciding_gate:
             # Bottom-center, not a corner: the mode/valley legend's loc="best"
             # consistently lands top-right on this shape of curve (two peaks
             # with a dip between them), so anchoring there collided with it.
             # The area below the valley dip is reliably open regardless of
             # where the two modes themselves happen to sit.
             d = diag["ashman_d"]
-            if ashman_d_is_deciding_gate:
-                passed = d >= min_ashman_d
-                text = f"separation score = {d:.2f} (>= {min_ashman_d} counts as two separate populations)"
-            else:
-                # D was computed but an earlier gate already rejected the
-                # window -- reporting it as "counts as two separate
-                # populations" here would contradict the tonic verdict
-                # (exactly the confirmed bug above), so state plainly that
-                # it wasn't the deciding factor instead of a pass/fail claim
-                # this score never actually got to make.
-                passed = False
-                text = f"separation score = {d:.2f} -- not the deciding factor (see caption)"
-            ax_kde.annotate(text, xy=(0.5, 0.04), xycoords="axes fraction", ha="center", va="bottom",
-                            fontsize=7, color="darkgreen" if passed else "firebrick",
+            passed = d >= min_ashman_d
+            ax_kde.annotate(f"separation score = {d:.2f} (>= {min_ashman_d} counts as two separate "
+                            "populations)",
+                            xy=(0.5, 0.04), xycoords="axes fraction", ha="center", va="bottom", fontsize=7,
+                            color="darkgreen" if passed else "firebrick",
                             bbox=dict(boxstyle="round", fc="white", ec="darkgreen" if passed else "firebrick",
                                      alpha=0.9))
 
@@ -286,13 +291,19 @@ def mark_isi_classification(ax_isi, ax_kde, t_ms: np.ndarray, v_mV: np.ndarray,
                              f"distinct populations (a score of {min_ashman_d} or higher is required to "
                              "call them separate) -- this is the gate that decided this window's "
                              f"classification.")
+            elif not ratio_meets_bar:
+                # No point stating the number: an earlier gate (the ratio,
+                # here) already rejected this window on its own, and the log
+                # scale above shows why -- the two candidate populations are
+                # visibly right on top of each other, not two real
+                # timescales, so a separation score computed on them isn't
+                # meaningful regardless of what it comes out to.
+                pieces.append("Ashman's D was not evaluated as a reason to call this bursting: the ratio "
+                             "above already shows the two candidate populations are essentially the same "
+                             "interval, not two separate timescales.")
             else:
-                pieces.append(f"A statistical separation score (Ashman's D) of {diag['ashman_d']:.2f} was "
-                             "also computed, but is not meaningful here: an earlier gate (ratio or "
-                             "spikes-per-burst) already rejected this window, and D can be misleadingly "
-                             "large for two intervals that are numerically almost identical (as here) "
-                             "since it grows as their own internal spread shrinks toward zero, "
-                             "independent of whether they represent two genuinely different timescales.")
+                pieces.append("Ashman's D was not evaluated as a reason to call this bursting: the "
+                             "spikes-per-burst count above already rejected this window.")
         pieces.append(f"Taken together, this window is classified as '{result['pattern']}'.")
         caption = " ".join(pieces)
 
