@@ -272,6 +272,25 @@ def resimulate_point(params, y_ss, baseline_freq_hz, held_nA, injected_nA, cell_
     return tr
 
 
+def trace_time_offsets(tr: dict) -> dict:
+    """Computes the offset time arrays _draw_trace_axes stitches the three
+    trace segments (hold/test/recovery) together with -- split out so a
+    caller that wants to annotate a POINT within the stitched trace (e.g.
+    plot_grid_overview.py's sag-calculation annotation, which needs to place
+    an arrow at a specific sample of the test segment in the same stitched
+    time coordinate the plot is actually drawn in) can reuse this instead of
+    a second copy of the offset arithmetic.
+    """
+    t_hold = tr["_trace_t_hold_ms"]
+    t_test, t_rec = tr["_trace_t_test_ms"], tr["_trace_t_rec_ms"]
+    dt_ms = t_hold[1] - t_hold[0] if len(t_hold) > 1 else 0.1
+    hold_end = t_hold[-1] + dt_ms if len(t_hold) else 0.0
+    t_test_off = t_test + hold_end
+    test_end = t_test_off[-1] + dt_ms if len(t_test_off) else hold_end
+    t_rec_off = t_rec + test_end
+    return {"hold_end": hold_end, "test_end": test_end, "t_test_off": t_test_off, "t_rec_off": t_rec_off}
+
+
 def _draw_trace_axes(ax_v, ax_i, cell_id: str, held_nA: float, injected_nA: float,
                      test_pattern: str, rebound_pattern: str, tr: dict) -> None:
     """Draws the V(t)/I(t) trace into a caller-supplied pair of axes --
@@ -281,14 +300,12 @@ def _draw_trace_axes(ax_v, ax_i, cell_id: str, held_nA: float, injected_nA: floa
     drawing code instead of a second copy that could drift out of sync.
     """
     t_hold, v_hold = tr["_trace_t_hold_ms"], tr["_trace_v_hold_mV"]
-    t_test, v_test = tr["_trace_t_test_ms"], tr["_trace_v_test_mV"]
-    t_rec, v_rec = tr["_trace_t_rec_ms"], tr["_trace_v_rec_mV"]
+    v_test = tr["_trace_v_test_mV"]
+    v_rec = tr["_trace_v_rec_mV"]
 
-    dt_ms = t_hold[1] - t_hold[0] if len(t_hold) > 1 else 0.1
-    hold_end = t_hold[-1] + dt_ms if len(t_hold) else 0.0
-    t_test_off = t_test + hold_end
-    test_end = t_test_off[-1] + dt_ms if len(t_test_off) else hold_end
-    t_rec_off = t_rec + test_end
+    offsets = trace_time_offsets(tr)
+    hold_end, test_end = offsets["hold_end"], offsets["test_end"]
+    t_test_off, t_rec_off = offsets["t_test_off"], offsets["t_rec_off"]
 
     ax_v.plot(t_hold, v_hold, color="gray", lw=0.8, label=f"holding current ({held_nA:.2f} nA)")
     ax_v.plot(t_test_off, v_test, color="firebrick", lw=0.8, label=f"current step ({injected_nA:.2f} nA)")
@@ -296,10 +313,25 @@ def _draw_trace_axes(ax_v, ax_i, cell_id: str, held_nA: float, injected_nA: floa
              label=f"recovery, released to {held_nA:.2f} nA")
     ax_v.axvline(hold_end, color="black", ls=":", lw=1)
     ax_v.axvline(test_end, color="black", ls=":", lw=1)
+
+    # Floor the V-axis autoscale at a 5 mV span (user-specified rule,
+    # 2026-08-21): matplotlib's default autoscale zooms tight to the data's
+    # own min/max, which for a near-flat trace (e.g. a "silent" point's
+    # sub-mV settling wiggle) blows a tiny, physiologically meaningless
+    # fluctuation up to fill the whole panel -- confirmed directly on a real
+    # silent-point trace autoscaled to a ~0.45 mV span. Expands symmetrically
+    # around the data's own center only when the natural range is already
+    # narrower than 5 mV; a genuinely large-amplitude trace (a real spike)
+    # is left alone.
+    y0, y1 = ax_v.get_ylim()
+    if y1 - y0 < 5.0:
+        mid = 0.5 * (y0 + y1)
+        ax_v.set_ylim(mid - 2.5, mid + 2.5)
+
     ax_v.set_ylabel("membrane potential (mV)")
-    ax_v.legend(loc="upper right", fontsize=7)
+    ax_v.legend(loc="upper right", fontsize=16)
     ax_v.set_title(f"{cell_id}: {describe_pattern(test_pattern)} during the current step, then "
-                   f"{describe_pattern(rebound_pattern)}", fontsize=9)
+                   f"{describe_pattern(rebound_pattern)}", fontsize=13)
 
     t_current = np.concatenate([t_hold, t_test_off, t_rec_off])
     i_current = np.concatenate([np.full_like(t_hold, held_nA),
@@ -328,7 +360,7 @@ def plot_example_trace(cell_id: str, held_nA: float, injected_nA: float,
                        outdir: Path, command: str, fig_format: str) -> Path:
     fig = build_example_trace_figure(cell_id, held_nA, injected_nA, test_pattern, rebound_pattern, tr)
     fig.text(0.5, 0.01, command, ha="center", va="bottom",
-             fontsize=6, family="monospace", color="dimgray", wrap=True)
+             fontsize=15, family="monospace", color="dimgray", wrap=True)
 
     cell_dir = outdir / cell_id
     cell_dir.mkdir(parents=True, exist_ok=True)

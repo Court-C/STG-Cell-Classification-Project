@@ -1213,6 +1213,17 @@ REBOUND_PATTERN_COLORS = {"none": "gray", "single_spike": "steelblue",
 # rendered as BLANK_COLOR (see _panel_categorical's blank_labels), not their
 # nominal colors above, so this dict's colors for them are unused in practice.
 REBOUND_BLANK_LABELS = {"none", "not_applicable"}
+# Orthogonal to PATTERN_COLORS (2026-08-21, user-flagged): test_pattern's
+# "bursting" currently absorbs two very different things -- a train that
+# genuinely oscillates in a sustained short/long rhythm for the whole
+# window, and one that fires once and then genuinely stops
+# (test_likely_ceased_firing, see run_test_and_recovery's
+# test_adaptation_ratio_extreme override) -- with no way to tell them apart
+# on any existing panel. This surfaces that duration signal as its own
+# categorical panel instead of leaving it folded silently into "bursting".
+FIRING_DURATION_COLORS = {"sustained": "steelblue", "transient": "darkorange",
+                          "not_applicable": "lightgray"}
+FIRING_DURATION_BLANK_LABELS = {"not_applicable"}
 NO_DATA_COLOR = (1.0, 1.0, 1.0, 1.0)  # plain white: a pixel with nothing to report,
 # whether that's a genuinely missing grid coordinate or a blank_labels category --
 # a reader doesn't need three shades of gray individually justified to read
@@ -1228,6 +1239,20 @@ def _test_pattern_map(cell_result: dict, features: dict) -> dict:
 def _rebound_pattern_map(cell_result: dict, features: dict) -> dict:
     rp_names = list(REBOUND_PATTERN_COLORS.keys())
     return {k: rp_names.index(v) for k, v in (features.get("rebound_pattern_map") or {}).items()}
+
+
+def _firing_duration_map(cell_result: dict, features: dict) -> dict:
+    # test_likely_ceased_firing is None whenever the question isn't even
+    # answerable (fewer than 2 spikes in the test window -- see
+    # run_test_and_recovery) -- rendered "not_applicable"/blank, same
+    # convention as rebound_pattern's "none"/"not_applicable".
+    names = list(FIRING_DURATION_COLORS.keys())
+    out = {}
+    for p in cell_result["grid"].values():
+        ceased = p.get("test_likely_ceased_firing")
+        label = "not_applicable" if ceased is None else ("transient" if ceased else "sustained")
+        out[(p["held_nA"], p["injected_nA"])] = names.index(label)
+    return out
 
 
 def _spikes_per_burst_map(cell_result: dict, features: dict) -> dict:
@@ -1261,38 +1286,55 @@ def _iH_map(cell_result: dict, features: dict) -> dict:
 # given panel is describing (rebound_pattern/rebound_* are recovery-phase by
 # their name alone, but e.g. sag_depth or adaptation_ratio are not obviously
 # test-phase without this).
+# Standardized color scheme (2026-08-21, user-specified): every "map" panel
+# is colored by which SEMANTIC group its unit belongs to, not individually --
+# so any two panels a reader would naturally compare (e.g. the four Hz-rate
+# panels, or the two mV panels) share one colormap, while panels from
+# different groups are visually distinct at a glance. Limited to
+# matplotlib's 5 perceptually-uniform "viridis-family" maps (viridis,
+# plasma, magma, cividis, inferno) -- excludes the mismatched ColorBrewer
+# maps (YlGnBu/YlOrBr/Oranges) previously used ad hoc for a few panels.
+CMAP_RATE = "viridis"      # Hz: firing_rate, intra_burst_rate, burst_freq_approx, recovery_firing_rate
+CMAP_COUNT = "plasma"      # count / spike count / spikes-per-burst: n_bursts, rebound_count, spikes_per_burst
+CMAP_READOUT = "magma"     # single-point physiological readout (mV or nA): sag_depth, rebound_peak_mV, iH_recovery_trough
+CMAP_RATIO = "cividis"     # unitless ratio/fraction: adaptation_ratio, rebound_occurred
+CMAP_TIME = "inferno"      # ms: rebound_latency
+
 PARAMETER_PANELS = [
     # --- test phase ---
     dict(key="test_pattern", title="test-window firing pattern", kind="categorical", phase="test",
         value_map_fn=_test_pattern_map, colors=PATTERN_COLORS, blank_labels=frozenset()),
-    dict(key="firing_rate", title="test-window firing rate", kind="map", cmap="viridis", label="Hz",
+    dict(key="firing_duration", title="firing duration (test window)", kind="categorical", phase="test",
+        value_map_fn=_firing_duration_map, colors=FIRING_DURATION_COLORS,
+        blank_labels=FIRING_DURATION_BLANK_LABELS),
+    dict(key="firing_rate", title="test-window firing rate", kind="map", cmap=CMAP_RATE, label="Hz",
         phase="test", value_map_fn=lambda cr, f: f.get("firing_rate_map") or {}),
-    dict(key="intra_burst_rate", title="intra-burst rate", kind="map", cmap="cividis", label="Hz",
+    dict(key="intra_burst_rate", title="intra-burst rate", kind="map", cmap=CMAP_RATE, label="Hz",
         phase="test", value_map_fn=lambda cr, f: f.get("intra_burst_rate_map") or {}),
-    dict(key="burst_freq_approx", title="burst freq, approx", kind="map", cmap="cividis", label="Hz",
+    dict(key="burst_freq_approx", title="burst freq, approx", kind="map", cmap=CMAP_RATE, label="Hz",
         phase="test", value_map_fn=lambda cr, f: f.get("burst_freq_approx_map") or {}),
-    dict(key="n_bursts", title="n bursts", kind="map", cmap="plasma", label="count",
+    dict(key="n_bursts", title="n bursts", kind="map", cmap=CMAP_COUNT, label="count",
         phase="test", value_map_fn=lambda cr, f: f.get("n_bursts_map") or {}),
-    dict(key="sag_depth", title="sag depth", kind="map", cmap="YlGnBu", label="mV",
+    dict(key="sag_depth", title="sag depth", kind="map", cmap=CMAP_READOUT, label="mV",
         phase="test", value_map_fn=lambda cr, f: f.get("sag_depth_map") or {}),
-    dict(key="adaptation_ratio", title="adaptation ratio (tonic)", kind="map", cmap="plasma", label="ratio",
+    dict(key="adaptation_ratio", title="adaptation ratio (tonic)", kind="map", cmap=CMAP_RATIO, label="ratio",
         phase="test", value_map_fn=lambda cr, f: f.get("adaptation_ratio_map") or {}),
-    dict(key="spikes_per_burst", title="spikes per burst (bursting only)", kind="map", cmap="plasma",
+    dict(key="spikes_per_burst", title="spikes per burst (bursting only)", kind="map", cmap=CMAP_COUNT,
         label="spikes/burst", phase="test", value_map_fn=_spikes_per_burst_map),
     # --- recovery phase ---
     dict(key="rebound_pattern", title="rebound pattern", kind="categorical", phase="recovery",
         value_map_fn=_rebound_pattern_map, colors=REBOUND_PATTERN_COLORS, blank_labels=REBOUND_BLANK_LABELS),
-    dict(key="recovery_firing_rate", title="recovery-window firing rate", kind="map", cmap="viridis",
+    dict(key="recovery_firing_rate", title="recovery-window firing rate", kind="map", cmap=CMAP_RATE,
         label="Hz", phase="recovery", value_map_fn=lambda cr, f: f.get("recovery_firing_rate_map") or {}),
-    dict(key="rebound_occurred", title="rebound occurred", kind="map", cmap="Oranges", label="fraction",
+    dict(key="rebound_occurred", title="rebound occurred", kind="map", cmap=CMAP_RATIO, label="fraction",
         phase="recovery", value_map_fn=lambda cr, f: f.get("rebound_occurred_map") or {}),
-    dict(key="rebound_count", title="rebound spike count", kind="map", cmap="YlOrBr", label="spike count",
+    dict(key="rebound_count", title="rebound spike count", kind="map", cmap=CMAP_COUNT, label="spike count",
         phase="recovery", value_map_fn=lambda cr, f: f.get("rebound_count_map") or {}),
-    dict(key="rebound_latency", title="rebound latency", kind="map", cmap="viridis", label="ms",
+    dict(key="rebound_latency", title="rebound latency", kind="map", cmap=CMAP_TIME, label="ms",
         phase="recovery", value_map_fn=lambda cr, f: f.get("rebound_latency_map") or {}),
-    dict(key="rebound_peak_mV", title="rebound peak", kind="map", cmap="magma", label="mV",
+    dict(key="rebound_peak_mV", title="rebound peak", kind="map", cmap=CMAP_READOUT, label="mV",
         phase="recovery", value_map_fn=lambda cr, f: f.get("rebound_peak_mV_map") or {}),
-    dict(key="iH_recovery_trough", title="i_H at recovery trough (silenced only)", kind="map", cmap="magma",
+    dict(key="iH_recovery_trough", title="i_H at recovery trough (silenced only)", kind="map", cmap=CMAP_READOUT,
         label="nA", phase="recovery", value_map_fn=_iH_map),
 ]
 PARAMETER_PANELS_BY_KEY = {spec["key"]: spec for spec in PARAMETER_PANELS}
@@ -1337,11 +1379,17 @@ def _exact_grid_matrix(value_map: dict, held_levels, injected_levels) -> np.ndar
 
 def _panel_map(ax, value_map, held_levels, injected_levels, extent, cmap, label, title):
     """Shared continuous-panel renderer for plot_cell_grid_features -- an
-    exact per-point matrix (see _exact_grid_matrix), imshow'd with
-    interpolation="nearest" (meaning: no resampling/blending even when the
-    figure's saved pixel density differs from the grid's own N_held x
-    N_injected point count -- every displayed pixel still traces to
-    exactly one real matrix cell, never an average of neighbors).
+    exact per-point matrix (see _exact_grid_matrix), imshow'd with a smooth
+    continuous color gradient and interpolation="nearest" (meaning: no
+    resampling/BLENDING of neighboring grid cells even when the figure's
+    saved pixel density differs from the grid's own N_held x N_injected
+    point count -- every displayed pixel still traces to exactly one real
+    matrix cell -- this is about pixel sampling, not color binning, so it's
+    independent of the gradient being smooth vs discretized). Only the two
+    categorical panels (test_pattern/rebound_pattern, rendered by
+    _panel_categorical instead) are meant to look discrete/blocky
+    (user-specified 2026-08-21); every other panel here should read as a
+    genuine continuous gradient.
     """
     matrix = _exact_grid_matrix(value_map, held_levels, injected_levels)
     if np.all(np.isnan(matrix)):
@@ -1350,8 +1398,10 @@ def _panel_map(ax, value_map, held_levels, injected_levels, extent, cmap, label,
     else:
         im = ax.imshow(matrix, origin="lower", extent=extent, aspect="auto", cmap=cmap,
                        interpolation="nearest")
-        plt.colorbar(im, ax=ax, label=label)
-    ax.set_title(title, fontsize=9)
+        cbar = plt.colorbar(im, ax=ax, label=label)
+        cbar.set_label(label, fontsize=16)
+        cbar.ax.tick_params(labelsize=15)
+    ax.set_title(title, fontsize=18)
 
 
 def _panel_categorical(ax, value_map, held_levels, injected_levels, extent, colors, title,
@@ -1380,10 +1430,10 @@ def _panel_categorical(ax, value_map, held_levels, injected_levels, extent, colo
     rgba = cmap(norm(np.where(blank, 0, matrix)))
     rgba[blank] = NO_DATA_COLOR
     ax.imshow(rgba, origin="lower", extent=extent, aspect="auto", interpolation="nearest")
-    ax.set_title(title, fontsize=9)
+    ax.set_title(title, fontsize=18)
     handles = [plt.Line2D([0], [0], marker="s", color="w", markerfacecolor=c, markersize=8, label=lbl)
               for lbl, c in colors.items() if lbl not in blank_labels]
-    ax.legend(handles=handles, loc="best", fontsize=6)
+    ax.legend(handles=handles, loc="best", fontsize=15)
 
 
 def draw_parameter_panel(ax, cell_result: dict, features: dict, parameter_key: str) -> dict:
@@ -1427,7 +1477,7 @@ def build_cell_grid_features_fig(cell_result: dict, features: dict, bottom_margi
     Merged replacement for the old plot_cell_grid (6 panels, this module)
     + plot_cell_features (12 panels, extract_grid_features.py) -- 4 of the
     6/12 were exact duplicates (firing rate, rebound count, rebound
-    latency, spikes/burst); this shows the 15 genuinely distinct panels
+    latency, spikes/burst); this shows the 16 genuinely distinct panels
     once each, grouped by which simulated phase each one's data comes from
     (test phase: during the injected current step; recovery phase: after
     release back to held, watching for rebound -- see PARAMETER_PANELS'
@@ -1455,22 +1505,27 @@ def build_cell_grid_features_fig(cell_result: dict, features: dict, bottom_margi
     # values left/bottom, 0 at right/top -- the standard Cartesian
     # convention.
     #
-    # 6 rows, not 4: rows 0 and 3 are thin spacer/header rows (all 4 axes
+    # 7 rows, not 4: rows 0 and 4 are thin spacer/header rows (all 4 axes
     # turned off, used only to host a bold "TEST PHASE"/"RECOVERY PHASE"
     # label -- see below), so the phase boundary is a real visual gap, not
-    # just the panels themselves running together. Rows 1-2 hold the 8
-    # test-phase panels (a full 2x4), rows 4-5 hold the 7 recovery-phase
-    # panels (2x4, one slot left blank).
-    fig, axes = plt.subplots(6, 4, figsize=(19, 22), gridspec_kw={"height_ratios": [0.12, 1, 1, 0.12, 1, 1]})
-    for row in (0, 3):
+    # just the panels themselves running together. Rows 1-3 hold the 9
+    # test-phase panels (2x4 plus one, same "extra row with mostly-blank
+    # slots" pattern recovery already used for its own uneven count), rows
+    # 5-6 hold the 7 recovery-phase panels (2x4, one slot left blank).
+    fig, axes = plt.subplots(7, 4, figsize=(19, 25),
+                             gridspec_kw={"height_ratios": [0.12, 1, 1, 1, 0.12, 1, 1]})
+    for row in (0, 4):
         for col in range(4):
             axes[row, col].axis("off")
-    axes[5, 3].axis("off")
+    for col in range(1, 4):
+        axes[3, col].axis("off")
+    axes[6, 3].axis("off")
 
     test_axes = [axes[1, 0], axes[1, 1], axes[1, 2], axes[1, 3],
-                axes[2, 0], axes[2, 1], axes[2, 2], axes[2, 3]]
-    recovery_axes = [axes[4, 0], axes[4, 1], axes[4, 2], axes[4, 3],
-                     axes[5, 0], axes[5, 1], axes[5, 2]]
+                axes[2, 0], axes[2, 1], axes[2, 2], axes[2, 3],
+                axes[3, 0]]
+    recovery_axes = [axes[5, 0], axes[5, 1], axes[5, 2], axes[5, 3],
+                     axes[6, 0], axes[6, 1], axes[6, 2]]
     for ax, spec in zip(test_axes, TEST_PHASE_PANELS):
         draw_parameter_panel(ax, cell_result, features, spec["key"])
     for ax, spec in zip(recovery_axes, RECOVERY_PHASE_PANELS):
@@ -1479,9 +1534,9 @@ def build_cell_grid_features_fig(cell_result: dict, features: dict, bottom_margi
     for ax in axes.flat:
         if not ax.axison:
             continue
-        ax.set_xlabel("held (nA)", fontsize=7)
-        ax.set_ylabel("injected (nA)", fontsize=7)
-        ax.tick_params(labelsize=7)
+        ax.set_xlabel("held (nA)", fontsize=16)
+        ax.set_ylabel("injected (nA)", fontsize=16)
+        ax.tick_params(labelsize=15)
 
     # Left title-less: tight_layout's rect still reserves the same top/
     # bottom margin whether or not a suptitle/footer is added yet, so each
@@ -1496,10 +1551,10 @@ def build_cell_grid_features_fig(cell_result: dict, features: dict, bottom_margi
     # (fig.transFigure y-center) rather than a guessed figure-fraction --
     # must run AFTER tight_layout so it lands exactly centered in the gap
     # tight_layout actually resolved, regardless of figure size/DPI.
-    for row, label in ((0, "TEST PHASE"), (3, "RECOVERY PHASE")):
+    for row, label in ((0, "TEST PHASE"), (4, "RECOVERY PHASE")):
         bbox = axes[row, 0].get_position()
         fig.text(0.5, bbox.y0 + 0.5 * bbox.height, label, ha="center", va="center",
-                 fontsize=14, fontweight="bold", color="dimgray")
+                 fontsize=23, fontweight="bold", color="dimgray")
     return fig
 
 
@@ -1529,9 +1584,9 @@ def plot_cell_grid_features(cell_result: dict, features: dict, outdir: Path, com
     if fig is None:
         return
     cell_id = cell_result["cell_id"]
-    fig.suptitle(grid_features_title(cell_result, features), fontsize=10)
+    fig.suptitle(grid_features_title(cell_result, features), fontsize=19)
     fig.text(0.5, 0.005, command, ha="center", va="bottom",
-             fontsize=6, family="monospace", color="dimgray", wrap=True)
+             fontsize=15, family="monospace", color="dimgray", wrap=True)
     outpath = outdir / f"{cell_id}_grid.{fig_format}"
     fig.savefig(outpath, format=fig_format, dpi=170)
     plt.close(fig)

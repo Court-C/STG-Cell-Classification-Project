@@ -72,13 +72,18 @@ def resolve_grid_point(cell_result: dict, held_nA: float, injected_nA: float) ->
 
 def draw_parameter_trace_panel(fig: plt.Figure, subplot_spec, cell_id: str, cell_result: dict,
                                features: dict, parameter: str, held_nA: float, injected_nA: float,
-                               tr: dict) -> None:
+                               tr: dict) -> tuple:
     """Draws one heatmap(+marked point)/trace panel into `subplot_spec` (a
     matplotlib SubplotSpec -- e.g. one cell of an outer GridSpec) -- split
     out of build_parameter_trace_figure so a caller building a page with
     SEVERAL examples (e.g. a curated-examples summary page) can lay out
     multiple panels on one figure via nested GridSpecs instead of gluing
     together several independent Figures.
+
+    Returns (ax_heat, ax_v, ax_i) so a caller that needs to add its own
+    further annotation on top (e.g. plot_grid_overview.py's sag-calculation
+    page, which draws a baseline/arrow on ax_v) can do so without
+    re-deriving which axes is which.
     """
     point = resolve_grid_point(cell_result, held_nA, injected_nA)
     spec = PARAMETER_PANELS_BY_KEY[parameter]
@@ -104,7 +109,8 @@ def draw_parameter_trace_panel(fig: plt.Figure, subplot_spec, cell_id: str, cell
                      point["test_pattern"], point["rebound_pattern"], tr)
     ax_v.set_title(f"{spec['title']} = {value_str} at held={held_nA:+.2f} nA, injected={injected_nA:+.2f} nA\n"
                    f"{describe_pattern(point['test_pattern'])} during the current step, then "
-                   f"{describe_pattern(point['rebound_pattern'])}", fontsize=9)
+                   f"{describe_pattern(point['rebound_pattern'])}", fontsize=13)
+    return ax_heat, ax_v, ax_i
 
 
 def build_parameter_trace_figure(cell_id: str, cell_result: dict, features: dict, parameter: str,
@@ -113,7 +119,7 @@ def build_parameter_trace_figure(cell_id: str, cell_result: dict, features: dict
     gs = fig.add_gridspec(1, 1)
     draw_parameter_trace_panel(fig, gs[0, 0], cell_id, cell_result, features, parameter,
                                held_nA, injected_nA, tr)
-    fig.suptitle(cell_id, fontsize=10)
+    fig.suptitle(cell_id, fontsize=19)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
     return fig
 

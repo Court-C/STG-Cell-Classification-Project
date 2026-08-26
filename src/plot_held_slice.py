@@ -95,10 +95,10 @@ def build_held_slice_figure(cell_id: str, cell_result: dict, features: dict, par
         ax_curve.plot(xs, ys, marker="o", ms=4, color=color, label=f"held={held_nA:+.2f} nA")
 
     ax_curve.set_xlabel("injected current (nA)")
-    ax_curve.legend(loc="best", fontsize=8)
-    ax_curve.set_title(f"{spec['title']} vs. injected current", fontsize=9)
+    ax_curve.legend(loc="best", fontsize=17)
+    ax_curve.set_title(f"{spec['title']} vs. injected current", fontsize=18)
 
-    fig.suptitle(f"{cell_id} — {spec['title']}", fontsize=10)
+    fig.suptitle(f"{cell_id} — {spec['title']}", fontsize=19)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     return fig
 
