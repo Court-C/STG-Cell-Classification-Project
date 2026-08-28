@@ -1231,9 +1231,23 @@ NO_DATA_COLOR = (1.0, 1.0, 1.0, 1.0)  # plain white: a pixel with nothing to rep
 
 
 def _test_pattern_map(cell_result: dict, features: dict) -> dict:
+    # Excludes blew_up points -- test_pattern is None both for a point that
+    # genuinely never got far enough to classify AND for one whose
+    # simulation blew up entirely (non-finite trajectory), and `or "silent"`
+    # used to collapse both into a real "silent" classification. That's
+    # wrong: a blown-up point isn't evidence the cell doesn't fire there,
+    # it's a simulation failure with no classification at all, and every
+    # other panel in this module (compute_firing_rate_map, compute_rebound_
+    # maps, etc.) already excludes blew_up points for exactly this reason --
+    # this was the one holdout, and on a cell whose grid blows up on most
+    # points (confirmed real case: ZE23IV, 2101/2500 points, deepest floor
+    # in the population) it painted the entire heatmap "silent" gray, making
+    # a numerically unstable cell look like a genuinely quiescent one
+    # (user-flagged 2026-08-26: "if it takes a deep current to suppress it
+    # then shouldn't I see a lot more blue than gray?").
     pattern_names = list(PATTERN_COLORS.keys())
-    return {(p["held_nA"], p["injected_nA"]): pattern_names.index(p["test_pattern"] or "silent")
-            for p in cell_result["grid"].values()}
+    return {(p["held_nA"], p["injected_nA"]): pattern_names.index(p["test_pattern"])
+            for p in cell_result["grid"].values() if not p["blew_up"] and p["test_pattern"] is not None}
 
 
 def _rebound_pattern_map(cell_result: dict, features: dict) -> dict:
